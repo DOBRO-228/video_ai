@@ -1,0 +1,13 @@
+# {{ title }}
+
+- Video: [{{ video.title }}]({{ video.url }})
+- Channel: {{ video.channel }}
+- Job ID: `{{ video.video_id }}`
+- Chunks: {{ chunks|length }}
+
+## Chunks
+
+{% for chunk in chunks -%}
+- [[chunks/{{ chunk.chunk_id }}|{{ chunk.chunk_id }}]]
+{% endfor %}
+

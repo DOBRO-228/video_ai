@@ -1,0 +1,11 @@
+# {{ chunk.chunk_id }}
+
+- Video: [{{ chunk.title }}]({{ chunk.url }})
+- Channel: {{ chunk.channel }}
+- Timestamp: [YouTube]({{ chunk.timestamp_url }})
+- Range: {{ chunk.start }}s -> {{ chunk.end }}s
+- Topics: {{ chunk.topics|join(", ") }}
+- Entities: {{ chunk.entities|join(", ") }}
+- Modality: {{ chunk.modality|join(", ") }}
+
+{{ chunk.combined_text }}

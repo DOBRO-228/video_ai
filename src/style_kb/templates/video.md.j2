@@ -1,0 +1,35 @@
+# {{ video.title }}
+
+- Channel: {{ video.channel }}
+- URL: {{ video.url }}
+- Video ID: `{{ video.video_id }}`
+- Duration: {{ video.duration }}s
+
+## Timeline
+
+{% for event in timeline_events -%}
+### {{ event.start }}s -> {{ event.end }}s
+
+- Timestamp: [YouTube]({{ event.timestamp_url }})
+- Topics: {{ event.topics|join(", ") }}
+- Items: {{ event.items|join(", ") }}
+
+{{ event.speech_text }}
+
+{{ event.visual_summary }}
+
+{% if event.on_screen_text %}
+On-screen text:
+{% for item in event.on_screen_text -%}
+- {{ item }}
+{% endfor %}
+{% endif %}
+
+{% if event_frame_links.get(event.scene_id) %}
+Frames:
+{% for frame_link in event_frame_links.get(event.scene_id, []) -%}
+![]({{ frame_link }})
+{% endfor %}
+{% endif %}
+
+{% endfor %}

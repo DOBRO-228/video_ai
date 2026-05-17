@@ -1,0 +1,113 @@
+project:
+  name: mens-style-kb
+  output_dir: ./mens-style-kb
+  keep_media: false
+  keep_frames: true
+
+download:
+  video_height: 720
+  video_format: mp4
+  audio_format: mp3
+  audio_quality: "0"
+  cookies_from_browser: null
+
+stt:
+  provider: soniox
+  model: stt-async-v4
+  mode: async_file
+  language_hints:
+    - ru
+    - en
+  language_hints_strict: false
+  language_identification: true
+  speaker_diarization: false
+  context:
+    domain: "men's style, menswear, tailoring, suits, shoes, shirts, accessories, fit, fabrics, colors, proportions, grooming"
+    terms:
+      - "посадка"
+      - "цветовая гамма"
+      - "сочетание цветов"
+      - "вытягивание роста"
+      - "лен"
+      - "хлопок"
+      - "шерсть"
+      - "тенсил"
+      - "замша"
+      - "кожа"
+      - "рубашка"
+      - "пиджак"
+      - "брюки"
+      - "галстук"
+      - "пуговицы"
+      - "ремень"
+      - "аксессуары"
+      - "манжеты"
+      - "рукав"
+      - "воротник"
+      - "защипы"
+      - "боковые регуляторы"
+      - "подтяжки"
+      - "крой"
+      - "фланель"
+      - "твид"
+      - "текстура"
+      - "шелк"
+      - "вязаные изделия"
+      - "рубашка-поло"
+      - "духи"
+      - "лацканы"
+      - "дерби"
+      - "оксфорды"
+      - "броги"
+      - "лоферы"
+      - "smart casual"
+      - "tailoring"
+      - "fit"
+      - "lapel"
+      - "shoulder seam"
+      - "trouser break"
+      - "oxfords"
+      - "derbies"
+      - "brogues"
+      - "loafers"
+      - "pleats"
+      - "cuffs"
+      - "drape"
+      - "silhouette"
+
+scene_detection:
+  detector: adaptive
+  min_scene_len_seconds: 1.5
+  images_per_scene: 3
+  extra_sample_every_seconds: 10
+  fallback_scene_seconds: 30
+
+vision:
+  provider: openai
+  model: gpt-5.4-mini
+  detail: low
+  batch_size: 1
+  include_nearby_transcript: true
+  transcript_context_before_seconds: 5
+  transcript_context_after_seconds: 5
+  ocr: true
+  prompt_file: visual_menswear_ru.txt
+
+speech_segmentation:
+  max_segment_seconds: 35
+  min_segment_seconds: 5
+  pause_break_ms: 900
+  max_segment_words: 150
+
+chunking:
+  mode: scene
+  target_words: 500
+  max_words: 900
+  overlap_seconds: 10
+  max_scenes_per_chunk: 3
+
+export:
+  formats:
+    - jsonl
+    - obsidian
+
