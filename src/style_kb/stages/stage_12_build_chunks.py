@@ -3,7 +3,7 @@ from __future__ import annotations
 from style_kb.errors import StageExecutionError
 from style_kb.models import Chunk
 from style_kb.pipeline.base import Stage, StageContext, StageResult
-from style_kb.stages.common import load_timeline_events, youtube_source_ref
+from style_kb.stages.common import load_chunks, load_timeline_events, youtube_source_ref
 from style_kb.utils.collections import stable_unique
 from style_kb.utils.ids import chunk_id
 from style_kb.utils.pydantic_io import write_models_jsonl
@@ -38,13 +38,14 @@ class Stage12BuildChunks(Stage):
             start = chunk_events[0].start
             end = chunk_events[-1].end
             speech_text = " ".join(event.speech_text for event in chunk_events if event.speech_text).strip()
+            presenter_brief = _presenter_brief(chunk_events)
             visual_text = compact_join(
                 [
                     " ".join(event.visual_summary for event in chunk_events if event.visual_summary).strip(),
                     "\n".join(text for event in chunk_events for text in event.on_screen_text).strip(),
                 ]
             )
-            combined_text = compact_join([speech_text, visual_text])
+            combined_text = compact_join([speech_text, presenter_brief, visual_text])
             topics = stable_unique(topic for event in chunk_events for topic in event.topics)
             entities = stable_unique(item for event in chunk_events for item in event.items)
             on_screen_text = stable_unique(text for event in chunk_events for text in event.on_screen_text)
@@ -60,6 +61,7 @@ class Stage12BuildChunks(Stage):
                     title=chunk_events[0].title,
                     channel=chunk_events[0].channel,
                     url=context.job.url,
+                    presenter_brief=presenter_brief,
                     start=start,
                     end=end,
                     timestamp_url=build_timestamp_url(context.job.video_id, start),
@@ -78,6 +80,15 @@ class Stage12BuildChunks(Stage):
 
         write_models_jsonl(context.paths.chunks_jsonl, chunks)
         return StageResult(output_files=self.output_files(context), metrics={"chunks_count": len(chunks)})
+
+
+def _presenter_brief(events) -> str:
+    briefs = [
+        event.presenter_context.narrative_brief
+        for event in events
+        if event.presenter_context.relevance in {"brief", "primary_example"} and event.presenter_context.narrative_brief
+    ]
+    return " ".join(stable_unique(briefs)).strip()
 
 
 def _collect_chunk_events(events, start_index: int, context: StageContext):

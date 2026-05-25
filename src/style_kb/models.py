@@ -9,6 +9,8 @@ from pydantic import BaseModel, ConfigDict, Field
 StageState = Literal["pending", "running", "completed", "failed", "skipped"]
 JobState = Literal["pending", "running", "completed", "failed"]
 ConfidenceLevel = Literal["low", "medium", "high"]
+PresenterRole = Literal["none", "primary_presenter", "other_person"]
+PresenterRelevance = Literal["none", "background", "brief", "primary_example"]
 
 
 class StrictModel(BaseModel):
@@ -28,6 +30,25 @@ class SourceRef(StrictModel):
 class ProviderSource(StrictModel):
     provider: str
     model: str
+
+
+class PresenterContext(StrictModel):
+    present: bool
+    role: PresenterRole
+    is_recurring: bool
+    relevance: PresenterRelevance
+    baseline_summary: str
+    scene_deltas: list[str]
+    narrative_brief: str
+    confidence: ConfidenceLevel
+
+
+class PresenterProfile(StrictModel):
+    has_primary_presenter: bool
+    confidence: ConfidenceLevel
+    baseline_summary: str
+    recurring_visual_markers: list[str]
+    notes: str
 
 
 class TimeBoundModel(StrictModel):
@@ -95,6 +116,7 @@ class VisualEvent(GroundedTimeBoundModel):
     visual_event_id: str
     scene_id: str
     frames: list[FrameRef]
+    presenter_context: PresenterContext
     visual_summary: str
     observations: list[str]
     interpretations: list[str]
@@ -110,6 +132,7 @@ class TimelineEvent(GroundedTimeBoundModel):
     event_id: str
     title: str
     channel: str
+    presenter_context: PresenterContext
     speech_text: str
     visual_summary: str
     on_screen_text: list[str]
@@ -125,6 +148,7 @@ class Chunk(GroundedTimeBoundModel):
     title: str
     channel: str
     url: str
+    presenter_brief: str
     speech_text: str
     visual_text: str
     combined_text: str

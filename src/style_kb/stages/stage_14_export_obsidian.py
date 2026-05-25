@@ -13,7 +13,12 @@ class Stage14ExportObsidian(Stage):
     ordinal = 14
 
     def input_files(self, context: StageContext) -> list:
-        return [context.paths.metadata_video_info, context.paths.timeline_events_jsonl, context.paths.chunks_jsonl]
+        return [
+            context.paths.metadata_video_info,
+            context.paths.timeline_events_jsonl,
+            context.paths.chunks_jsonl,
+            context.paths.frame_refs_jsonl,
+        ]
 
     def output_files(self, context: StageContext) -> list:
         outputs = [context.paths.obsidian_index]

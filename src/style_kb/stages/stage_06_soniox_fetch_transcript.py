@@ -25,7 +25,31 @@ class Stage06SonioxFetchTranscript(Stage):
     def validate_outputs(self, context: StageContext) -> bool:
         if not context.paths.stt_transcript_raw.exists() or not context.paths.stt_speech_tokens.exists():
             return False
-        return len(load_speech_tokens(context.paths.stt_speech_tokens)) > 0
+        tokens = load_speech_tokens(context.paths.stt_speech_tokens)
+        if not tokens:
+            return False
+        transcript_payload = read_payload(context.paths.stt_transcript_raw)
+        expected_tokens = _normalize_tokens(context.job.video_id, transcript_payload)
+        if len(tokens) != len(expected_tokens):
+            return False
+        for actual, expected in zip(tokens, expected_tokens):
+            if actual.token_index != expected.token_index:
+                return False
+            if actual.text != expected.text:
+                return False
+            if actual.start_ms != expected.start_ms or actual.end_ms != expected.end_ms:
+                return False
+            if actual.language != expected.language or actual.speaker != expected.speaker:
+                return False
+        if any(token.start_ms > token.end_ms for token in tokens):
+            return False
+        if any(current.start_ms < previous.start_ms for previous, current in zip(tokens, tokens[1:])):
+            return False
+        transcription_payload = read_payload(context.paths.stt_transcription)
+        audio_duration_ms = transcription_payload.get("audio_duration_ms")
+        if audio_duration_ms is not None and tokens[-1].end_ms > int(audio_duration_ms) + 10_000:
+            return False
+        return True
 
     def run(self, context: StageContext) -> StageResult:
         transcription_payload = read_payload(context.paths.stt_transcription)
@@ -57,8 +81,8 @@ def _normalize_tokens(video_id: str, transcript_payload: dict) -> list[SpeechTok
     raw_tokens = transcript_payload.get("tokens") or []
     tokens: list[SpeechToken] = []
     for index, raw_token in enumerate(raw_tokens):
-        text = str(raw_token.get("text") or raw_token.get("token") or raw_token.get("value") or "").strip()
-        if not text:
+        text = str(raw_token.get("text") or raw_token.get("token") or raw_token.get("value") or "")
+        if text == "":
             continue
         start_ms = _coerce_ms(raw_token, ["start_ms", "start_time_ms", "startTimeMs", "start"])
         end_ms = _coerce_ms(raw_token, ["end_ms", "end_time_ms", "endTimeMs", "end"])
@@ -83,9 +107,9 @@ def _coerce_ms(payload: dict, keys: list[str]) -> int:
         if key not in payload or payload[key] is None:
             continue
         value = payload[key]
-        if isinstance(value, (int, float)) and value < 10000:
-            return int(round(float(value) * 1000))
-        return int(round(float(value)))
+        if _key_is_milliseconds(key):
+            return int(round(float(value)))
+        return int(round(float(value) * 1000))
     raise ProviderError("Soniox token is missing timestamp fields", error_code="soniox_token_timestamp_missing")
 
 
@@ -94,3 +118,8 @@ def _coerce_optional(payload: dict, keys: list[str]) -> str | None:
         if payload.get(key) is not None:
             return str(payload[key])
     return None
+
+
+def _key_is_milliseconds(key: str) -> bool:
+    normalized = key.lower()
+    return normalized.endswith("_ms") or normalized.endswith("timems")

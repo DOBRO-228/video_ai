@@ -7,5 +7,6 @@
 - Topics: {{ chunk.topics|join(", ") }}
 - Entities: {{ chunk.entities|join(", ") }}
 - Modality: {{ chunk.modality|join(", ") }}
-
+{% if chunk.presenter_brief %}- Presenter: {{ chunk.presenter_brief }}
+{% endif %}
 {{ chunk.combined_text }}

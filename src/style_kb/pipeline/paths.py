@@ -114,6 +114,10 @@ class JobPaths:
         return self.stt_dir / "speech_segments.jsonl"
 
     @property
+    def stt_speech_segments_raw(self) -> Path:
+        return self.stt_dir / "speech_segments_raw.json"
+
+    @property
     def scenes_jsonl(self) -> Path:
         return self.scenes_dir / "scenes.jsonl"
 
@@ -124,6 +128,14 @@ class JobPaths:
     @property
     def visual_events_jsonl(self) -> Path:
         return self.visual_dir / "visual_events.jsonl"
+
+    @property
+    def visual_presenter_profile(self) -> Path:
+        return self.visual_dir / "presenter_profile.json"
+
+    @property
+    def visual_raw_presenter_profile(self) -> Path:
+        return self.visual_raw_dir / "presenter_profile.raw.json"
 
     @property
     def timeline_events_jsonl(self) -> Path:
@@ -189,4 +201,3 @@ class JobPaths:
             "quality_report": str(self.quality_report),
             "obsidian_index": str(self.obsidian_index),
         }
-

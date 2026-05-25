@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from style_kb.clients.media import duration_seconds
 from style_kb.errors import StageExecutionError
-from style_kb.models import QualityReport
+from style_kb.models import PresenterProfile, QualityReport, VisualEvent
 from style_kb.pipeline.base import Stage, StageContext, StageResult
 from style_kb.stages.common import (
     load_chunks,
@@ -15,7 +15,7 @@ from style_kb.stages.common import (
     load_visual_events,
     read_payload,
 )
-from style_kb.utils.pydantic_io import write_model
+from style_kb.utils.pydantic_io import read_model, write_model
 
 
 class Stage15QualityReport(Stage):
@@ -32,6 +32,7 @@ class Stage15QualityReport(Stage):
             context.paths.scenes_jsonl,
             context.paths.frame_refs_jsonl,
             context.paths.visual_events_jsonl,
+            context.paths.visual_presenter_profile,
             context.paths.timeline_events_jsonl,
             context.paths.chunks_jsonl,
         ]
@@ -68,6 +69,10 @@ class Stage15QualityReport(Stage):
             warnings.append("metadata duration differs from proxy video duration by more than 1.0s")
         if len(scenes) == 1:
             warnings.append("scene detection produced a single scene")
+        chunks_coverage = round(sum(chunk.end - chunk.start for chunk in chunks) / max(video_duration, 1.0), 4)
+        if chunks_coverage > 2.0:
+            warnings.append("chunks cover the video more than 2x; overlap or duplicated content may be too high")
+        warnings.extend(_presenter_warnings(context, visual_events, chunks))
 
         report = QualityReport(
             job_id=context.job.job_id,
@@ -92,7 +97,7 @@ class Stage15QualityReport(Stage):
             coverage={
                 "speech_segments_vs_video": round(sum(segment.end - segment.start for segment in speech_segments) / max(video_duration, 1.0), 4),
                 "timeline_vs_video": round(sum(event.end - event.start for event in timeline_events) / max(video_duration, 1.0), 4),
-                "chunks_vs_video": round(sum(chunk.end - chunk.start for chunk in chunks) / max(video_duration, 1.0), 4),
+                "chunks_vs_video": chunks_coverage,
             },
             mismatches={
                 "audio_vs_video_duration_abs": round(abs(audio_duration - video_duration), 4),
@@ -105,3 +110,47 @@ class Stage15QualityReport(Stage):
         )
         write_model(context.paths.quality_report, report)
         return StageResult(output_files=self.output_files(context), metrics={"warnings_count": len(warnings)})
+
+
+def _presenter_warnings(context: StageContext, visual_events: list[VisualEvent], chunks) -> list[str]:
+    warnings: list[str] = []
+    if not context.paths.visual_presenter_profile.exists():
+        return warnings
+    profile = read_model(context.paths.visual_presenter_profile, PresenterProfile)
+    if not profile.has_primary_presenter:
+        return warnings
+
+    recurring_events = [event for event in visual_events if event.presenter_context.is_recurring]
+    background_events = [event for event in recurring_events if event.presenter_context.relevance == "background"]
+    if profile.confidence == "high" and not recurring_events:
+        warnings.append("presenter profile detected a recurring presenter, but no visual events are marked recurring")
+
+    baseline_values = {event.presenter_context.baseline_summary.strip() for event in recurring_events if event.presenter_context.baseline_summary.strip()}
+    if len(baseline_values) > 3:
+        warnings.append("presenter baseline drifts across visual events; recurring presenter context may be unstable")
+
+    background_leaks = sum(1 for event in background_events if _event_mentions_presenter_baseline(event, profile))
+    if background_events and background_leaks / max(len(background_events), 1) > 0.35:
+        warnings.append("background presenter baseline appears in scene-specific visual fields too often")
+
+    chunks_with_brief = [chunk for chunk in chunks if chunk.presenter_brief.strip()]
+    if profile.confidence == "high" and not chunks_with_brief:
+        warnings.append("presenter_brief is empty for all chunks despite high-confidence recurring presenter")
+    return warnings
+
+
+def _event_mentions_presenter_baseline(event: VisualEvent, profile: PresenterProfile) -> bool:
+    markers = [profile.baseline_summary, *profile.recurring_visual_markers]
+    marker_words = {word.lower() for marker in markers for word in marker.replace("/", " ").split() if len(word) >= 5}
+    if not marker_words:
+        return False
+    text = " ".join(
+        [
+            event.visual_summary,
+            " ".join(event.observations),
+            " ".join(event.items),
+            " ".join(event.colors),
+            " ".join(event.style_topics),
+        ]
+    ).lower()
+    return any(word in text for word in marker_words)

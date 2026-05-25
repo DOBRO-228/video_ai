@@ -84,9 +84,14 @@ scene_detection:
 
 vision:
   provider: openai
-  model: gpt-5.4-mini
+  model: gpt-5-nano
   detail: low
-  batch_size: 1
+  batch_size: 8
+  presenter_bootstrap_enabled: true
+  presenter_bootstrap_prompt_file: presenter_profile_ru.txt
+  presenter_bootstrap_scene_limit: 12
+  presenter_bootstrap_max_images: 12
+  presenter_low_confidence_disables_recurrence: true
   include_nearby_transcript: true
   transcript_context_before_seconds: 5
   transcript_context_after_seconds: 5
@@ -94,7 +99,10 @@ vision:
   prompt_file: visual_menswear_ru.txt
 
 speech_segmentation:
-  max_segment_seconds: 35
+  provider: openai
+  model: gpt-5-mini
+  prompt_file: speech_segments_semantic_ru.txt
+  max_segment_seconds: 60
   min_segment_seconds: 5
   pause_break_ms: 900
   max_segment_words: 150
@@ -110,4 +118,3 @@ export:
   formats:
     - jsonl
     - obsidian
-

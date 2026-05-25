@@ -59,6 +59,11 @@ class VisionConfig(BaseModel):
     model: str
     detail: str
     batch_size: int = Field(gt=0)
+    presenter_bootstrap_enabled: bool
+    presenter_bootstrap_prompt_file: str
+    presenter_bootstrap_scene_limit: int = Field(gt=0)
+    presenter_bootstrap_max_images: int = Field(gt=0)
+    presenter_low_confidence_disables_recurrence: bool
     include_nearby_transcript: bool
     transcript_context_before_seconds: int = Field(ge=0)
     transcript_context_after_seconds: int = Field(ge=0)
@@ -69,6 +74,9 @@ class VisionConfig(BaseModel):
 class SpeechSegmentationConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    provider: str
+    model: str
+    prompt_file: str
     max_segment_seconds: float = Field(gt=0)
     min_segment_seconds: float = Field(gt=0)
     pause_break_ms: int = Field(gt=0)
@@ -102,4 +110,3 @@ class AppConfig(BaseModel):
     speech_segmentation: SpeechSegmentationConfig
     chunking: ChunkingConfig
     export: ExportConfig
-

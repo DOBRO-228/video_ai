@@ -13,7 +13,8 @@
 - Timestamp: [YouTube]({{ event.timestamp_url }})
 - Topics: {{ event.topics|join(", ") }}
 - Items: {{ event.items|join(", ") }}
-
+{% if event.presenter_context.narrative_brief %}- Presenter: {{ event.presenter_context.narrative_brief }}
+{% endif %}
 {{ event.speech_text }}
 
 {{ event.visual_summary }}

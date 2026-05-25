@@ -83,21 +83,27 @@ class PipelineRunner:
             for stage_class in STAGES:
                 stage = stage_class()
                 job = self.repository.update_job(job.job_id, current_stage=stage.name)
-                context = StageContext(config=self.config, repository=self.repository, job=job, paths=paths)
+                context = StageContext(
+                    config=self.config,
+                    repository=self.repository,
+                    job=job,
+                    paths=paths,
+                    progress_callback=self.progress_callback,
+                )
                 stage_row = self.repository.get_stage(job.job_id, stage.name)
-                should_skip = stage.validate_outputs(context)
+                should_skip = stage.validate_outputs(context) and stage.outputs_are_current(context)
                 if should_skip:
-                    status = "completed" if stage_row and stage_row.status == "completed" else "skipped"
                     finished_stage = self.repository.mark_stage_finished(
                         job_id=job.job_id,
                         stage_name=stage.name,
-                        status=status,
+                        status="completed",
                         output_files=[str(path) for path in stage.output_files(context) if path.exists()],
                         remote_refs=stage_row.remote_refs if stage_row else {},
                         metrics=stage_row.metrics if stage_row else {},
                     )
-                    self._write_stage_outcome_log(paths=paths, stage_status=finished_stage)
-                    self._emit_stage_progress(finished_stage)
+                    skipped_stage = finished_stage.model_copy(update={"status": "skipped"})
+                    self._write_stage_reuse_log(paths=paths, stage_status=skipped_stage)
+                    self._emit_stage_progress(skipped_stage)
                     continue
 
                 self.repository.mark_stage_running(
@@ -235,6 +241,27 @@ class PipelineRunner:
         if error is not None and error.details:
             lines.append("details:")
             lines.append(error.details)
+        lines.append("")
+        append_text(paths.stage_log(stage_status.stage_name), "\n".join(lines), encoding="utf-8")
+
+    def _write_stage_reuse_log(self, *, paths: JobPaths, stage_status: StageStatus) -> None:
+        reused_at = datetime.now(tz=UTC).isoformat()
+        lines = [
+            "",
+            "[stage-reuse]",
+            f"job_id: {stage_status.job_id}",
+            f"stage: {stage_status.stage_name}",
+            f"status: {stage_status.status}",
+            f"attempt: {stage_status.attempt}",
+            f"reused_at: {reused_at}",
+            "output_files:",
+        ]
+        if stage_status.output_files:
+            lines.extend(f"  - {path}" for path in stage_status.output_files)
+        else:
+            lines.append("  -")
+        lines.append("metrics:")
+        lines.append(_pretty_json(stage_status.metrics))
         lines.append("")
         append_text(paths.stage_log(stage_status.stage_name), "\n".join(lines), encoding="utf-8")
 
