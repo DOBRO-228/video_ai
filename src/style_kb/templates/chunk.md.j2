@@ -7,6 +7,8 @@
 - Topics: {{ chunk.topics|join(", ") }}
 - Entities: {{ chunk.entities|join(", ") }}
 - Modality: {{ chunk.modality|join(", ") }}
+{% if chunk.speaker_roles %}- Speaker roles: {{ chunk.speaker_roles|join(", ") }}
+{% endif %}
 {% if chunk.presenter_brief %}- Presenter: {{ chunk.presenter_brief }}
 {% endif %}
 {{ chunk.combined_text }}

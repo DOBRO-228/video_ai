@@ -20,7 +20,8 @@ stt:
     - en
   language_hints_strict: false
   language_identification: true
-  speaker_diarization: false
+  speaker_diarization: true
+  speaker_role_strategy: longest_speech_host
   context:
     domain: "men's style, menswear, tailoring, suits, shoes, shirts, accessories, fit, fabrics, colors, proportions, grooming"
     terms:

@@ -11,6 +11,7 @@ class Stage13ExportJsonl(Stage):
     def input_files(self, context: StageContext) -> list:
         return [
             context.paths.metadata_video_info,
+            context.paths.stt_speaker_diarization,
             context.paths.stt_speech_tokens,
             context.paths.stt_speech_segments,
             context.paths.scenes_jsonl,
@@ -26,6 +27,7 @@ class Stage13ExportJsonl(Stage):
     def validate_outputs(self, context: StageContext) -> bool:
         expected = [
             context.paths.export_jsonl("video_info.jsonl"),
+            context.paths.export_jsonl("speaker_diarization.jsonl"),
             context.paths.export_jsonl("speech_tokens.jsonl"),
             context.paths.export_jsonl("speech_segments.jsonl"),
             context.paths.export_jsonl("scenes.jsonl"),
@@ -39,6 +41,7 @@ class Stage13ExportJsonl(Stage):
     def run(self, context: StageContext) -> StageResult:
         outputs = export_jsonl_bundle(
             video_info_path=context.paths.metadata_video_info,
+            speaker_diarization_path=context.paths.stt_speaker_diarization,
             speech_tokens_path=context.paths.stt_speech_tokens,
             speech_segments_path=context.paths.stt_speech_segments,
             scenes_path=context.paths.scenes_jsonl,
@@ -49,4 +52,3 @@ class Stage13ExportJsonl(Stage):
             export_dir=context.paths.export_jsonl_dir,
         )
         return StageResult(output_files=outputs, metrics={"exported_files": len(outputs)})
-

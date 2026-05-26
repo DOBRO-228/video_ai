@@ -110,6 +110,10 @@ class JobPaths:
         return self.stt_dir / "speech_tokens.jsonl"
 
     @property
+    def stt_speaker_diarization(self) -> Path:
+        return self.stt_dir / "speaker_diarization.json"
+
+    @property
     def stt_speech_segments(self) -> Path:
         return self.stt_dir / "speech_segments.jsonl"
 

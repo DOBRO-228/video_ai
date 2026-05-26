@@ -38,6 +38,7 @@ class Stage12BuildChunks(Stage):
             start = chunk_events[0].start
             end = chunk_events[-1].end
             speech_text = " ".join(event.speech_text for event in chunk_events if event.speech_text).strip()
+            dialogue_text = _dialogue_text(chunk_events)
             presenter_brief = _presenter_brief(chunk_events)
             visual_text = compact_join(
                 [
@@ -45,10 +46,16 @@ class Stage12BuildChunks(Stage):
                     "\n".join(text for event in chunk_events for text in event.on_screen_text).strip(),
                 ]
             )
-            combined_text = compact_join([speech_text, presenter_brief, visual_text])
+            combined_text = compact_join([dialogue_text or speech_text, presenter_brief, visual_text])
             topics = stable_unique(topic for event in chunk_events for topic in event.topics)
             entities = stable_unique(item for event in chunk_events for item in event.items)
             on_screen_text = stable_unique(text for event in chunk_events for text in event.on_screen_text)
+            speaker_roles = stable_unique(
+                turn.speaker_role
+                for event in chunk_events
+                for turn in event.speech_turns
+                if turn.speaker_role
+            )
             modality = []
             if speech_text:
                 modality.append("audio")
@@ -66,12 +73,14 @@ class Stage12BuildChunks(Stage):
                     end=end,
                     timestamp_url=build_timestamp_url(context.job.video_id, start),
                     speech_text=speech_text,
+                    dialogue_text=dialogue_text,
                     visual_text=visual_text,
                     combined_text=combined_text,
                     on_screen_text=on_screen_text,
                     topics=topics,
                     entities=entities,
                     modality=modality,
+                    speaker_roles=speaker_roles,
                     timeline_event_ids=[event.event_id for event in chunk_events],
                     source_refs=[youtube_source_ref(context.job.video_id, start, end, title=chunk_events[0].title)],
                 )
@@ -89,6 +98,32 @@ def _presenter_brief(events) -> str:
         if event.presenter_context.relevance in {"brief", "primary_example"} and event.presenter_context.narrative_brief
     ]
     return " ".join(stable_unique(briefs)).strip()
+
+
+def _dialogue_text(events) -> str:
+    lines = []
+    previous_label = None
+    buffer = []
+    for event in events:
+        for turn in event.speech_turns:
+            label = _speaker_label(turn.speaker_role, turn.speaker)
+            if previous_label is not None and label != previous_label:
+                lines.append(f"{previous_label}: {' '.join(buffer).strip()}")
+                buffer = []
+            previous_label = label
+            if turn.text:
+                buffer.append(turn.text)
+    if previous_label is not None and buffer:
+        lines.append(f"{previous_label}: {' '.join(buffer).strip()}")
+    return "\n".join(line for line in lines if not line.endswith(": "))
+
+
+def _speaker_label(speaker_role: str | None, speaker: str | None) -> str:
+    if speaker_role == "host":
+        return "Ведущий"
+    if speaker_role == "offscreen_questioner":
+        return "Закадровый вопрос"
+    return speaker or "Голос"
 
 
 def _collect_chunk_events(events, start_index: int, context: StageContext):

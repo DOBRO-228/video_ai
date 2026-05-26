@@ -57,6 +57,8 @@ class _TranscriptUnit:
     end_ms: int
     text: str
     word_count: int
+    speaker: str | None
+    speaker_role: str | None
 
 
 class Stage07BuildSpeechSegments(Stage):
@@ -84,7 +86,6 @@ class Stage07BuildSpeechSegments(Stage):
 
         token_positions = {token.token_index: index for index, token in enumerate(tokens)}
         max_duration = context.config.speech_segmentation.max_segment_seconds
-        min_duration = context.config.speech_segmentation.min_segment_seconds
         max_words = context.config.speech_segmentation.max_segment_words
         previous_end_position = -1
 
@@ -101,7 +102,7 @@ class Stage07BuildSpeechSegments(Stage):
             duration = segment.end - segment.start
             if duration > max_duration + _DURATION_EPSILON_SECONDS:
                 return False
-            if duration < min_duration - _DURATION_EPSILON_SECONDS:
+            if not segment.speaker and duration < context.config.speech_segmentation.min_segment_seconds - _DURATION_EPSILON_SECONDS:
                 return False
 
             start_position = token_positions.get(segment.token_start_index)
@@ -119,6 +120,9 @@ class Stage07BuildSpeechSegments(Stage):
             if segment.start_ms != group[0].start_ms or segment.end_ms != group[-1].end_ms:
                 return False
             if segment.text != _join_tokens(group):
+                return False
+            speaker, speaker_role = _single_content_speaker(group)
+            if segment.speaker != speaker or segment.speaker_role != speaker_role:
                 return False
             if _word_count_from_tokens(group) > max_words:
                 return False
@@ -179,6 +183,7 @@ def _segment_with_retries(
                 "min_segment_seconds": context.config.speech_segmentation.min_segment_seconds,
                 "max_segment_seconds": context.config.speech_segmentation.max_segment_seconds,
                 "max_segment_words": context.config.speech_segmentation.max_segment_words,
+                "speaker_turn_min_duration_rule": "speaker-labeled segments may be shorter than min_segment_seconds",
                 "preferred_max_segment_seconds": _SOFT_MAX_SEMANTIC_SECONDS,
                 "units_count": len(units),
                 "retry_feedback": previous_violations,
@@ -220,7 +225,6 @@ def _segments_from_payload(
         model=context.config.speech_segmentation.model,
     )
     max_duration = context.config.speech_segmentation.max_segment_seconds
-    min_duration = context.config.speech_segmentation.min_segment_seconds
     max_words = context.config.speech_segmentation.max_segment_words
     expected_start = 1
     results: list[SpeechSegment] = []
@@ -251,7 +255,7 @@ def _segments_from_payload(
             raise ProviderError(
                 "OpenAI speech segmentation returned an empty token group",
                 error_code="openai_segmenter_empty_group",
-            )
+        )
 
         duration = group[-1].end - group[0].start
         words_count = _word_count_from_tokens(group)
@@ -260,7 +264,7 @@ def _segments_from_payload(
                 f"OpenAI speech segmentation exceeded max_segment_seconds for range {unit_start_index}-{unit_end_index}",
                 error_code="openai_segmenter_duration_exceeded",
             )
-        if duration < min_duration - _DURATION_EPSILON_SECONDS:
+        if not _has_speaker_label(group) and duration < context.config.speech_segmentation.min_segment_seconds - _DURATION_EPSILON_SECONDS:
             raise ProviderError(
                 f"OpenAI speech segmentation violated min_segment_seconds for range {unit_start_index}-{unit_end_index}",
                 error_code="openai_segmenter_duration_too_short",
@@ -274,8 +278,7 @@ def _segments_from_payload(
         text = _join_tokens(group)
         languages = [token.language for token in group if token.language]
         language = Counter(languages).most_common(1)[0][0] if languages else None
-        speakers = [token.speaker for token in group if token.speaker]
-        speaker = Counter(speakers).most_common(1)[0][0] if speakers else None
+        speaker, speaker_role = _single_content_speaker(group, fail_on_mixed=True)
         start = group[0].start
         end = group[-1].end
         results.append(
@@ -291,6 +294,7 @@ def _segments_from_payload(
                 token_end_index=group[-1].token_index,
                 tokens_count=len(group),
                 speaker=speaker,
+                speaker_role=speaker_role,
                 language=language,
                 timestamp_url=build_timestamp_url(context.job.video_id, start),
                 source=provider,
@@ -315,7 +319,7 @@ def _build_prompt(base_prompt_text: str, violations: list[str], attempt: int) ->
         "Нарушения предыдущей попытки, которые нужно исправить:",
         *[f"- {violation}" for violation in violations[:12]],
         "",
-        "Сделай новое разбиение. Не повторяй эти ошибки. Если граница выглядит сомнительно, объединяй continuation с предыдущим сегментом или сдвигай границу к ближайшему завершённому предложению.",
+        "Сделай новое разбиение. Не повторяй эти ошибки. Если граница выглядит сомнительно, объединяй continuation с предыдущим сегментом или сдвигай границу к ближайшему завершённому предложению. Но никогда не объединяй units разных speaker.",
     ]
     return base_prompt_text.rstrip() + "\n" + "\n".join(feedback_lines)
 
@@ -336,6 +340,8 @@ def _semantic_boundary_violations(segments: list[SpeechSegment]) -> list[str]:
             )
 
     for index, (previous, current) in enumerate(zip(segments, segments[1:]), start=1):
+        if _segments_have_speaker_change(previous, current):
+            continue
         previous_terminal = _terminal_char(previous.text)
         current_first_word = _first_word(current.text)
         if previous_terminal in _NON_TERMINAL_END_CHARS:
@@ -395,6 +401,7 @@ def _build_transcript_units(tokens: list[SpeechToken], context: StageContext) ->
         unit_end_position = _extend_through_trailing_whitespace(tokens, position, next_content_position)
         unit_start_position = content_positions[start_content_index]
         unit_tokens = tokens[unit_start_position : unit_end_position + 1]
+        unit_speaker, unit_speaker_role = _single_content_speaker(unit_tokens)
         units.append(
             _TranscriptUnit(
                 unit_index=len(units) + 1,
@@ -406,6 +413,8 @@ def _build_transcript_units(tokens: list[SpeechToken], context: StageContext) ->
                 end_ms=unit_tokens[-1].end_ms,
                 text=_join_tokens(unit_tokens),
                 word_count=current_words,
+                speaker=unit_speaker,
+                speaker_role=unit_speaker_role,
             )
         )
         start_content_index = content_index + 1
@@ -430,6 +439,8 @@ def _should_break_unit(
         return True
 
     next_content_token = tokens[next_content_position]
+    if current_token.speaker and next_content_token.speaker and current_token.speaker != next_content_token.speaker:
+        return True
     gap_ms = max(0, next_content_token.start_ms - current_token.end_ms)
     if gap_ms >= context.config.speech_segmentation.pause_break_ms:
         return True
@@ -457,6 +468,8 @@ def _unit_payload(unit: _TranscriptUnit) -> dict[str, object]:
         "end": unit.end,
         "duration": round(unit.end - unit.start, 3),
         "word_count": unit.word_count,
+        "speaker": unit.speaker,
+        "speaker_role": unit.speaker_role,
         "text": unit.text,
     }
 
@@ -477,6 +490,45 @@ def _word_count_from_tokens(tokens: list[SpeechToken]) -> int:
             count += 1
         previous_content_position = position
     return count
+
+
+def _has_speaker_label(tokens: list[SpeechToken]) -> bool:
+    return any(token.speaker for token in tokens if not _is_whitespace_token(token))
+
+
+def _single_content_speaker(
+    tokens: list[SpeechToken],
+    *,
+    fail_on_mixed: bool = False,
+) -> tuple[str | None, str | None]:
+    identities = [
+        _speaker_identity(token)
+        for token in tokens
+        if not _is_whitespace_token(token) and token.speaker
+    ]
+    unique = []
+    for identity in identities:
+        if identity not in unique:
+            unique.append(identity)
+    if not unique:
+        return None, None
+    if len(unique) == 1:
+        return unique[0]
+    if fail_on_mixed:
+        speakers = ", ".join(speaker or "unknown" for speaker, _ in unique)
+        raise ProviderError(
+            f"OpenAI speech segmentation mixed speakers in one segment: {speakers}",
+            error_code="openai_segmenter_mixed_speakers",
+        )
+    return Counter(identities).most_common(1)[0][0]
+
+
+def _speaker_identity(token: SpeechToken) -> tuple[str | None, str | None]:
+    return token.speaker, token.speaker_role
+
+
+def _segments_have_speaker_change(previous: SpeechSegment, current: SpeechSegment) -> bool:
+    return bool(previous.speaker and current.speaker and previous.speaker != current.speaker)
 
 
 def _starts_new_word(token: SpeechToken) -> bool:

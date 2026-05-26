@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from style_kb.clients.media import duration_seconds
 from style_kb.errors import StageExecutionError
-from style_kb.models import PresenterProfile, QualityReport, VisualEvent
+from style_kb.models import PresenterProfile, QualityReport, SpeakerDiarization, VisualEvent
 from style_kb.pipeline.base import Stage, StageContext, StageResult
 from style_kb.stages.common import (
     load_chunks,
@@ -27,6 +27,7 @@ class Stage15QualityReport(Stage):
             context.paths.metadata_video_info,
             context.paths.downloads_audio_ffprobe,
             context.paths.downloads_video_ffprobe,
+            context.paths.stt_speaker_diarization,
             context.paths.stt_speech_tokens,
             context.paths.stt_speech_segments,
             context.paths.scenes_jsonl,
@@ -48,6 +49,7 @@ class Stage15QualityReport(Stage):
     def run(self, context: StageContext) -> StageResult:
         video_info = load_video_info(context.paths.metadata_video_info)
         speech_tokens = load_speech_tokens(context.paths.stt_speech_tokens)
+        speaker_diarization = read_model(context.paths.stt_speaker_diarization, SpeakerDiarization)
         speech_segments = load_speech_segments(context.paths.stt_speech_segments)
         scenes = load_scenes(context.paths.scenes_jsonl)
         frame_refs = load_frame_refs(context.paths.frame_refs_jsonl)
@@ -69,6 +71,8 @@ class Stage15QualityReport(Stage):
             warnings.append("metadata duration differs from proxy video duration by more than 1.0s")
         if len(scenes) == 1:
             warnings.append("scene detection produced a single scene")
+        if speaker_diarization.enabled and speaker_diarization.detected_speakers == 0:
+            warnings.append("speaker diarization is enabled but no speaker labels were detected")
         chunks_coverage = round(sum(chunk.end - chunk.start for chunk in chunks) / max(video_duration, 1.0), 4)
         if chunks_coverage > 2.0:
             warnings.append("chunks cover the video more than 2x; overlap or duplicated content may be too high")
@@ -79,6 +83,7 @@ class Stage15QualityReport(Stage):
             video_id=context.job.video_id,
             stage_counts={
                 "speech_tokens": len(speech_tokens),
+                "speakers": speaker_diarization.detected_speakers,
                 "speech_segments": len(speech_segments),
                 "scenes": len(scenes),
                 "frame_refs": len(frame_refs),

@@ -39,6 +39,7 @@ class SttConfig(BaseModel):
     language_hints_strict: bool
     language_identification: bool
     speaker_diarization: bool
+    speaker_role_strategy: str
     context: SttContextConfig
 
 

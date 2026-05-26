@@ -15,7 +15,13 @@
 - Items: {{ event.items|join(", ") }}
 {% if event.presenter_context.narrative_brief %}- Presenter: {{ event.presenter_context.narrative_brief }}
 {% endif %}
+{% if event.speech_turns %}
+{% for turn in event.speech_turns -%}
+{% if turn.speaker_role == "host" %}Ведущий{% elif turn.speaker_role == "offscreen_questioner" %}Закадровый вопрос{% else %}{{ turn.speaker or "Голос" }}{% endif %}: {{ turn.text }}
+{% endfor %}
+{% else %}
 {{ event.speech_text }}
+{% endif %}
 
 {{ event.visual_summary }}
 

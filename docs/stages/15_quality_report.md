@@ -13,6 +13,7 @@ The stage loads all canonical upstream artifacts, verifies that timeline and chu
 - `metadata/video_info.json`
 - `downloads/audio.ffprobe.json`
 - `downloads/video_proxy.ffprobe.json`
+- `stt/speaker_diarization.json`
 - `stt/speech_tokens.jsonl`
 - `stt/speech_segments.jsonl`
 - `scenes/scenes.jsonl`
@@ -35,9 +36,9 @@ The stage can be skipped when `quality_report.json` exists and parses as `Qualit
 - This is the last stage that should inspect all canonical data before cleanup.
 - Failed jobs retain media/frames for resume and debugging because cleanup runs only after this stage.
 - Warnings should be diagnostic; hard failures should be reserved for impossible consistency states.
+- Speaker count is not fixed. Quality report warns only when diarization is enabled but no speaker labels are detected.
 
 ## Related Code
 
 - `src/style_kb/stages/stage_15_quality_report.py`
 - `src/style_kb/models.py::QualityReport`
-

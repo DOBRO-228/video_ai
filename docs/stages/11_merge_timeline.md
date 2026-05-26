@@ -8,7 +8,7 @@ Build the central multimodal timeline: one `TimelineEvent` per scene containing 
 
 The stage checks audio/video duration mismatch, loads scenes, visual events, speech segments, and speech tokens, then builds one timeline event per scene. Speech is clipped to scene boundaries using token midpoint timestamps instead of blindly attaching whole overlapping segments.
 
-Visual fields and `presenter_context` are copied from the scene's `VisualEvent`.
+Visual fields and `presenter_context` are copied from the scene's `VisualEvent`. Speech is also grouped into `speech_turns` so downstream consumers can distinguish `host` from `offscreen_questioner`.
 
 ## Inputs
 
@@ -33,9 +33,9 @@ The stage rebuilds expected timeline events and compares them with the existing 
 - Fail when audio/video duration mismatch exceeds 1 second.
 - Missing visual event for any scene is a hard error.
 - Timeline events are the main bridge between raw modalities and chunks.
+- Keep `speech_text` plain for compatibility; use `speech_turns` for speaker-aware dialogue.
 
 ## Related Code
 
 - `src/style_kb/stages/stage_11_merge_timeline.py`
 - `src/style_kb/models.py::TimelineEvent`
-

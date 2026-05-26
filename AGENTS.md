@@ -59,6 +59,12 @@ Preserve provenance on useful outputs:
 
 `timeline_event` is the central object: speech plus visual evidence plus on-screen text plus timestamp/source grounding.
 
+Speech diarization uses raw Soniox speaker ids plus repository-level roles:
+
+- `host`: the speaker with the largest speech duration.
+- `offscreen_questioner`: other detected speakers, usually questions from off camera.
+- `unknown`: only for data that cannot be assigned.
+
 ## Environment
 
 API keys are loaded from `.env` into environment variables:

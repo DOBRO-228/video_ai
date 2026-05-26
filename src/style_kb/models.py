@@ -11,6 +11,7 @@ JobState = Literal["pending", "running", "completed", "failed"]
 ConfidenceLevel = Literal["low", "medium", "high"]
 PresenterRole = Literal["none", "primary_presenter", "other_person"]
 PresenterRelevance = Literal["none", "background", "brief", "primary_example"]
+SpeakerRole = Literal["host", "offscreen_questioner", "unknown"]
 
 
 class StrictModel(BaseModel):
@@ -51,6 +52,26 @@ class PresenterProfile(StrictModel):
     notes: str
 
 
+class SpeakerProfile(StrictModel):
+    speaker: str
+    role: SpeakerRole
+    tokens_count: int
+    words_count: int
+    speech_seconds: float
+    first_start: float | None = None
+    last_end: float | None = None
+
+
+class SpeakerDiarization(StrictModel):
+    video_id: str
+    provider: str
+    model: str
+    enabled: bool
+    detected_speakers: int
+    role_strategy: str
+    speakers: list[SpeakerProfile]
+
+
 class TimeBoundModel(StrictModel):
     video_id: str
     start: float
@@ -81,6 +102,7 @@ class SpeechToken(TimeBoundModel):
     start_ms: int
     end_ms: int
     speaker: str | None = None
+    speaker_role: SpeakerRole | None = None
     language: str | None = None
 
 
@@ -93,8 +115,16 @@ class SpeechSegment(GroundedTimeBoundModel):
     token_end_index: int
     tokens_count: int
     speaker: str | None = None
+    speaker_role: SpeakerRole | None = None
     language: str | None = None
     source: ProviderSource
+
+
+class SpeechTurn(GroundedTimeBoundModel):
+    text: str
+    speaker: str | None = None
+    speaker_role: SpeakerRole | None = None
+    speech_segment_ids: list[str]
 
 
 class Scene(GroundedTimeBoundModel):
@@ -134,6 +164,7 @@ class TimelineEvent(GroundedTimeBoundModel):
     channel: str
     presenter_context: PresenterContext
     speech_text: str
+    speech_turns: list[SpeechTurn]
     visual_summary: str
     on_screen_text: list[str]
     items: list[str]
@@ -150,12 +181,14 @@ class Chunk(GroundedTimeBoundModel):
     url: str
     presenter_brief: str
     speech_text: str
+    dialogue_text: str
     visual_text: str
     combined_text: str
     on_screen_text: list[str]
     topics: list[str]
     entities: list[str]
     modality: list[str]
+    speaker_roles: list[SpeakerRole]
     timeline_event_ids: list[str]
 
 
@@ -205,4 +238,3 @@ class StageStatus(StrictModel):
     error_code: str | None = None
     error_message: str | None = None
     metrics: dict[str, Any] = Field(default_factory=dict)
-

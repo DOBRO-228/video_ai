@@ -11,6 +11,7 @@ The stage copies canonical internal artifacts into `exports/jsonl/` using the ex
 ## Inputs
 
 - `metadata/video_info.json`
+- `stt/speaker_diarization.json`
 - `stt/speech_tokens.jsonl`
 - `stt/speech_segments.jsonl`
 - `scenes/scenes.jsonl`
@@ -22,6 +23,7 @@ The stage copies canonical internal artifacts into `exports/jsonl/` using the ex
 ## Outputs
 
 - `exports/jsonl/video_info.jsonl`
+- `exports/jsonl/speaker_diarization.jsonl`
 - `exports/jsonl/speech_tokens.jsonl`
 - `exports/jsonl/speech_segments.jsonl`
 - `exports/jsonl/scenes.jsonl`
@@ -32,7 +34,7 @@ The stage copies canonical internal artifacts into `exports/jsonl/` using the ex
 
 ## Skip Validation
 
-The stage can be skipped when every expected exported JSONL file exists.
+The stage can be skipped when every expected exported JSONL file exists, including `speaker_diarization.jsonl`.
 
 ## Important Notes
 
@@ -44,4 +46,3 @@ The stage can be skipped when every expected exported JSONL file exists.
 
 - `src/style_kb/stages/stage_13_export_jsonl.py`
 - `src/style_kb/export/jsonl.py`
-

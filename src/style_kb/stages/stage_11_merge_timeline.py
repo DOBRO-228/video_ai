@@ -4,7 +4,7 @@ import re
 
 from style_kb.clients.media import duration_seconds
 from style_kb.errors import MediaToolError, StageExecutionError
-from style_kb.models import Scene, SourceRef, SpeechSegment, SpeechToken, TimelineEvent, VideoInfo, VisualEvent
+from style_kb.models import Scene, SourceRef, SpeechSegment, SpeechToken, SpeechTurn, TimelineEvent, VideoInfo, VisualEvent
 from style_kb.pipeline.base import Stage, StageContext, StageResult
 from style_kb.stages.common import (
     load_scenes,
@@ -115,6 +115,7 @@ def _build_scene_timeline_event(
     is_last_scene: bool,
 ) -> TimelineEvent:
     scene_tokens: list[SpeechToken] = []
+    scene_token_segment_ids: list[str] = []
     scene_segment_ids: list[str] = []
     audio_source_refs: list[SourceRef] = []
 
@@ -133,6 +134,7 @@ def _build_scene_timeline_event(
         if not clipped_tokens:
             continue
         scene_tokens.extend(clipped_tokens)
+        scene_token_segment_ids.extend([segment.segment_id] * len(clipped_tokens))
         scene_segment_ids.append(segment.segment_id)
         audio_source_refs.append(
             SourceRef(
@@ -157,6 +159,7 @@ def _build_scene_timeline_event(
         end=scene.end,
         timestamp_url=build_timestamp_url(context.job.video_id, scene.start),
         speech_text=_join_tokens(scene_tokens),
+        speech_turns=_build_speech_turns(context.job.video_id, scene_tokens, scene_token_segment_ids),
         visual_summary=visual_event.visual_summary,
         on_screen_text=stable_unique(visual_event.on_screen_text),
         items=stable_unique(visual_event.items),
@@ -165,6 +168,51 @@ def _build_scene_timeline_event(
         scene_id=scene.scene_id,
         speech_segment_ids=scene_segment_ids,
         source_refs=source_refs,
+    )
+
+
+def _build_speech_turns(video_id: str, tokens: list[SpeechToken], segment_ids: list[str]) -> list[SpeechTurn]:
+    if not tokens:
+        return []
+    turns: list[SpeechTurn] = []
+    current_tokens: list[SpeechToken] = []
+    current_segment_ids: list[str] = []
+    current_identity: tuple[str | None, str | None] | None = None
+
+    for token, segment_id in zip(tokens, segment_ids):
+        identity = current_identity if not token.text.strip() and current_identity is not None else (token.speaker, token.speaker_role)
+        if current_identity is not None and identity != current_identity and current_tokens:
+            turns.append(_speech_turn(video_id, current_tokens, current_segment_ids, current_identity))
+            current_tokens = []
+            current_segment_ids = []
+        current_identity = identity
+        current_tokens.append(token)
+        current_segment_ids.append(segment_id)
+
+    if current_tokens and current_identity is not None:
+        turns.append(_speech_turn(video_id, current_tokens, current_segment_ids, current_identity))
+    return turns
+
+
+def _speech_turn(
+    video_id: str,
+    tokens: list[SpeechToken],
+    segment_ids: list[str],
+    identity: tuple[str | None, str | None],
+) -> SpeechTurn:
+    speaker, speaker_role = identity
+    start = tokens[0].start
+    end = tokens[-1].end
+    return SpeechTurn(
+        video_id=video_id,
+        start=start,
+        end=end,
+        timestamp_url=build_timestamp_url(video_id, start),
+        text=_join_tokens(tokens),
+        speaker=speaker,
+        speaker_role=speaker_role,
+        speech_segment_ids=stable_unique(segment_ids),
+        source_refs=[SourceRef(type="audio", url=build_timestamp_url(video_id, start), start=start, end=end, modality="audio")],
     )
 
 
