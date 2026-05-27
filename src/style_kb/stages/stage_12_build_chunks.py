@@ -22,73 +22,83 @@ class Stage12BuildChunks(Stage):
         return [context.paths.chunks_jsonl]
 
     def validate_outputs(self, context: StageContext) -> bool:
-        if not context.paths.chunks_jsonl.exists():
+        if not context.paths.chunks_jsonl.exists() or not context.paths.timeline_events_jsonl.exists():
             return False
-        return bool(load_chunks(context.paths.chunks_jsonl))
+        actual_chunks = load_chunks(context.paths.chunks_jsonl)
+        expected_chunks = _build_chunks(context)
+        return bool(actual_chunks) and [
+            chunk.model_dump(mode="json") for chunk in actual_chunks
+        ] == [
+            chunk.model_dump(mode="json") for chunk in expected_chunks
+        ]
 
     def run(self, context: StageContext) -> StageResult:
-        events = load_timeline_events(context.paths.timeline_events_jsonl)
-        if not events:
-            raise StageExecutionError("cannot build chunks from empty timeline", error_code="empty_timeline")
-
-        chunks: list[Chunk] = []
-        index = 0
-        while index < len(events):
-            chunk_events = _collect_chunk_events(events, index, context)
-            start = chunk_events[0].start
-            end = chunk_events[-1].end
-            speech_text = " ".join(event.speech_text for event in chunk_events if event.speech_text).strip()
-            dialogue_text = _dialogue_text(chunk_events)
-            presenter_brief = _presenter_brief(chunk_events)
-            visual_text = compact_join(
-                [
-                    " ".join(event.visual_summary for event in chunk_events if event.visual_summary).strip(),
-                    "\n".join(text for event in chunk_events for text in event.on_screen_text).strip(),
-                ]
-            )
-            combined_text = compact_join([dialogue_text or speech_text, presenter_brief, visual_text])
-            topics = stable_unique(topic for event in chunk_events for topic in event.topics)
-            entities = stable_unique(item for event in chunk_events for item in event.items)
-            on_screen_text = stable_unique(text for event in chunk_events for text in event.on_screen_text)
-            speaker_roles = stable_unique(
-                turn.speaker_role
-                for event in chunk_events
-                for turn in event.speech_turns
-                if turn.speaker_role
-            )
-            modality = []
-            if speech_text:
-                modality.append("audio")
-            if visual_text or on_screen_text:
-                modality.append("visual")
-            chunks.append(
-                Chunk(
-                    chunk_id=chunk_id(context.job.video_id, start, end),
-                    video_id=context.job.video_id,
-                    title=chunk_events[0].title,
-                    channel=chunk_events[0].channel,
-                    url=context.job.url,
-                    presenter_brief=presenter_brief,
-                    start=start,
-                    end=end,
-                    timestamp_url=build_timestamp_url(context.job.video_id, start),
-                    speech_text=speech_text,
-                    dialogue_text=dialogue_text,
-                    visual_text=visual_text,
-                    combined_text=combined_text,
-                    on_screen_text=on_screen_text,
-                    topics=topics,
-                    entities=entities,
-                    modality=modality,
-                    speaker_roles=speaker_roles,
-                    timeline_event_ids=[event.event_id for event in chunk_events],
-                    source_refs=[youtube_source_ref(context.job.video_id, start, end, title=chunk_events[0].title)],
-                )
-            )
-            index = _next_chunk_index(events, index, chunk_events[-1], context)
-
+        chunks = _build_chunks(context)
         write_models_jsonl(context.paths.chunks_jsonl, chunks)
         return StageResult(output_files=self.output_files(context), metrics={"chunks_count": len(chunks)})
+
+
+def _build_chunks(context: StageContext) -> list[Chunk]:
+    events = load_timeline_events(context.paths.timeline_events_jsonl)
+    if not events:
+        raise StageExecutionError("cannot build chunks from empty timeline", error_code="empty_timeline")
+
+    chunks: list[Chunk] = []
+    index = 0
+    while index < len(events):
+        chunk_events = _collect_chunk_events(events, index, context)
+        start = chunk_events[0].start
+        end = chunk_events[-1].end
+        speech_text = " ".join(event.speech_text for event in chunk_events if event.speech_text).strip()
+        dialogue_text = _dialogue_text(chunk_events)
+        presenter_brief = _presenter_brief(chunk_events)
+        visual_text = compact_join(
+            [
+                " ".join(event.visual_summary for event in chunk_events if event.visual_summary).strip(),
+                "\n".join(text for event in chunk_events for text in event.on_screen_text).strip(),
+            ]
+        )
+        combined_text = compact_join([dialogue_text or speech_text, presenter_brief, visual_text])
+        topics = stable_unique(topic for event in chunk_events for topic in event.topics)
+        entities = stable_unique(item for event in chunk_events for item in event.items)
+        on_screen_text = stable_unique(text for event in chunk_events for text in event.on_screen_text)
+        speaker_roles = stable_unique(
+            turn.speaker_role
+            for event in chunk_events
+            for turn in event.speech_turns
+            if turn.speaker_role
+        )
+        modality = []
+        if speech_text:
+            modality.append("audio")
+        if visual_text or on_screen_text:
+            modality.append("visual")
+        chunks.append(
+            Chunk(
+                chunk_id=chunk_id(context.job.video_id, start, end),
+                video_id=context.job.video_id,
+                title=chunk_events[0].title,
+                channel=chunk_events[0].channel,
+                url=context.job.url,
+                presenter_brief=presenter_brief,
+                start=start,
+                end=end,
+                timestamp_url=build_timestamp_url(context.job.video_id, start),
+                speech_text=speech_text,
+                dialogue_text=dialogue_text,
+                visual_text=visual_text,
+                combined_text=combined_text,
+                on_screen_text=on_screen_text,
+                topics=topics,
+                entities=entities,
+                modality=modality,
+                speaker_roles=speaker_roles,
+                timeline_event_ids=[event.event_id for event in chunk_events],
+                source_refs=[youtube_source_ref(context.job.video_id, start, end, title=chunk_events[0].title)],
+            )
+        )
+        index = _next_chunk_index(events, index, chunk_events[-1], context)
+    return chunks
 
 
 def _presenter_brief(events) -> str:
@@ -147,18 +157,14 @@ def _collect_chunk_events(events, start_index: int, context: StageContext):
 
 
 def _next_chunk_index(events, current_start_index: int, last_event, context: StageContext) -> int:
-    next_index = current_start_index + 1
     if context.config.chunking.overlap_seconds <= 0:
         return len(events) if last_event == events[-1] else events.index(last_event) + 1
 
-    chunk_end = last_event.end
-    overlap_cutoff = chunk_end - context.config.chunking.overlap_seconds
     end_index = events.index(last_event)
-    next_index = end_index + 1
-    for candidate_index in range(current_start_index + 1, end_index + 1):
-        if events[candidate_index].end > overlap_cutoff:
-            next_index = candidate_index
-            break
-    if next_index <= current_start_index:
-        next_index = current_start_index + 1
-    return next_index
+    if last_event == events[-1]:
+        return len(events)
+    if end_index <= current_start_index:
+        return end_index + 1
+    if last_event.end - last_event.start >= context.config.chunking.overlap_seconds:
+        return end_index
+    return end_index + 1

@@ -68,6 +68,7 @@ class SpeakerDiarization(StrictModel):
     model: str
     enabled: bool
     detected_speakers: int
+    unassigned_tokens_count: int
     role_strategy: str
     speakers: list[SpeakerProfile]
 

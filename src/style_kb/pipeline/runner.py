@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Callable
 
 from style_kb.config import default_config_path, load_default_config
+from style_kb.config.models import AppConfig
 from style_kb.errors import JobLockError, StageExecutionError, StyleKbError
 from style_kb.models import Job, StageStatus
 from style_kb.pipeline.base import StageContext
@@ -194,7 +195,7 @@ class PipelineRunner:
 
     def _job_has_final_outputs(self, job: Job) -> bool:
         paths = JobPaths(self.output_root, job.job_id)
-        return all(
+        if not all(
             path.exists()
             for path in [
                 paths.timeline_events_jsonl,
@@ -203,7 +204,23 @@ class PipelineRunner:
                 paths.cleanup_report,
                 paths.obsidian_index,
             ]
+        ):
+            return False
+
+        context = StageContext(
+            config=self.config,
+            repository=self.repository,
+            job=job,
+            paths=paths,
+            progress_callback=self.progress_callback,
         )
+        for stage_class in STAGES:
+            stage = stage_class()
+            if _stage_outputs_may_be_cleaned(stage.name, self.config):
+                continue
+            if not stage.validate_outputs(context) or not stage.outputs_are_current(context):
+                return False
+        return True
 
     def _write_stage_outcome_log(
         self,
@@ -281,6 +298,12 @@ def _is_pid_alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _stage_outputs_may_be_cleaned(stage_name: str, config: AppConfig) -> bool:
+    if stage_name in {"02_download_audio", "03_download_video_proxy"} and not config.project.keep_media:
+        return True
+    return stage_name == "09_extract_keyframes" and not config.project.keep_frames
 
 
 def _pretty_json(value: object) -> str:

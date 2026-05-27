@@ -6,7 +6,7 @@ Build the central multimodal timeline: one `TimelineEvent` per scene containing 
 
 ## How It Works
 
-The stage checks audio/video duration mismatch, loads scenes, visual events, speech segments, and speech tokens, then builds one timeline event per scene. Speech is clipped to scene boundaries using token midpoint timestamps instead of blindly attaching whole overlapping segments.
+The stage checks audio/video duration mismatch, stores the checked durations in durable timeline metadata, loads scenes, visual events, speech segments, and speech tokens, then builds one timeline event per scene. Speech is clipped to scene boundaries using token midpoint timestamps instead of blindly attaching whole overlapping segments.
 
 Visual fields and `presenter_context` are copied from the scene's `VisualEvent`. Speech is also grouped into `speech_turns` so downstream consumers can distinguish `host` from `offscreen_questioner`.
 
@@ -23,10 +23,13 @@ Visual fields and `presenter_context` are copied from the scene's `VisualEvent`.
 ## Outputs
 
 - `timeline/timeline_events.jsonl`
+- `timeline/media_durations.json`
 
 ## Skip Validation
 
-The stage rebuilds expected timeline events and compares them with the existing output. It skips only when the existing output matches the deterministic rebuild.
+The stage rebuilds expected timeline events and compares them with the existing output. It skips only when the existing output matches the deterministic rebuild and `timeline/media_durations.json` still matches current ffprobe data when ffprobe files are present.
+
+After `16_cleanup` removes media and ffprobe files, validation uses `timeline/media_durations.json` as the durable source for the original audio/video duration check.
 
 ## Important Notes
 

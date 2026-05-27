@@ -17,9 +17,12 @@ from style_kb.stages.common import (
     youtube_source_ref,
 )
 from style_kb.utils.collections import stable_unique
+from style_kb.utils.files import write_json_atomic
 from style_kb.utils.ids import timeline_event_id
 from style_kb.utils.pydantic_io import write_models_jsonl
 from style_kb.utils.time import build_timestamp_url
+
+_DURATION_MISMATCH_LIMIT_SECONDS = 1.0
 
 
 class Stage11MergeTimeline(Stage):
@@ -38,21 +41,21 @@ class Stage11MergeTimeline(Stage):
         ]
 
     def output_files(self, context: StageContext) -> list:
-        return [context.paths.timeline_events_jsonl]
+        return [context.paths.timeline_events_jsonl, context.paths.timeline_media_durations]
 
     def validate_outputs(self, context: StageContext) -> bool:
-        if not context.paths.timeline_events_jsonl.exists():
+        if not context.paths.timeline_events_jsonl.exists() or not context.paths.timeline_media_durations.exists():
             return False
-        try:
-            actual_events = load_timeline_events(context.paths.timeline_events_jsonl)
-        except Exception:
+        actual_media_durations = read_payload(context.paths.timeline_media_durations)
+        _validate_media_durations(actual_media_durations, context.job.video_id)
+        expected_media_durations = _expected_media_durations(context, actual_media_durations)
+        if actual_media_durations != expected_media_durations:
             return False
+
+        actual_events = load_timeline_events(context.paths.timeline_events_jsonl)
         if not actual_events:
             return False
-        try:
-            expected_events = _build_timeline_events(context)
-        except Exception:
-            return False
+        expected_events = _build_timeline_events(context, media_durations=expected_media_durations)
         if len(actual_events) != len(expected_events):
             return False
         return all(
@@ -61,18 +64,28 @@ class Stage11MergeTimeline(Stage):
         )
 
     def run(self, context: StageContext) -> StageResult:
-        timeline_events = _build_timeline_events(context)
+        media_durations = _build_media_durations(context)
+        timeline_events = _build_timeline_events(context, media_durations=media_durations)
+        write_json_atomic(context.paths.timeline_media_durations, media_durations)
         write_models_jsonl(context.paths.timeline_events_jsonl, timeline_events)
-        return StageResult(output_files=self.output_files(context), metrics={"timeline_events_count": len(timeline_events)})
+        return StageResult(
+            output_files=self.output_files(context),
+            metrics={
+                "timeline_events_count": len(timeline_events),
+                "audio_video_duration_abs": media_durations["audio_video_duration_abs"],
+            },
+        )
 
 
-def _build_timeline_events(context: StageContext) -> list[TimelineEvent]:
-    audio_duration = duration_seconds(read_payload(context.paths.downloads_audio_ffprobe))
-    video_duration = duration_seconds(read_payload(context.paths.downloads_video_ffprobe))
-    if abs(audio_duration - video_duration) > 1.0:
+def _build_timeline_events(context: StageContext, *, media_durations: dict) -> list[TimelineEvent]:
+    _validate_media_durations(media_durations, context.job.video_id)
+    if media_durations["audio_video_duration_abs"] > _DURATION_MISMATCH_LIMIT_SECONDS:
         raise MediaToolError("audio/video duration mismatch exceeds 1.0s", error_code="audio_video_duration_mismatch")
 
     video_info = load_video_info(context.paths.metadata_video_info)
+    if media_durations["metadata_duration"] != video_info.duration:
+        raise MediaToolError("metadata duration changed after timeline merge", error_code="metadata_duration_changed")
+
     speech_tokens = load_speech_tokens(context.paths.stt_speech_tokens)
     speech_segments = load_speech_segments(context.paths.stt_speech_segments)
     visual_events = {event.scene_id: event for event in load_visual_events(context.paths.visual_events_jsonl)}
@@ -101,6 +114,40 @@ def _build_timeline_events(context: StageContext) -> list[TimelineEvent]:
             )
         )
     return timeline_events
+
+
+def _build_media_durations(context: StageContext) -> dict:
+    video_info = load_video_info(context.paths.metadata_video_info)
+    audio_duration = duration_seconds(read_payload(context.paths.downloads_audio_ffprobe))
+    video_duration = duration_seconds(read_payload(context.paths.downloads_video_ffprobe))
+    audio_video_duration_abs = round(abs(audio_duration - video_duration), 4)
+    if audio_video_duration_abs > _DURATION_MISMATCH_LIMIT_SECONDS:
+        raise MediaToolError("audio/video duration mismatch exceeds 1.0s", error_code="audio_video_duration_mismatch")
+    return {
+        "video_id": context.job.video_id,
+        "audio_duration": audio_duration,
+        "video_duration": video_duration,
+        "metadata_duration": video_info.duration,
+        "audio_video_duration_abs": audio_video_duration_abs,
+    }
+
+
+def _expected_media_durations(context: StageContext, existing_media_durations: dict) -> dict:
+    if context.paths.downloads_audio_ffprobe.exists() and context.paths.downloads_video_ffprobe.exists():
+        return _build_media_durations(context)
+    return existing_media_durations
+
+
+def _validate_media_durations(payload: dict, video_id: str) -> None:
+    if payload.get("video_id") != video_id:
+        raise MediaToolError("timeline media durations belong to a different video", error_code="timeline_media_video_mismatch")
+    for key in ["audio_duration", "video_duration", "metadata_duration", "audio_video_duration_abs"]:
+        value = payload.get(key)
+        if not isinstance(value, int | float) or value < 0:
+            raise MediaToolError("timeline media durations are invalid", error_code="timeline_media_durations_invalid")
+    expected_mismatch = round(abs(payload["audio_duration"] - payload["video_duration"]), 4)
+    if payload["audio_video_duration_abs"] != expected_mismatch:
+        raise MediaToolError("timeline media duration mismatch value is inconsistent", error_code="timeline_media_durations_invalid")
 
 
 def _build_scene_timeline_event(

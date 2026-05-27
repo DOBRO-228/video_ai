@@ -87,7 +87,7 @@ vision:
   provider: openai
   model: gpt-5-nano
   detail: low
-  batch_size: 8
+  batch_size: 16
   presenter_bootstrap_enabled: true
   presenter_bootstrap_prompt_file: presenter_profile_ru.txt
   presenter_bootstrap_scene_limit: 12

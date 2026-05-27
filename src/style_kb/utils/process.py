@@ -26,13 +26,17 @@ def run_subprocess(
     if log_path is not None:
         stage_name = _stage_name_from_log_path(log_path)
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        header_lines = [
+            f"stage: {stage_name}",
+            f"return_code: {completed.returncode}",
+            "command: " + " ".join(args),
+        ]
+        if completed.returncode != 0:
+            header_lines.insert(1, f"error_code: {error_code}")
         log_path.write_text(
             "\n".join(
-                [
-                    f"stage: {stage_name}",
-                    f"error_code: {error_code}",
-                    f"return_code: {completed.returncode}",
-                    "command: " + " ".join(args),
+                header_lines
+                + [
                     "",
                     "[stdout]",
                     completed.stdout,

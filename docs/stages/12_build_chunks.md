@@ -12,6 +12,8 @@ Presenter baseline enters chunk text only through `presenter_brief`, and only wh
 
 When timeline events contain `speech_turns`, chunks also include `dialogue_text` with labels such as `Ведущий:` and `Закадровый вопрос:`.
 
+Scene overlap is discrete: a next chunk overlaps the previous chunk only with the previous last timeline event, and only when that event alone is long enough to cover configured `overlap_seconds`. This avoids excessive sliding-window duplication on videos with many short scenes.
+
 ## Inputs
 
 - `timeline/timeline_events.jsonl`
@@ -23,7 +25,7 @@ When timeline events contain `speech_turns`, chunks also include `dialogue_text`
 
 ## Skip Validation
 
-The stage can be skipped when `chunks.jsonl` exists and parses to at least one `Chunk`.
+The stage can be skipped when `chunks.jsonl` exists and matches the deterministic rebuild from current timeline events and chunking config.
 
 ## Important Notes
 

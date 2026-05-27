@@ -9,7 +9,7 @@ from style_kb.models import SpeakerDiarization, SpeakerProfile, SpeechToken
 from style_kb.pipeline.base import Stage, StageContext, StageResult
 from style_kb.stages.common import load_speech_tokens, read_payload
 from style_kb.utils.files import write_json_atomic
-from style_kb.utils.pydantic_io import read_model, write_model, write_models_jsonl
+from style_kb.utils.pydantic_io import write_model, write_models_jsonl
 from style_kb.utils.time import ms_to_seconds
 
 
@@ -22,6 +22,7 @@ class Stage06SonioxFetchTranscript(Stage):
 
     def output_files(self, context: StageContext) -> list:
         return [
+            context.paths.stt_transcription,
             context.paths.stt_transcript_raw,
             context.paths.stt_speech_tokens,
             context.paths.stt_speaker_diarization,
@@ -38,7 +39,10 @@ class Stage06SonioxFetchTranscript(Stage):
         if not tokens:
             return False
         transcript_payload = read_payload(context.paths.stt_transcript_raw)
-        diarization = read_model(context.paths.stt_speaker_diarization, SpeakerDiarization)
+        diarization_payload = read_payload(context.paths.stt_speaker_diarization)
+        if "unassigned_tokens_count" not in diarization_payload:
+            return False
+        diarization = SpeakerDiarization.model_validate(diarization_payload)
         expected_tokens = _apply_speaker_roles(
             _normalize_tokens(context.job.video_id, transcript_payload),
             diarization,
@@ -104,7 +108,7 @@ class Stage06SonioxFetchTranscript(Stage):
 def _build_speaker_diarization(video_id: str, tokens: list[SpeechToken], context: StageContext) -> SpeakerDiarization:
     speaker_tokens: dict[str, list[SpeechToken]] = defaultdict(list)
     for token in tokens:
-        if not token.text.strip() or not token.speaker:
+        if not token.speaker:
             continue
         speaker_tokens[token.speaker].append(token)
 
@@ -135,6 +139,7 @@ def _build_speaker_diarization(video_id: str, tokens: list[SpeechToken], context
         model=context.config.stt.model,
         enabled=context.config.stt.speaker_diarization,
         detected_speakers=len(profiles),
+        unassigned_tokens_count=sum(1 for token in tokens if not token.speaker),
         role_strategy=context.config.stt.speaker_role_strategy,
         speakers=profiles,
     )

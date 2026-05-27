@@ -74,10 +74,7 @@ class Stage07BuildSpeechSegments(Stage):
     def validate_outputs(self, context: StageContext) -> bool:
         if not context.paths.stt_speech_segments.exists() or not context.paths.stt_speech_segments_raw.exists():
             return False
-        try:
-            read_payload(context.paths.stt_speech_segments_raw)
-        except Exception:
-            return False
+        read_payload(context.paths.stt_speech_segments_raw)
 
         segments = load_speech_segments(context.paths.stt_speech_segments)
         tokens = load_speech_tokens(context.paths.stt_speech_tokens)
@@ -131,6 +128,11 @@ class Stage07BuildSpeechSegments(Stage):
             previous_end_position = end_position
 
         if previous_end_position != len(tokens) - 1:
+            return False
+        expected_segments = _merge_short_same_speaker_segments(segments, tokens, context)
+        if [segment.model_dump(mode="json") for segment in segments] != [
+            segment.model_dump(mode="json") for segment in expected_segments
+        ]:
             return False
         return not _semantic_boundary_violations(segments)
 
@@ -191,6 +193,7 @@ def _segment_with_retries(
             raw_output_path=context.paths.stt_speech_segments_raw,
         )
         segments = _segments_from_payload(payload, units, tokens, context)
+        segments = _merge_short_same_speaker_segments(segments, tokens, context)
         violations = _semantic_boundary_violations(segments)
         if not violations:
             return segments, attempt
@@ -309,6 +312,96 @@ def _segments_from_payload(
             error_code="openai_segmenter_incomplete_coverage",
         )
     return results
+
+
+def _merge_short_same_speaker_segments(
+    segments: list[SpeechSegment],
+    tokens: list[SpeechToken],
+    context: StageContext,
+) -> list[SpeechSegment]:
+    if not segments:
+        return []
+
+    token_positions = {token.token_index: index for index, token in enumerate(tokens)}
+    merged: list[SpeechSegment] = []
+    current = segments[0]
+    for next_segment in segments[1:]:
+        if _should_merge_same_speaker_segments(current, next_segment, token_positions, tokens, context):
+            current = _merge_segments(current, next_segment, token_positions, tokens, context)
+            continue
+        merged.append(current)
+        current = next_segment
+    merged.append(current)
+    return merged
+
+
+def _should_merge_same_speaker_segments(
+    current: SpeechSegment,
+    next_segment: SpeechSegment,
+    token_positions: dict[int, int],
+    tokens: list[SpeechToken],
+    context: StageContext,
+) -> bool:
+    if not current.speaker or current.speaker != next_segment.speaker:
+        return False
+    if current.speaker_role != next_segment.speaker_role:
+        return False
+    if current.end - current.start >= context.config.speech_segmentation.min_segment_seconds:
+        if next_segment.end - next_segment.start >= context.config.speech_segmentation.min_segment_seconds:
+            return False
+
+    start_position = token_positions.get(current.token_start_index)
+    current_end_position = token_positions.get(current.token_end_index)
+    next_start_position = token_positions.get(next_segment.token_start_index)
+    end_position = token_positions.get(next_segment.token_end_index)
+    if (
+        start_position is None
+        or current_end_position is None
+        or next_start_position is None
+        or end_position is None
+        or start_position > end_position
+        or current_end_position + 1 != next_start_position
+    ):
+        return False
+    group = tokens[start_position : end_position + 1]
+    duration = group[-1].end - group[0].start
+    if duration > context.config.speech_segmentation.max_segment_seconds + _DURATION_EPSILON_SECONDS:
+        return False
+    return _word_count_from_tokens(group) <= context.config.speech_segmentation.max_segment_words
+
+
+def _merge_segments(
+    current: SpeechSegment,
+    next_segment: SpeechSegment,
+    token_positions: dict[int, int],
+    tokens: list[SpeechToken],
+    context: StageContext,
+) -> SpeechSegment:
+    start_position = token_positions[current.token_start_index]
+    end_position = token_positions[next_segment.token_end_index]
+    group = tokens[start_position : end_position + 1]
+    languages = [token.language for token in group if token.language]
+    language = Counter(languages).most_common(1)[0][0] if languages else None
+    start = group[0].start
+    end = group[-1].end
+    return SpeechSegment(
+        segment_id=speech_segment_id(context.job.video_id, start, end),
+        video_id=context.job.video_id,
+        start=start,
+        end=end,
+        start_ms=group[0].start_ms,
+        end_ms=group[-1].end_ms,
+        text=_join_tokens(group),
+        token_start_index=group[0].token_index,
+        token_end_index=group[-1].token_index,
+        tokens_count=len(group),
+        speaker=current.speaker,
+        speaker_role=current.speaker_role,
+        language=language,
+        timestamp_url=build_timestamp_url(context.job.video_id, start),
+        source=current.source,
+        source_refs=[youtube_source_ref(context.job.video_id, start, end, modality="audio")],
+    )
 
 
 def _build_prompt(base_prompt_text: str, violations: list[str], attempt: int) -> str:

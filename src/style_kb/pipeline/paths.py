@@ -146,6 +146,10 @@ class JobPaths:
         return self.timeline_dir / "timeline_events.jsonl"
 
     @property
+    def timeline_media_durations(self) -> Path:
+        return self.timeline_dir / "media_durations.json"
+
+    @property
     def chunks_jsonl(self) -> Path:
         return self.chunks_dir / "chunks.jsonl"
 
@@ -201,6 +205,7 @@ class JobPaths:
         return {
             "job_dir": str(self.job_dir),
             "timeline_events": str(self.timeline_events_jsonl),
+            "timeline_media_durations": str(self.timeline_media_durations),
             "chunks": str(self.chunks_jsonl),
             "quality_report": str(self.quality_report),
             "obsidian_index": str(self.obsidian_index),

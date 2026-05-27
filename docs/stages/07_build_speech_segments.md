@@ -10,6 +10,8 @@ The stage builds deterministic transcript units from Soniox tokens, then sends t
 
 Units are forced to break on speaker changes. The LLM is not allowed to combine different speakers into a single segment.
 
+After LLM segmentation, consecutive short segments from the same speaker are merged when the merged segment still respects max duration and max word constraints.
+
 ## Inputs
 
 - `stt/speech_tokens.jsonl`

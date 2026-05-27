@@ -13,6 +13,7 @@ Speaker role mapping is deterministic for the MVP:
 - Speaker with the largest speech duration becomes `host`.
 - Other detected speakers become `offscreen_questioner`.
 - If Soniox returns no speaker labels, tokens keep `speaker_role=null` and quality report emits a warning.
+- Tokens without a Soniox speaker label are counted in `unassigned_tokens_count`.
 
 ## Inputs
 

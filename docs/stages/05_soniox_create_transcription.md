@@ -16,7 +16,7 @@ The stage reads the uploaded file id, then calls `SonioxClient.create_transcript
 
 ## Outputs
 
-- `stt/soniox_transcription.json`
+- `stt/soniox_transcription.json` (later rewritten by `06_soniox_fetch_transcript` with the final terminal status payload)
 - SQLite remote ref `soniox_transcription_id`
 
 ## Skip Validation
