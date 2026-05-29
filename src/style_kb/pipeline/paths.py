@@ -50,6 +50,18 @@ class JobPaths:
         return self.job_dir / "chunks"
 
     @property
+    def chunks_raw_dir(self) -> Path:
+        return self.chunks_dir / "raw"
+
+    @property
+    def claims_dir(self) -> Path:
+        return self.job_dir / "claims"
+
+    @property
+    def claims_raw_dir(self) -> Path:
+        return self.claims_dir / "raw"
+
+    @property
     def exports_dir(self) -> Path:
         return self.job_dir / "exports"
 
@@ -154,6 +166,30 @@ class JobPaths:
         return self.chunks_dir / "chunks.jsonl"
 
     @property
+    def chunk_plan(self) -> Path:
+        return self.chunks_dir / "chunk_plan.json"
+
+    @property
+    def chunk_plan_errors(self) -> Path:
+        return self.chunks_dir / "chunk_plan_errors.json"
+
+    @property
+    def chunk_plan_warnings(self) -> Path:
+        return self.chunks_dir / "chunk_plan_warnings.json"
+
+    @property
+    def style_claims_jsonl(self) -> Path:
+        return self.claims_dir / "style_claims.jsonl"
+
+    @property
+    def style_claims_raw(self) -> Path:
+        return self.claims_dir / "style_claims_raw.json"
+
+    @property
+    def style_claims_errors(self) -> Path:
+        return self.claims_dir / "style_claims_errors.json"
+
+    @property
     def quality_report(self) -> Path:
         return self.reports_dir / "quality_report.json"
 
@@ -169,6 +205,18 @@ class JobPaths:
 
     def frame_path(self, scene_index: int, image_index: int) -> Path:
         return self.frames_dir / f"scene_{scene_index:06d}_{image_index:02d}.jpg"
+
+    def style_claims_raw_chunk(self, chunk_id: str) -> Path:
+        return self.claims_raw_dir / f"{chunk_id}.json"
+
+    def style_claims_raw_attempt(self, chunk_id: str, attempt: int) -> Path:
+        return self.claims_raw_dir / f"{chunk_id}_attempt_{attempt:02d}.json"
+
+    def chunk_plan_raw_attempt(self, window_index: int, attempt: int) -> Path:
+        return self.chunks_raw_dir / f"chunk_plan_window_{window_index:03d}_attempt_{attempt:02d}.json"
+
+    def chunk_plan_window_cache(self, window_index: int) -> Path:
+        return self.chunks_raw_dir / f"chunk_plan_window_{window_index:03d}_cache.json"
 
     def export_jsonl(self, name: str) -> Path:
         return self.export_jsonl_dir / name
@@ -193,6 +241,8 @@ class JobPaths:
             self.visual_raw_dir,
             self.timeline_dir,
             self.chunks_dir,
+            self.chunks_raw_dir,
+            self.claims_raw_dir,
             self.export_jsonl_dir,
             self.export_obsidian_dir / "videos",
             self.export_obsidian_dir / "chunks",
@@ -207,6 +257,9 @@ class JobPaths:
             "timeline_events": str(self.timeline_events_jsonl),
             "timeline_media_durations": str(self.timeline_media_durations),
             "chunks": str(self.chunks_jsonl),
+            "chunk_plan": str(self.chunk_plan),
+            "chunk_plan_warnings": str(self.chunk_plan_warnings),
+            "style_claims": str(self.style_claims_jsonl),
             "quality_report": str(self.quality_report),
             "obsidian_index": str(self.obsidian_index),
         }

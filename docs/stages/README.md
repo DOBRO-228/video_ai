@@ -20,10 +20,11 @@ Read the stage document before editing the corresponding `src/style_kb/stages/st
 | 10_describe_visuals | [10_describe_visuals.md](10_describe_visuals.md) | `src/style_kb/stages/stage_10_describe_visuals.py` |
 | 11_merge_timeline | [11_merge_timeline.md](11_merge_timeline.md) | `src/style_kb/stages/stage_11_merge_timeline.py` |
 | 12_build_chunks | [12_build_chunks.md](12_build_chunks.md) | `src/style_kb/stages/stage_12_build_chunks.py` |
-| 13_export_jsonl | [13_export_jsonl.md](13_export_jsonl.md) | `src/style_kb/stages/stage_13_export_jsonl.py` |
-| 14_export_obsidian | [14_export_obsidian.md](14_export_obsidian.md) | `src/style_kb/stages/stage_14_export_obsidian.py` |
-| 15_quality_report | [15_quality_report.md](15_quality_report.md) | `src/style_kb/stages/stage_15_quality_report.py` |
-| 16_cleanup | [16_cleanup.md](16_cleanup.md) | `src/style_kb/stages/stage_16_cleanup.py` |
+| 13_extract_style_claims | [13_extract_style_claims.md](13_extract_style_claims.md) | `src/style_kb/stages/stage_13_extract_style_claims.py` |
+| 14_export_jsonl | [14_export_jsonl.md](14_export_jsonl.md) | `src/style_kb/stages/stage_14_export_jsonl.py` |
+| 15_export_obsidian | [15_export_obsidian.md](15_export_obsidian.md) | `src/style_kb/stages/stage_15_export_obsidian.py` |
+| 16_quality_report | [16_quality_report.md](16_quality_report.md) | `src/style_kb/stages/stage_16_quality_report.py` |
+| 17_cleanup | [17_cleanup.md](17_cleanup.md) | `src/style_kb/stages/stage_17_cleanup.py` |
 
 ## Cross-Stage Invariants
 
@@ -34,4 +35,3 @@ Read the stage document before editing the corresponding `src/style_kb/stages/st
 - Configuration comes from `src/style_kb/config/default.yaml`, not CLI flags.
 - API keys come from `.env`/environment variables, not YAML.
 - Avoid fallback behavior unless it is already explicit in a stage document.
-

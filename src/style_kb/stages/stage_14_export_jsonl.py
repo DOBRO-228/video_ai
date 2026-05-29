@@ -4,9 +4,9 @@ from style_kb.export.jsonl import export_jsonl_bundle
 from style_kb.pipeline.base import Stage, StageContext, StageResult
 
 
-class Stage13ExportJsonl(Stage):
-    name = "13_export_jsonl"
-    ordinal = 13
+class Stage14ExportJsonl(Stage):
+    name = "14_export_jsonl"
+    ordinal = 14
 
     def input_files(self, context: StageContext) -> list:
         return [
@@ -19,6 +19,8 @@ class Stage13ExportJsonl(Stage):
             context.paths.visual_events_jsonl,
             context.paths.timeline_events_jsonl,
             context.paths.chunks_jsonl,
+            context.paths.chunk_plan,
+            context.paths.style_claims_jsonl,
         ]
 
     def output_files(self, context: StageContext) -> list:
@@ -35,6 +37,8 @@ class Stage13ExportJsonl(Stage):
             context.paths.export_jsonl("visual_events.jsonl"),
             context.paths.export_jsonl("timeline_events.jsonl"),
             context.paths.export_jsonl("chunks.jsonl"),
+            context.paths.export_jsonl("chunk_plan.jsonl"),
+            context.paths.export_jsonl("style_claims.jsonl"),
         ]
         return all(path.exists() for path in expected)
 
@@ -49,6 +53,8 @@ class Stage13ExportJsonl(Stage):
             visual_events_path=context.paths.visual_events_jsonl,
             timeline_events_path=context.paths.timeline_events_jsonl,
             chunks_path=context.paths.chunks_jsonl,
+            chunk_plan_path=context.paths.chunk_plan,
+            style_claims_path=context.paths.style_claims_jsonl,
             export_dir=context.paths.export_jsonl_dir,
         )
         return StageResult(output_files=outputs, metrics={"exported_files": len(outputs)})

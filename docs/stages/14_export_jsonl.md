@@ -1,4 +1,4 @@
-# 13_export_jsonl
+# 14_export_jsonl
 
 ## Purpose
 
@@ -19,6 +19,8 @@ The stage copies canonical internal artifacts into `exports/jsonl/` using the ex
 - `visual/visual_events.jsonl`
 - `timeline/timeline_events.jsonl`
 - `chunks/chunks.jsonl`
+- `chunks/chunk_plan.json`
+- `claims/style_claims.jsonl`
 
 ## Outputs
 
@@ -31,10 +33,12 @@ The stage copies canonical internal artifacts into `exports/jsonl/` using the ex
 - `exports/jsonl/visual_events.jsonl`
 - `exports/jsonl/timeline_events.jsonl`
 - `exports/jsonl/chunks.jsonl`
+- `exports/jsonl/chunk_plan.jsonl`
+- `exports/jsonl/style_claims.jsonl`
 
 ## Skip Validation
 
-The stage can be skipped when every expected exported JSONL file exists, including `speaker_diarization.jsonl`.
+The stage can be skipped when every expected exported JSONL file exists, including `speaker_diarization.jsonl`, `chunk_plan.jsonl`, and `style_claims.jsonl`.
 
 ## Important Notes
 
@@ -44,5 +48,5 @@ The stage can be skipped when every expected exported JSONL file exists, includi
 
 ## Related Code
 
-- `src/style_kb/stages/stage_13_export_jsonl.py`
+- `src/style_kb/stages/stage_14_export_jsonl.py`
 - `src/style_kb/export/jsonl.py`

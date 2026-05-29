@@ -1,14 +1,33 @@
 # {{ chunk.chunk_id }}
 
+- Chunk title: {{ chunk.chunk_title }}
 - Video: [{{ chunk.title }}]({{ chunk.url }})
 - Channel: {{ chunk.channel }}
 - Timestamp: [YouTube]({{ chunk.timestamp_url }})
 - Range: {{ chunk.start }}s -> {{ chunk.end }}s
+- Boundary: {{ chunk.boundary_reason }}
 - Topics: {{ chunk.topics|join(", ") }}
 - Entities: {{ chunk.entities|join(", ") }}
 - Modality: {{ chunk.modality|join(", ") }}
+- Speech segments: {{ chunk.speech_segment_ids|join(", ") }}
 {% if chunk.speaker_roles %}- Speaker roles: {{ chunk.speaker_roles|join(", ") }}
 {% endif %}
 {% if chunk.presenter_brief %}- Presenter: {{ chunk.presenter_brief }}
 {% endif %}
 {{ chunk.combined_text }}
+
+{% if style_claims %}
+## Style Claims
+
+{% for claim in style_claims -%}
+- **{{ claim.subject }}**: {{ claim.claim }}
+{% if claim.rationale %}  - Rationale: {{ claim.rationale }}
+{% endif %}
+{% if claim.conditions %}  - Conditions: {{ claim.conditions|join(", ") }}
+{% endif %}
+{% if claim.prefer %}  - Prefer: {{ claim.prefer|join(", ") }}
+{% endif %}
+{% if claim.avoid %}  - Avoid: {{ claim.avoid|join(", ") }}
+{% endif %}
+{% endfor %}
+{% endif %}

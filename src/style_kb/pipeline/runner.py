@@ -44,6 +44,7 @@ class PipelineRunner:
         job = self.repository.get_job(job_id)
         if job is None:
             raise StyleKbError(f"job not found: {job_id}")
+        self.repository.ensure_stages(job.job_id, [(stage.ordinal, stage.name) for stage in STAGES])
         return self._run_existing_job(job)
 
     def status(self, job_id: str) -> tuple[Job, list[StageStatus]]:
@@ -200,6 +201,7 @@ class PipelineRunner:
             for path in [
                 paths.timeline_events_jsonl,
                 paths.chunks_jsonl,
+                paths.style_claims_jsonl,
                 paths.quality_report,
                 paths.cleanup_report,
                 paths.obsidian_index,

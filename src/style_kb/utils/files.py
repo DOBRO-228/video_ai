@@ -3,8 +3,12 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Iterable
+
+_APPEND_LOCKS_LOCK = threading.Lock()
+_APPEND_LOCKS: dict[Path, threading.Lock] = {}
 
 
 def ensure_parent(path: Path) -> None:
@@ -27,8 +31,20 @@ def write_text_atomic(path: Path, payload: str, *, encoding: str = "utf-8") -> N
 
 def append_text(path: Path, payload: str, *, encoding: str = "utf-8") -> None:
     ensure_parent(path)
-    with path.open("a", encoding=encoding) as handle:
-        handle.write(payload)
+    lock = _append_lock(path)
+    with lock:
+        with path.open("a", encoding=encoding) as handle:
+            handle.write(payload)
+
+
+def _append_lock(path: Path) -> threading.Lock:
+    normalized_path = path.resolve(strict=False)
+    with _APPEND_LOCKS_LOCK:
+        lock = _APPEND_LOCKS.get(normalized_path)
+        if lock is None:
+            lock = threading.Lock()
+            _APPEND_LOCKS[normalized_path] = lock
+        return lock
 
 
 def write_json_atomic(path: Path, payload: Any) -> None:

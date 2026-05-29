@@ -87,7 +87,7 @@ vision:
   provider: openai
   model: gpt-5-nano
   detail: low
-  batch_size: 16
+  batch_size: 12
   presenter_bootstrap_enabled: true
   presenter_bootstrap_prompt_file: presenter_profile_ru.txt
   presenter_bootstrap_scene_limit: 12
@@ -109,11 +109,30 @@ speech_segmentation:
   max_segment_words: 150
 
 chunking:
-  mode: scene
-  target_words: 500
-  max_words: 900
-  overlap_seconds: 10
-  max_scenes_per_chunk: 3
+  mode: llm_speech_plan
+  provider: openai
+  model: gpt-5-mini
+  prompt_file: chunk_plan_ru.txt
+  max_words: 1000
+  max_speech_segments_per_chunk: 8
+  question_answer_merge_seconds: 12
+  visual_attach_seconds: 5
+  max_planner_segments_per_call: 80
+  planner_context_segments: 3
+  planner_parallel_requests: 4
+  max_retries: 3
+  title_max_chars: 80
+  boundary_reason_max_chars: 160
+  notes_max_chars: 240
+  topic_max_chars: 80
+  max_topics: 6
+
+style_claims:
+  provider: openai
+  model: gpt-5-mini
+  prompt_file: style_claims_ru.txt
+  max_claims_per_chunk: 5
+  max_retries: 3
 
 export:
   formats:

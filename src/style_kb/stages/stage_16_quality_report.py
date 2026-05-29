@@ -10,6 +10,7 @@ from style_kb.stages.common import (
     load_scenes,
     load_speech_segments,
     load_speech_tokens,
+    load_style_claims,
     load_timeline_events,
     load_video_info,
     load_visual_events,
@@ -18,9 +19,9 @@ from style_kb.stages.common import (
 from style_kb.utils.pydantic_io import read_model, write_model
 
 
-class Stage15QualityReport(Stage):
-    name = "15_quality_report"
-    ordinal = 15
+class Stage16QualityReport(Stage):
+    name = "16_quality_report"
+    ordinal = 16
 
     def input_files(self, context: StageContext) -> list:
         return [
@@ -36,6 +37,7 @@ class Stage15QualityReport(Stage):
             context.paths.visual_presenter_profile,
             context.paths.timeline_events_jsonl,
             context.paths.chunks_jsonl,
+            context.paths.style_claims_jsonl,
         ]
 
     def output_files(self, context: StageContext) -> list:
@@ -56,6 +58,7 @@ class Stage15QualityReport(Stage):
         visual_events = load_visual_events(context.paths.visual_events_jsonl)
         timeline_events = load_timeline_events(context.paths.timeline_events_jsonl)
         chunks = load_chunks(context.paths.chunks_jsonl)
+        style_claims = load_style_claims(context.paths.style_claims_jsonl)
         if not timeline_events:
             raise StageExecutionError("timeline is empty", error_code="quality_empty_timeline")
         if not chunks:
@@ -76,6 +79,12 @@ class Stage15QualityReport(Stage):
         chunks_coverage = round(sum(chunk.end - chunk.start for chunk in chunks) / max(video_duration, 1.0), 4)
         if chunks_coverage > 2.0:
             warnings.append("chunks cover the video more than 2x; overlap or duplicated content may be too high")
+        if not style_claims:
+            warnings.append("style claims are empty despite non-empty chunks")
+        chunks_with_claims = {claim.chunk_id for claim in style_claims}
+        chunks_without_claims = [chunk for chunk in chunks if chunk.chunk_id not in chunks_with_claims]
+        if chunks and len(chunks_without_claims) / len(chunks) > 0.5:
+            warnings.append("more than half of chunks have no extracted style claims")
         warnings.extend(_presenter_warnings(context, visual_events, chunks))
 
         report = QualityReport(
@@ -90,6 +99,7 @@ class Stage15QualityReport(Stage):
                 "visual_events": len(visual_events),
                 "timeline_events": len(timeline_events),
                 "chunks": len(chunks),
+                "style_claims": len(style_claims),
             },
             durations={
                 "metadata": video_info.duration,

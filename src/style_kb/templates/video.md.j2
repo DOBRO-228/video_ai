@@ -5,6 +5,20 @@
 - Video ID: `{{ video.video_id }}`
 - Duration: {{ video.duration }}s
 
+{% if style_claims %}
+## Style Claims
+
+{% for claim in style_claims -%}
+- [{{ claim.start }}s]({{ claim.timestamp_url }}) **{{ claim.subject }}**: {{ claim.claim }}
+{% if claim.conditions %}  - Conditions: {{ claim.conditions|join(", ") }}
+{% endif %}
+{% if claim.prefer %}  - Prefer: {{ claim.prefer|join(", ") }}
+{% endif %}
+{% if claim.avoid %}  - Avoid: {{ claim.avoid|join(", ") }}
+{% endif %}
+{% endfor %}
+
+{% endif %}
 ## Timeline
 
 {% for event in timeline_events -%}

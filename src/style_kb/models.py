@@ -12,6 +12,7 @@ ConfidenceLevel = Literal["low", "medium", "high"]
 PresenterRole = Literal["none", "primary_presenter", "other_person"]
 PresenterRelevance = Literal["none", "background", "brief", "primary_example"]
 SpeakerRole = Literal["host", "offscreen_questioner", "unknown"]
+ClaimType = Literal["rule", "recommendation", "warning", "definition", "example", "exception"]
 
 
 class StrictModel(BaseModel):
@@ -177,6 +178,9 @@ class TimelineEvent(GroundedTimeBoundModel):
 
 class Chunk(GroundedTimeBoundModel):
     chunk_id: str
+    speech_segment_ids: list[str]
+    chunk_title: str
+    boundary_reason: str
     title: str
     channel: str
     url: str
@@ -191,6 +195,58 @@ class Chunk(GroundedTimeBoundModel):
     modality: list[str]
     speaker_roles: list[SpeakerRole]
     timeline_event_ids: list[str]
+
+
+class ChunkPlanItem(StrictModel):
+    chunk_index: int
+    speech_segment_ids: list[str]
+    title: str
+    boundary_reason: str
+    topics: list[str]
+    notes: str
+
+
+class ChunkPlan(StrictModel):
+    video_id: str
+    provider: str
+    model: str
+    mode: str
+    prompt_file: str
+    prompt_sha256: str
+    max_words: int
+    max_speech_segments_per_chunk: int
+    question_answer_merge_seconds: int
+    visual_attach_seconds: int
+    max_planner_segments_per_call: int
+    planner_context_segments: int
+    title_max_chars: int
+    boundary_reason_max_chars: int
+    notes_max_chars: int
+    topic_max_chars: int
+    max_topics: int
+    windows_count: int
+    attempts: int
+    attempts_per_window: list[int]
+    max_attempts_in_any_window: int
+    chunks: list[ChunkPlanItem]
+
+
+class StyleClaim(GroundedTimeBoundModel):
+    claim_id: str
+    chunk_id: str
+    timeline_event_ids: list[str]
+    claim_type: ClaimType
+    subject: str
+    claim: str
+    rationale: str
+    conditions: list[str]
+    applies_to: list[str]
+    avoid: list[str]
+    prefer: list[str]
+    evidence: list[str]
+    topics: list[str]
+    confidence: ConfidenceLevel
+    source: ProviderSource
 
 
 class QualityReport(StrictModel):

@@ -3,16 +3,24 @@ from __future__ import annotations
 import json
 import os
 from collections import defaultdict
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 
+from style_kb.clients._retry import OnRetry
 from style_kb.clients.openai_vision import OpenAIVisionClient, VisionAnalysisResult, load_cached_visual_result
 from style_kb.errors import StageExecutionError
 from style_kb.models import FrameRef, PresenterContext, PresenterProfile, Scene, SpeechSegment, VisualEvent
 from style_kb.pipeline.base import Stage, StageContext, StageResult
-from style_kb.stages.common import load_frame_refs, load_scenes, load_speech_segments, load_visual_events, youtube_source_ref
+from style_kb.stages.common import (
+    load_frame_refs,
+    load_scenes,
+    load_speech_segments,
+    load_visual_events,
+    log_openai_retry,
+    youtube_source_ref,
+)
 from style_kb.utils.collections import stable_unique
 from style_kb.utils.files import append_text
 from style_kb.utils.ids import visual_event_id
@@ -130,6 +138,7 @@ class Stage10DescribeVisuals(Stage):
                         detail=context.config.vision.detail,
                         api_key=api_key,
                         model=context.config.vision.model,
+                        on_retry=_scene_retry_logger(context, task),
                     ): task
                     for task in pending_tasks
                 }
@@ -139,8 +148,32 @@ class Stage10DescribeVisuals(Stage):
                         task = future_map.pop(future)
                         error = future.exception()
                         if error is not None:
-                            for pending_future in future_map:
-                                pending_future.cancel()
+                            cancelled_tasks: list[_SceneTask] = []
+                            in_flight_map: dict[Future, _SceneTask] = {}
+                            for pending_future, pending_task in list(future_map.items()):
+                                if pending_future.cancel():
+                                    cancelled_tasks.append(pending_task)
+                                else:
+                                    in_flight_map[pending_future] = pending_task
+                            future_map.clear()
+                            _log_concurrent_abort(
+                                context,
+                                error=error,
+                                completed=completed,
+                                total_scenes=total_scenes,
+                                cancelled_tasks=cancelled_tasks,
+                                in_flight_tasks=list(in_flight_map.values()),
+                            )
+                            _emit_concurrent_abort_progress(
+                                context,
+                                completed=completed,
+                                total_scenes=total_scenes,
+                                cancelled_count=len(cancelled_tasks),
+                                in_flight_count=len(in_flight_map),
+                            )
+                            if in_flight_map:
+                                wait(in_flight_map)
+                                _log_in_flight_finalization(context, in_flight_map)
                             raise error
                         result = future.result()
                         output_files.append(task.raw_output_path)
@@ -213,7 +246,11 @@ def _load_or_build_presenter_profile(
         if context.paths.visual_presenter_profile.stat().st_mtime >= newest_input:
             return cached
 
-    client = OpenAIVisionClient(os.environ.get("OPENAI_API_KEY"), model=context.config.vision.model)
+    client = OpenAIVisionClient(
+        os.environ.get("OPENAI_API_KEY"),
+        model=context.config.vision.model,
+        on_retry=_presenter_retry_logger(context),
+    )
     analysis = client.build_presenter_profile(
         system_prompt=prompt_path.read_text(encoding="utf-8"),
         image_paths=image_paths,
@@ -346,9 +383,10 @@ def _request_scene_analysis(
     detail: str,
     api_key: str | None,
     model: str,
+    on_retry: OnRetry | None = None,
 ) -> _SceneResult:
     started_at = perf_counter()
-    client = OpenAIVisionClient(api_key, model=model)
+    client = OpenAIVisionClient(api_key, model=model, on_retry=on_retry)
     analysis = client.describe_scene(
         system_prompt=system_prompt,
         transcript_context=task.transcript_context,
@@ -451,6 +489,92 @@ def _log_scene_result(
     append_text(context.paths.stage_log(Stage10DescribeVisuals.name), "\n".join(lines), encoding="utf-8")
 
 
+def _scene_retry_logger(context: StageContext, task: _SceneTask) -> OnRetry:
+    def _log_retry(attempt: int, delay_seconds: float, error: BaseException) -> None:
+        log_openai_retry(
+            context.paths.stage_log(Stage10DescribeVisuals.name),
+            attempt=attempt,
+            delay_seconds=delay_seconds,
+            error=error,
+            context_lines=[
+                "operation: describe_scene",
+                f"scene_order: {task.order}",
+                f"scene_id: {task.scene.scene_id}",
+                f"raw_output: {task.raw_output_path}",
+            ],
+        )
+
+    return _log_retry
+
+
+def _presenter_retry_logger(context: StageContext) -> OnRetry:
+    def _log_retry(attempt: int, delay_seconds: float, error: BaseException) -> None:
+        log_openai_retry(
+            context.paths.stage_log(Stage10DescribeVisuals.name),
+            attempt=attempt,
+            delay_seconds=delay_seconds,
+            error=error,
+            context_lines=[
+                "operation: presenter_profile",
+                f"raw_output: {context.paths.visual_raw_presenter_profile}",
+            ],
+        )
+
+    return _log_retry
+
+
+def _log_concurrent_abort(
+    context: StageContext,
+    *,
+    error: BaseException,
+    completed: int,
+    total_scenes: int,
+    cancelled_tasks: list[_SceneTask],
+    in_flight_tasks: list[_SceneTask],
+) -> None:
+    lines = [
+        "",
+        "[concurrent-abort]",
+        f"completed_progress: {completed}/{total_scenes}",
+        f"error: {type(error).__name__}: {error}",
+        f"cancelled_count: {len(cancelled_tasks)}",
+        f"in_flight_count: {len(in_flight_tasks)}",
+        "cancelled_tasks:",
+        *[_task_log_line(task) for task in cancelled_tasks],
+        "in_flight_tasks:",
+        *[_task_log_line(task) for task in in_flight_tasks],
+        "",
+    ]
+    append_text(context.paths.stage_log(Stage10DescribeVisuals.name), "\n".join(lines), encoding="utf-8")
+
+
+def _emit_concurrent_abort_progress(
+    context: StageContext,
+    *,
+    completed: int,
+    total_scenes: int,
+    cancelled_count: int,
+    in_flight_count: int,
+) -> None:
+    if context.progress_callback is None:
+        return
+    context.progress_callback(
+        " ".join(
+            [
+                f"[10 {Stage10DescribeVisuals.name}]",
+                "abort",
+                f"done={completed}/{total_scenes}",
+                f"cancelled={cancelled_count}",
+                f"in_flight={in_flight_count}",
+            ]
+        )
+    )
+
+
+def _task_log_line(task: _SceneTask) -> str:
+    return f"  - scene_order={task.order} scene_id={task.scene.scene_id} raw_output={task.raw_output_path}"
+
+
 def _emit_scene_progress(
     context: StageContext,
     result: _SceneResult,
@@ -491,3 +615,121 @@ def _dedupe_paths(paths: list[Path]) -> list[Path]:
         seen.add(path)
         unique.append(path)
     return unique
+
+
+def _scene_retry_logger(context: StageContext, task: _SceneTask) -> OnRetry:
+    stage_log_path = context.paths.stage_log(Stage10DescribeVisuals.name)
+
+    def _on_retry(attempt: int, delay: float, error: BaseException) -> None:
+        log_openai_retry(
+            stage_log_path,
+            attempt=attempt,
+            delay_seconds=delay,
+            error=error,
+            context_lines=[
+                f"scene_index: {task.scene.index}",
+                f"scene_id: {task.scene.scene_id}",
+            ],
+        )
+
+    return _on_retry
+
+
+def _presenter_retry_logger(context: StageContext) -> OnRetry:
+    stage_log_path = context.paths.stage_log(Stage10DescribeVisuals.name)
+
+    def _on_retry(attempt: int, delay: float, error: BaseException) -> None:
+        log_openai_retry(
+            stage_log_path,
+            attempt=attempt,
+            delay_seconds=delay,
+            error=error,
+            context_lines=["operation: presenter_profile_bootstrap"],
+        )
+
+    return _on_retry
+
+
+def _log_concurrent_abort(
+    context: StageContext,
+    *,
+    error: BaseException,
+    completed: int,
+    total_scenes: int,
+    cancelled_tasks: list[_SceneTask],
+    in_flight_tasks: list[_SceneTask],
+) -> None:
+    lines = [
+        "",
+        "[concurrent-abort]",
+        f"error: {type(error).__name__}: {error}",
+        f"completed: {completed}/{total_scenes}",
+        f"cancelled_count: {len(cancelled_tasks)}",
+        f"in_flight_count: {len(in_flight_tasks)}",
+        "cancelled_scenes:",
+        *[f"  - {task.scene.scene_id} (index {task.scene.index})" for task in cancelled_tasks],
+        "in_flight_scenes:",
+        *[f"  - {task.scene.scene_id} (index {task.scene.index})" for task in in_flight_tasks],
+        "note: in_flight requests keep running until completion; their raw outputs"
+        " are saved to disk and reused on the next run",
+        "",
+    ]
+    append_text(
+        context.paths.stage_log(Stage10DescribeVisuals.name),
+        "\n".join(lines),
+        encoding="utf-8",
+    )
+
+
+def _log_in_flight_finalization(
+    context: StageContext,
+    in_flight_map: dict[Future, _SceneTask],
+) -> None:
+    lines = ["", "[concurrent-abort-finalized]"]
+    for future, task in in_flight_map.items():
+        if future.cancelled():
+            lines.append(
+                f"  - scene_id={task.scene.scene_id} index={task.scene.index}"
+                " status=cancelled_after_start"
+            )
+            continue
+        future_error = future.exception()
+        if future_error is None:
+            lines.append(
+                f"  - scene_id={task.scene.scene_id} index={task.scene.index}"
+                f" status=completed_after_abort raw_output={task.raw_output_path}"
+            )
+        else:
+            lines.append(
+                f"  - scene_id={task.scene.scene_id} index={task.scene.index}"
+                f" status=failed_after_abort error={type(future_error).__name__}: {future_error}"
+            )
+    lines.append("")
+    append_text(
+        context.paths.stage_log(Stage10DescribeVisuals.name),
+        "\n".join(lines),
+        encoding="utf-8",
+    )
+
+
+def _emit_concurrent_abort_progress(
+    context: StageContext,
+    *,
+    completed: int,
+    total_scenes: int,
+    cancelled_count: int,
+    in_flight_count: int,
+) -> None:
+    if context.progress_callback is None:
+        return
+    context.progress_callback(
+        " ".join(
+            [
+                f"[10 {Stage10DescribeVisuals.name}]",
+                "abort",
+                f"done={completed}/{total_scenes}",
+                f"cancelled={cancelled_count}",
+                f"in_flight={in_flight_count}",
+            ]
+        )
+    )

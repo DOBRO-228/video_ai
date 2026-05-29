@@ -1,4 +1,4 @@
-# 16_cleanup
+# 17_cleanup
 
 ## Purpose
 
@@ -31,6 +31,5 @@ The stage can be skipped when `cleanup.json` exists and its `job_id` matches the
 
 ## Related Code
 
-- `src/style_kb/stages/stage_16_cleanup.py`
+- `src/style_kb/stages/stage_17_cleanup.py`
 - `src/style_kb/config/default.yaml`
-

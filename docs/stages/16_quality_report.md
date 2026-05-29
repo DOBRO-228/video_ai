@@ -1,4 +1,4 @@
-# 15_quality_report
+# 16_quality_report
 
 ## Purpose
 
@@ -6,7 +6,7 @@ Summarize pipeline quality, coverage, durations, counts, warnings, and artifact 
 
 ## How It Works
 
-The stage loads all canonical upstream artifacts, verifies that timeline and chunks are non-empty, reads media durations, computes coverage ratios, and writes a `QualityReport`. It also emits presenter-aware warnings when recurring presenter handling appears unstable.
+The stage loads all canonical upstream artifacts, verifies that timeline and chunks are non-empty, reads media durations, computes coverage ratios, and writes a `QualityReport`. It also emits presenter-aware warnings when recurring presenter handling appears unstable and claim-aware warnings when extracted style knowledge is missing.
 
 ## Inputs
 
@@ -22,6 +22,7 @@ The stage loads all canonical upstream artifacts, verifies that timeline and chu
 - `visual/presenter_profile.json`
 - `timeline/timeline_events.jsonl`
 - `chunks/chunks.jsonl`
+- `claims/style_claims.jsonl`
 
 ## Outputs
 
@@ -37,8 +38,9 @@ The stage can be skipped when `quality_report.json` exists and parses as `Qualit
 - Failed jobs retain media/frames for resume and debugging because cleanup runs only after this stage.
 - Warnings should be diagnostic; hard failures should be reserved for impossible consistency states.
 - Speaker count is not fixed. Quality report warns only when diarization is enabled but no speaker labels are detected.
+- Empty style claims are a warning, not a hard failure, because some chunks may contain only service or promotional content.
 
 ## Related Code
 
-- `src/style_kb/stages/stage_15_quality_report.py`
+- `src/style_kb/stages/stage_16_quality_report.py`
 - `src/style_kb/models.py::QualityReport`

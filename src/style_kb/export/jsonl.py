@@ -16,6 +16,8 @@ def export_jsonl_bundle(
     visual_events_path: Path,
     timeline_events_path: Path,
     chunks_path: Path,
+    chunk_plan_path: Path,
+    style_claims_path: Path,
     export_dir: Path,
 ) -> list[Path]:
     export_dir.mkdir(parents=True, exist_ok=True)
@@ -29,6 +31,8 @@ def export_jsonl_bundle(
         export_dir / "visual_events.jsonl",
         export_dir / "timeline_events.jsonl",
         export_dir / "chunks.jsonl",
+        export_dir / "chunk_plan.jsonl",
+        export_dir / "style_claims.jsonl",
     ]
     write_jsonl_atomic(outputs[0], [read_json(video_info_path)])
     write_jsonl_atomic(outputs[1], [read_json(speaker_diarization_path)])
@@ -39,4 +43,6 @@ def export_jsonl_bundle(
     copy_file_atomic(visual_events_path, outputs[6])
     copy_file_atomic(timeline_events_path, outputs[7])
     copy_file_atomic(chunks_path, outputs[8])
+    write_jsonl_atomic(outputs[9], [read_json(chunk_plan_path)])
+    copy_file_atomic(style_claims_path, outputs[10])
     return outputs

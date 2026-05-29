@@ -8,6 +8,7 @@ from typing import Any
 
 from openai import OpenAI
 
+from style_kb.clients._retry import OnRetry, RetryPolicy, call_with_retry
 from style_kb.errors import MissingApiKeyError, ProviderError
 from style_kb.utils.files import read_json, write_json_atomic
 
@@ -95,14 +96,23 @@ class VisionAnalysisResult:
 
 
 class OpenAIVisionClient:
-    def __init__(self, api_key: str | None, *, model: str) -> None:
+    def __init__(
+        self,
+        api_key: str | None,
+        *,
+        model: str,
+        retry_policy: RetryPolicy | None = None,
+        on_retry: OnRetry | None = None,
+    ) -> None:
         if not api_key:
             raise MissingApiKeyError(
                 "OPENAI_API_KEY is required before stage 10_describe_visuals",
                 error_code="missing_openai_api_key",
             )
-        self.client = OpenAI(api_key=api_key)
+        self.client = OpenAI(api_key=api_key, max_retries=0)
         self.model = model
+        self.retry_policy = retry_policy or RetryPolicy()
+        self.on_retry = on_retry
 
     def describe_scene(
         self,
@@ -162,17 +172,21 @@ class OpenAIVisionClient:
         error_code: str,
     ) -> VisionAnalysisResult:
         try:
-            response = self.client.responses.create(
-                model=self.model,
-                input=[{"role": "user", "content": content}],
-                text={
-                    "format": {
-                        "type": "json_schema",
-                        "name": schema_name,
-                        "strict": True,
-                        "schema": schema,
-                    }
-                },
+            response = call_with_retry(
+                lambda: self.client.responses.create(
+                    model=self.model,
+                    input=[{"role": "user", "content": content}],
+                    text={
+                        "format": {
+                            "type": "json_schema",
+                            "name": schema_name,
+                            "strict": True,
+                            "schema": schema,
+                        }
+                    },
+                ),
+                policy=self.retry_policy,
+                on_retry=self.on_retry,
             )
         except Exception as error:  # pragma: no cover - SDK exception surface depends on installed version
             raise ProviderError(str(error), error_code=error_code, details=str(error)) from error

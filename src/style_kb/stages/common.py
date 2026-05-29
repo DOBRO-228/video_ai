@@ -9,11 +9,12 @@ from style_kb.models import (
     SourceRef,
     SpeechSegment,
     SpeechToken,
+    StyleClaim,
     TimelineEvent,
     VideoInfo,
     VisualEvent,
 )
-from style_kb.utils.files import read_json
+from style_kb.utils.files import append_text, read_json
 from style_kb.utils.pydantic_io import read_model, read_models_jsonl
 from style_kb.utils.time import build_timestamp_url
 
@@ -50,6 +51,10 @@ def load_chunks(path: Path) -> list[Chunk]:
     return read_models_jsonl(path, Chunk)
 
 
+def load_style_claims(path: Path) -> list[StyleClaim]:
+    return read_models_jsonl(path, StyleClaim)
+
+
 def youtube_source_ref(video_id: str, start: float, end: float, *, title: str | None = None, modality: str | None = None) -> SourceRef:
     return SourceRef(
         type="youtube",
@@ -68,3 +73,23 @@ def relative_artifact_path(root: Path, artifact: Path) -> str:
 def read_payload(path: Path) -> dict:
     return read_json(path)
 
+
+def log_openai_retry(
+    stage_log_path: Path,
+    *,
+    attempt: int,
+    delay_seconds: float,
+    error: BaseException,
+    context_lines: list[str] | None = None,
+) -> None:
+    lines = [
+        "",
+        "[openai-retry]",
+        f"attempt: {attempt}",
+        f"next_delay_seconds: {delay_seconds:.2f}",
+        f"error: {type(error).__name__}: {error}",
+    ]
+    if context_lines:
+        lines.extend(context_lines)
+    lines.append("")
+    append_text(stage_log_path, "\n".join(lines), encoding="utf-8")

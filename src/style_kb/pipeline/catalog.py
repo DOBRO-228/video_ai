@@ -13,10 +13,11 @@ from style_kb.stages.stage_09_extract_keyframes import Stage09ExtractKeyframes
 from style_kb.stages.stage_10_describe_visuals import Stage10DescribeVisuals
 from style_kb.stages.stage_11_merge_timeline import Stage11MergeTimeline
 from style_kb.stages.stage_12_build_chunks import Stage12BuildChunks
-from style_kb.stages.stage_13_export_jsonl import Stage13ExportJsonl
-from style_kb.stages.stage_14_export_obsidian import Stage14ExportObsidian
-from style_kb.stages.stage_15_quality_report import Stage15QualityReport
-from style_kb.stages.stage_16_cleanup import Stage16Cleanup
+from style_kb.stages.stage_13_extract_style_claims import Stage13ExtractStyleClaims
+from style_kb.stages.stage_14_export_jsonl import Stage14ExportJsonl
+from style_kb.stages.stage_15_export_obsidian import Stage15ExportObsidian
+from style_kb.stages.stage_16_quality_report import Stage16QualityReport
+from style_kb.stages.stage_17_cleanup import Stage17Cleanup
 
 STAGES: list[type[Stage]] = [
     Stage01Metadata,
@@ -31,8 +32,9 @@ STAGES: list[type[Stage]] = [
     Stage10DescribeVisuals,
     Stage11MergeTimeline,
     Stage12BuildChunks,
-    Stage13ExportJsonl,
-    Stage14ExportObsidian,
-    Stage15QualityReport,
-    Stage16Cleanup,
+    Stage13ExtractStyleClaims,
+    Stage14ExportJsonl,
+    Stage15ExportObsidian,
+    Stage16QualityReport,
+    Stage17Cleanup,
 ]

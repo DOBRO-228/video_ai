@@ -88,10 +88,32 @@ class ChunkingConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     mode: str
-    target_words: int = Field(gt=0)
+    provider: str
+    model: str
+    prompt_file: str
     max_words: int = Field(gt=0)
-    overlap_seconds: int = Field(ge=0)
-    max_scenes_per_chunk: int = Field(gt=0)
+    max_speech_segments_per_chunk: int = Field(gt=0)
+    question_answer_merge_seconds: int = Field(ge=0)
+    visual_attach_seconds: int = Field(ge=0)
+    max_planner_segments_per_call: int = Field(gt=0)
+    planner_context_segments: int = Field(ge=0)
+    planner_parallel_requests: int = Field(gt=0)
+    max_retries: int = Field(gt=0)
+    title_max_chars: int = Field(gt=0)
+    boundary_reason_max_chars: int = Field(gt=0)
+    notes_max_chars: int = Field(gt=0)
+    topic_max_chars: int = Field(gt=0)
+    max_topics: int = Field(gt=0)
+
+
+class StyleClaimsConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str
+    model: str
+    prompt_file: str
+    max_claims_per_chunk: int = Field(ge=0)
+    max_retries: int = Field(gt=0)
 
 
 class ExportConfig(BaseModel):
@@ -110,4 +132,5 @@ class AppConfig(BaseModel):
     vision: VisionConfig
     speech_segmentation: SpeechSegmentationConfig
     chunking: ChunkingConfig
+    style_claims: StyleClaimsConfig
     export: ExportConfig

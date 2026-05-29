@@ -24,3 +24,6 @@ def timeline_event_id(video_id: str, start: float, end: float) -> str:
 def chunk_id(video_id: str, start: float, end: float) -> str:
     return f"{video_id}_c_{format_seconds_token(start)}_{format_seconds_token(end)}"
 
+
+def style_claim_id(video_id: str, index: int) -> str:
+    return f"{video_id}_claim_{index:06d}"

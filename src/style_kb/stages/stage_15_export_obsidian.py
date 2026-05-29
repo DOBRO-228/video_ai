@@ -5,18 +5,19 @@ from pathlib import Path
 
 from style_kb.export.obsidian import render_obsidian_export
 from style_kb.pipeline.base import Stage, StageContext, StageResult
-from style_kb.stages.common import load_chunks, load_frame_refs, load_timeline_events, load_video_info
+from style_kb.stages.common import load_chunks, load_frame_refs, load_style_claims, load_timeline_events, load_video_info
 
 
-class Stage14ExportObsidian(Stage):
-    name = "14_export_obsidian"
-    ordinal = 14
+class Stage15ExportObsidian(Stage):
+    name = "15_export_obsidian"
+    ordinal = 15
 
     def input_files(self, context: StageContext) -> list:
         return [
             context.paths.metadata_video_info,
             context.paths.timeline_events_jsonl,
             context.paths.chunks_jsonl,
+            context.paths.style_claims_jsonl,
             context.paths.frame_refs_jsonl,
         ]
 
@@ -39,6 +40,7 @@ class Stage14ExportObsidian(Stage):
         video = load_video_info(context.paths.metadata_video_info)
         timeline_events = load_timeline_events(context.paths.timeline_events_jsonl)
         chunks = load_chunks(context.paths.chunks_jsonl)
+        style_claims = load_style_claims(context.paths.style_claims_jsonl)
         frame_refs = load_frame_refs(context.paths.frame_refs_jsonl)
         frame_map: dict[str, list[str]] = defaultdict(list)
         video_note_path = context.paths.obsidian_video_note(context.job.video_id)
@@ -55,6 +57,7 @@ class Stage14ExportObsidian(Stage):
             video=video,
             timeline_events=timeline_events,
             chunks=chunks,
+            style_claims=style_claims,
             obsidian_index_path=context.paths.obsidian_index,
             video_note_path=video_note_path,
             chunk_note_paths={chunk.chunk_id: context.paths.obsidian_chunk_note(chunk.chunk_id) for chunk in chunks},

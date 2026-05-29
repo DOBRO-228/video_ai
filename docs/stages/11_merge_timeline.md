@@ -29,7 +29,7 @@ Visual fields and `presenter_context` are copied from the scene's `VisualEvent`.
 
 The stage rebuilds expected timeline events and compares them with the existing output. It skips only when the existing output matches the deterministic rebuild and `timeline/media_durations.json` still matches current ffprobe data when ffprobe files are present.
 
-After `16_cleanup` removes media and ffprobe files, validation uses `timeline/media_durations.json` as the durable source for the original audio/video duration check.
+After `17_cleanup` removes media and ffprobe files, validation uses `timeline/media_durations.json` as the durable source for the original audio/video duration check.
 
 ## Important Notes
 

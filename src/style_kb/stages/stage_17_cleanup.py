@@ -6,9 +6,9 @@ from style_kb.pipeline.base import Stage, StageContext, StageResult
 from style_kb.utils.files import read_json, write_json_atomic
 
 
-class Stage16Cleanup(Stage):
-    name = "16_cleanup"
-    ordinal = 16
+class Stage17Cleanup(Stage):
+    name = "17_cleanup"
+    ordinal = 17
 
     def input_files(self, context: StageContext) -> list:
         return [context.paths.quality_report]
