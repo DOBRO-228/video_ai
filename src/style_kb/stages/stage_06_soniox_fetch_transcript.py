@@ -2,15 +2,32 @@ from __future__ import annotations
 
 import os
 from collections import defaultdict
+from datetime import UTC, datetime
+from enum import StrEnum
+from time import perf_counter
 
+from style_kb.clients.provider_diagnostics import ProviderCallDiagnostics, ProviderName
 from style_kb.clients.soniox import SonioxClient
+from style_kb.diagnostics import PipelineEvent
 from style_kb.errors import ProviderError
-from style_kb.models import SpeakerDiarization, SpeakerProfile, SpeechToken
+from style_kb.models import SpeakerDiarization, SpeakerProfile, SpeakerRole, SpeechToken
 from style_kb.pipeline.base import Stage, StageContext, StageResult
-from style_kb.stages.common import load_speech_tokens, read_payload
+from style_kb.stages.common import (
+    ProviderOperation,
+    emit_provider_event,
+    load_speech_tokens,
+    provider_error_extra,
+    read_payload,
+)
+from style_kb.stages.diagnostics import append_stage_summary
 from style_kb.utils.files import write_json_atomic
 from style_kb.utils.pydantic_io import write_model, write_models_jsonl
 from style_kb.utils.time import ms_to_seconds
+
+
+class _SonioxTranscriptionStatus(StrEnum):
+    ERROR = "error"
+    FAILED = "failed"
 
 
 class Stage06SonioxFetchTranscript(Stage):
@@ -73,21 +90,157 @@ class Stage06SonioxFetchTranscript(Stage):
     def run(self, context: StageContext) -> StageResult:
         transcription_payload = read_payload(context.paths.stt_transcription)
         transcription_id = transcription_payload["id"]
+        append_stage_summary(
+            context,
+            self.name,
+            "soniox-fetch-preflight",
+            {
+                "soniox_transcription_id": transcription_id,
+                "poll_interval_seconds": 5.0,
+                "timeout_seconds": 3600.0,
+                "transcription_path": str(context.paths.stt_transcription),
+                "transcript_raw_path": str(context.paths.stt_transcript_raw),
+            },
+        )
         client = SonioxClient(os.environ.get("SONIOX_API_KEY"))
-        status_payload = client.wait_for_transcription(
-            transcription_id,
-            interval_sec=5.0,
-            timeout_sec=3600.0,
+        wait_started_at = datetime.now(tz=UTC).isoformat()
+        started = perf_counter()
+        wait_started_diagnostics = ProviderCallDiagnostics(
+            provider=ProviderName.SONIOX,
+            model=context.config.stt.model,
+            raw_output_path=str(context.paths.stt_transcription),
+            request_id=transcription_id,
+            started_at=wait_started_at,
+        )
+        emit_provider_event(
+            context,
+            PipelineEvent.PROVIDER_REQUEST_STARTED,
+            stage_name=self.name,
+            ordinal=self.ordinal,
+            operation=ProviderOperation.SONIOX_WAIT_TRANSCRIPTION,
+            diagnostics=wait_started_diagnostics,
+            message="Soniox wait transcription started",
+            extra={"poll_interval_seconds": 5.0, "timeout_seconds": 3600.0},
+        )
+        try:
+            status_payload = client.wait_for_transcription(
+                transcription_id,
+                interval_sec=5.0,
+                timeout_sec=3600.0,
+            )
+        except Exception as error:
+            wait_finished_at = datetime.now(tz=UTC).isoformat()
+            wait_duration = perf_counter() - started
+            wait_diagnostics = wait_started_diagnostics.with_updates(
+                finished_at=wait_finished_at,
+                duration_seconds=round(wait_duration, 3),
+            )
+            emit_provider_event(
+                context,
+                PipelineEvent.PROVIDER_REQUEST_FAILED,
+                stage_name=self.name,
+                ordinal=self.ordinal,
+                operation=ProviderOperation.SONIOX_WAIT_TRANSCRIPTION,
+                diagnostics=wait_diagnostics,
+                message="Soniox wait transcription failed",
+                extra={**provider_error_extra(error), "poll_interval_seconds": 5.0, "timeout_seconds": 3600.0},
+            )
+            raise
+        wait_finished_at = datetime.now(tz=UTC).isoformat()
+        wait_duration = perf_counter() - started
+        wait_diagnostics = wait_started_diagnostics.with_updates(
+            response_id=str(status_payload.get("id")) if status_payload.get("id") is not None else transcription_id,
+            finished_at=wait_finished_at,
+            duration_seconds=round(wait_duration, 3),
+        )
+        status_payload["_style_kb_diagnostics"] = wait_diagnostics.event_data(
+            operation=ProviderOperation.SONIOX_WAIT_TRANSCRIPTION.value,
+        )
+        emit_provider_event(
+            context,
+            PipelineEvent.PROVIDER_REQUEST_COMPLETED,
+            stage_name=self.name,
+            ordinal=self.ordinal,
+            operation=ProviderOperation.SONIOX_WAIT_TRANSCRIPTION,
+            diagnostics=wait_diagnostics,
+            message="Soniox wait transcription completed",
+            extra={"final_status": status_payload.get("status")},
         )
         status = status_payload.get("status")
-        if status in {"error", "failed"}:
+        if status in {_SonioxTranscriptionStatus.ERROR.value, _SonioxTranscriptionStatus.FAILED.value}:
+            emit_provider_event(
+                context,
+                PipelineEvent.PROVIDER_REQUEST_FAILED,
+                stage_name=self.name,
+                ordinal=self.ordinal,
+                operation=ProviderOperation.SONIOX_WAIT_TRANSCRIPTION,
+                diagnostics=wait_diagnostics,
+                message="Soniox transcription finished with failed status",
+                extra={"final_status": status, "error_message": status_payload.get("error_message")},
+            )
             raise ProviderError(
                 status_payload.get("error_message") or "Soniox transcription failed",
                 error_code="soniox_transcription_failed",
             )
 
         write_json_atomic(context.paths.stt_transcription, status_payload)
-        transcript_payload = client.get_transcript(transcription_id)
+        transcript_started_at = datetime.now(tz=UTC).isoformat()
+        transcript_timer_started = perf_counter()
+        transcript_started_diagnostics = ProviderCallDiagnostics(
+            provider=ProviderName.SONIOX,
+            model=context.config.stt.model,
+            raw_output_path=str(context.paths.stt_transcript_raw),
+            request_id=transcription_id,
+            started_at=transcript_started_at,
+        )
+        emit_provider_event(
+            context,
+            PipelineEvent.PROVIDER_REQUEST_STARTED,
+            stage_name=self.name,
+            ordinal=self.ordinal,
+            operation=ProviderOperation.SONIOX_GET_TRANSCRIPT,
+            diagnostics=transcript_started_diagnostics,
+            message="Soniox get transcript started",
+        )
+        try:
+            transcript_payload = client.get_transcript(transcription_id)
+        except Exception as error:
+            transcript_finished_at = datetime.now(tz=UTC).isoformat()
+            transcript_duration = perf_counter() - transcript_timer_started
+            transcript_diagnostics = transcript_started_diagnostics.with_updates(
+                finished_at=transcript_finished_at,
+                duration_seconds=round(transcript_duration, 3),
+            )
+            emit_provider_event(
+                context,
+                PipelineEvent.PROVIDER_REQUEST_FAILED,
+                stage_name=self.name,
+                ordinal=self.ordinal,
+                operation=ProviderOperation.SONIOX_GET_TRANSCRIPT,
+                diagnostics=transcript_diagnostics,
+                message="Soniox get transcript failed",
+                extra=provider_error_extra(error),
+            )
+            raise
+        transcript_finished_at = datetime.now(tz=UTC).isoformat()
+        transcript_duration = perf_counter() - transcript_timer_started
+        transcript_diagnostics = transcript_started_diagnostics.with_updates(
+            response_id=transcription_id,
+            finished_at=transcript_finished_at,
+            duration_seconds=round(transcript_duration, 3),
+        )
+        transcript_payload["_style_kb_diagnostics"] = transcript_diagnostics.event_data(
+            operation=ProviderOperation.SONIOX_GET_TRANSCRIPT.value,
+        )
+        emit_provider_event(
+            context,
+            PipelineEvent.PROVIDER_REQUEST_COMPLETED,
+            stage_name=self.name,
+            ordinal=self.ordinal,
+            operation=ProviderOperation.SONIOX_GET_TRANSCRIPT,
+            diagnostics=transcript_diagnostics,
+            message="Soniox get transcript completed",
+        )
         tokens = _normalize_tokens(context.job.video_id, transcript_payload)
         if not tokens:
             raise ProviderError("Soniox transcript is empty", error_code="empty_transcript")
@@ -96,11 +249,34 @@ class Stage06SonioxFetchTranscript(Stage):
         write_json_atomic(context.paths.stt_transcript_raw, transcript_payload)
         write_model(context.paths.stt_speaker_diarization, diarization)
         write_models_jsonl(context.paths.stt_speech_tokens, tokens)
+        append_stage_summary(
+            context,
+            self.name,
+            "soniox-fetch-summary",
+            {
+                "soniox_transcription_id": transcription_id,
+                "poll_interval_seconds": 5.0,
+                "timeout_seconds": 3600.0,
+                "wait_started_at": wait_started_at,
+                "wait_finished_at": wait_finished_at,
+                "wait_duration_seconds": round(wait_duration, 3),
+                "transcript_started_at": transcript_started_at,
+                "transcript_finished_at": transcript_finished_at,
+                "transcript_duration_seconds": round(transcript_duration, 3),
+                "final_status": status_payload.get("status"),
+                "tokens_count": len(tokens),
+                "detected_speakers": diarization.detected_speakers,
+                "unassigned_tokens_count": diarization.unassigned_tokens_count,
+                "transcript_raw_path": str(context.paths.stt_transcript_raw),
+            },
+        )
         return StageResult(
             output_files=self.output_files(context),
             metrics={
                 "tokens_count": len(tokens),
                 "detected_speakers": diarization.detected_speakers,
+                "unassigned_tokens_count": diarization.unassigned_tokens_count,
+                "wait_duration_seconds": round(wait_duration, 3),
             },
         )
 
@@ -121,7 +297,7 @@ def _build_speaker_diarization(video_id: str, tokens: list[SpeechToken], context
     profiles: list[SpeakerProfile] = []
     for speaker in ranked_speakers:
         group = speaker_tokens[speaker]
-        role = "host" if speaker == host_speaker else "offscreen_questioner"
+        role = SpeakerRole.HOST if speaker == host_speaker else SpeakerRole.OFFSCREEN_QUESTIONER
         profiles.append(
             SpeakerProfile(
                 speaker=speaker,

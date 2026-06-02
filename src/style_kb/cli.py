@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import typer
 
+from style_kb.error_advice import advice_for_error_code
 from style_kb.errors import StyleKbError
+from style_kb.models import Job, JobState, StageState, StageStatus
 from style_kb.pipeline.paths import JobPaths
 from style_kb.pipeline.runner import PipelineRunner
 
@@ -38,16 +41,16 @@ def status(job_id: str) -> None:
     typer.echo(f"job_dir: {job.job_dir}")
     if job.error_code or job.error_message:
         typer.echo(f"error: {job.error_code or '-'} {job.error_message or ''}".strip())
-    artifact_paths = _artifact_paths(job.job_id)
+    paths = JobPaths(runner.output_root, job.job_id)
+    artifact_paths = paths.artifact_summary()
     typer.echo("artifacts:")
     for key, value in artifact_paths.items():
         typer.echo(f"  {key}: {value}")
+    _print_diagnostics_block(job, stages, paths)
     typer.echo("")
     typer.echo("stages:")
     for stage in stages:
-        typer.echo(
-            f"  {stage.ordinal:02d} {stage.stage_name:<28} {stage.status:<9} attempts={stage.attempt}"
-        )
+        _print_stage_status(stage, job=job, paths=paths)
 
 
 @app.command()
@@ -74,6 +77,92 @@ def _artifact_paths(job_id: str) -> dict[str, str]:
     runner = PipelineRunner(Path.cwd())
     paths = JobPaths(runner.output_root, job_id)
     return paths.artifact_summary()
+
+
+def _print_diagnostics_block(job: Job, stages: list[StageStatus], paths: JobPaths) -> None:
+    failed_stage = next((stage for stage in stages if stage.status == StageState.FAILED), None)
+    if job.status != JobState.FAILED and failed_stage is None:
+        return
+    typer.echo("diagnostics:")
+    failure_report_status = "" if paths.failure_report.exists() else " (missing)"
+    typer.echo(f"  failure_report: {paths.failure_report}{failure_report_status}")
+    typer.echo(f"  pipeline_log: {paths.pipeline_log}")
+    if failed_stage is not None:
+        typer.echo(f"  failed_stage_log: {paths.stage_log(failed_stage.stage_name)}")
+    advice = advice_for_error_code(
+        job.error_code or (failed_stage.error_code if failed_stage is not None else None),
+        job_id=job.job_id,
+        stage_name=failed_stage.stage_name if failed_stage is not None else job.current_stage,
+    )
+    if advice is not None:
+        typer.echo(f"  advice: {advice.summary}")
+        for action in advice.actions:
+            typer.echo(f"  action: {action}")
+        for inspect_path in advice.inspect[:4]:
+            typer.echo(f"  inspect: {inspect_path}")
+    typer.echo(f"  resume: style-kb resume {job.job_id}")
+
+
+def _print_stage_status(stage: StageStatus, *, job: Job, paths: JobPaths) -> None:
+    log_path = paths.stage_log(stage.stage_name)
+    parts = [
+        f"  {stage.ordinal:02d} {stage.stage_name:<28} {stage.status:<9}",
+        f"attempts={stage.attempt}",
+    ]
+    if stage.error_code:
+        parts.append(f"error={stage.error_code}")
+    if log_path.exists():
+        parts.append(f"log={log_path}")
+    typer.echo(" ".join(parts))
+    if stage.status == StageState.FAILED or stage.stage_name == job.current_stage:
+        _print_stage_diagnostics(stage, paths=paths)
+
+
+def _print_stage_diagnostics(stage: StageStatus, *, paths: JobPaths) -> None:
+    duration = _duration_seconds(stage)
+    values = {
+        "error_code": stage.error_code,
+        "error_message": stage.error_message,
+        "started_at": stage.started_at.isoformat() if stage.started_at else None,
+        "finished_at": stage.finished_at.isoformat() if stage.finished_at else None,
+        "duration_seconds": f"{duration:.3f}" if duration is not None else None,
+        "log_path": str(paths.stage_log(stage.stage_name)),
+        "failure_report": str(paths.failure_report) if paths.failure_report.exists() else None,
+        "input_files": str(len(stage.input_files)),
+        "output_files": str(len(stage.output_files)),
+        "metrics": _compact_mapping(stage.metrics),
+    }
+    for key, value in values.items():
+        if value is not None and value != "":
+            typer.echo(f"      {key}: {value}")
+
+
+def _duration_seconds(stage: StageStatus) -> float | None:
+    if stage.started_at is None or stage.finished_at is None:
+        return None
+    return max(0.0, (stage.finished_at - stage.started_at).total_seconds())
+
+
+def _compact_mapping(value: dict[str, object], *, limit: int = 6) -> str:
+    if not value:
+        return ""
+    items = list(value.items())
+    rendered = [f"{key}={_compact_value(item)}" for key, item in items[:limit]]
+    if len(items) > limit:
+        rendered.append(f"+{len(items) - limit} more")
+    return ", ".join(rendered)
+
+
+def _compact_value(value: object, *, max_chars: int = 80) -> str:
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, int | float | bool) or value is None:
+        text = str(value)
+    else:
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    if len(text) > max_chars:
+        return text[: max_chars - 3] + "..."
+    return text
 
 
 if __name__ == "__main__":

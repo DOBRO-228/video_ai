@@ -1,18 +1,65 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 
-StageState = Literal["pending", "running", "completed", "failed", "skipped"]
-JobState = Literal["pending", "running", "completed", "failed"]
-ConfidenceLevel = Literal["low", "medium", "high"]
-PresenterRole = Literal["none", "primary_presenter", "other_person"]
-PresenterRelevance = Literal["none", "background", "brief", "primary_example"]
-SpeakerRole = Literal["host", "offscreen_questioner", "unknown"]
-ClaimType = Literal["rule", "recommendation", "warning", "definition", "example", "exception"]
+class ValueEnum(StrEnum):
+    @classmethod
+    def values(cls) -> list[str]:
+        return [member.value for member in cls]
+
+
+class StageState(ValueEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+class JobState(ValueEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class ConfidenceLevel(ValueEnum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+class PresenterRole(ValueEnum):
+    NONE = "none"
+    PRIMARY_PRESENTER = "primary_presenter"
+    OTHER_PERSON = "other_person"
+
+
+class PresenterRelevance(ValueEnum):
+    NONE = "none"
+    BACKGROUND = "background"
+    BRIEF = "brief"
+    PRIMARY_EXAMPLE = "primary_example"
+
+
+class SpeakerRole(ValueEnum):
+    HOST = "host"
+    OFFSCREEN_QUESTIONER = "offscreen_questioner"
+    UNKNOWN = "unknown"
+
+
+class ClaimType(ValueEnum):
+    RULE = "rule"
+    RECOMMENDATION = "recommendation"
+    WARNING = "warning"
+    DEFINITION = "definition"
+    EXAMPLE = "example"
+    EXCEPTION = "exception"
 
 
 class StrictModel(BaseModel):
@@ -154,7 +201,6 @@ class VisualEvent(GroundedTimeBoundModel):
     interpretations: list[str]
     on_screen_text: list[str]
     items: list[str]
-    colors: list[str]
     style_topics: list[str]
     confidence: ConfidenceLevel
     notes: str
@@ -170,7 +216,6 @@ class TimelineEvent(GroundedTimeBoundModel):
     visual_summary: str
     on_screen_text: list[str]
     items: list[str]
-    colors: list[str]
     topics: list[str]
     scene_id: str
     speech_segment_ids: list[str]

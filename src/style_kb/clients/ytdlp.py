@@ -7,6 +7,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
+from style_kb.diagnostics import PipelineLogger
 from style_kb.errors import ExternalToolError
 from style_kb.utils.process import run_subprocess
 
@@ -21,11 +22,42 @@ def _base_args(cookies_from_browser: str | None) -> list[str]:
     return args
 
 
-def fetch_metadata(url: str, *, log_path: Path, cookies_from_browser: str | None) -> dict:
-    ensure_ytdlp_ready()
+def fetch_metadata(
+    url: str,
+    *,
+    log_path: Path,
+    cookies_from_browser: str | None,
+    stdout_artifact: Path | None = None,
+    pipeline_logger: PipelineLogger | None = None,
+    job_id: str | None = None,
+    video_id: str | None = None,
+    stage: str | None = None,
+    ordinal: int | None = None,
+) -> dict:
+    version_text = ensure_ytdlp_ready(
+        log_path=log_path,
+        pipeline_logger=pipeline_logger,
+        job_id=job_id,
+        video_id=video_id,
+        stage=stage,
+        ordinal=ordinal,
+    )
     args = _base_args(cookies_from_browser) + ["--dump-single-json", url]
-    completed = run_subprocess(args, error_code="yt_dlp_metadata_failed", log_path=log_path)
-    return json.loads(completed.stdout)
+    completed = run_subprocess(
+        args,
+        error_code="yt_dlp_metadata_failed",
+        log_path=log_path,
+        pipeline_logger=pipeline_logger,
+        job_id=job_id,
+        video_id=video_id,
+        stage=stage,
+        ordinal=ordinal,
+        stdout_limit_bytes=0,
+        stdout_artifact=stdout_artifact,
+    )
+    metadata = json.loads(completed.stdout)
+    metadata["_style_kb_ytdlp_version"] = version_text
+    return metadata
 
 
 def download_audio(
@@ -36,8 +68,20 @@ def download_audio(
     audio_quality: str,
     cookies_from_browser: str | None,
     log_path: Path,
-) -> None:
-    ensure_ytdlp_ready()
+    pipeline_logger: PipelineLogger | None = None,
+    job_id: str | None = None,
+    video_id: str | None = None,
+    stage: str | None = None,
+    ordinal: int | None = None,
+) -> str:
+    ensure_ytdlp_ready(
+        log_path=log_path,
+        pipeline_logger=pipeline_logger,
+        job_id=job_id,
+        video_id=video_id,
+        stage=stage,
+        ordinal=ordinal,
+    )
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=destination.parent) as temp_dir_name:
         temp_dir = Path(temp_dir_name)
@@ -52,7 +96,16 @@ def download_audio(
             str(template),
             url,
         ]
-        run_subprocess(args, error_code="yt_dlp_audio_failed", log_path=log_path)
+        run_subprocess(
+            args,
+            error_code="yt_dlp_audio_failed",
+            log_path=log_path,
+            pipeline_logger=pipeline_logger,
+            job_id=job_id,
+            video_id=video_id,
+            stage=stage,
+            ordinal=ordinal,
+        )
         candidates = sorted(temp_dir.glob(f"*.{audio_format}"))
         if not candidates:
             candidates = sorted(temp_dir.glob("*"))
@@ -69,8 +122,20 @@ def download_video_proxy(
     video_format: str,
     cookies_from_browser: str | None,
     log_path: Path,
+    pipeline_logger: PipelineLogger | None = None,
+    job_id: str | None = None,
+    video_id: str | None = None,
+    stage: str | None = None,
+    ordinal: int | None = None,
 ) -> None:
-    ensure_ytdlp_ready()
+    ensure_ytdlp_ready(
+        log_path=log_path,
+        pipeline_logger=pipeline_logger,
+        job_id=job_id,
+        video_id=video_id,
+        stage=stage,
+        ordinal=ordinal,
+    )
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=destination.parent) as temp_dir_name:
         temp_dir = Path(temp_dir_name)
@@ -88,7 +153,16 @@ def download_video_proxy(
             str(template),
             url,
         ]
-        run_subprocess(args, error_code="yt_dlp_video_failed", log_path=log_path)
+        run_subprocess(
+            args,
+            error_code="yt_dlp_video_failed",
+            log_path=log_path,
+            pipeline_logger=pipeline_logger,
+            job_id=job_id,
+            video_id=video_id,
+            stage=stage,
+            ordinal=ordinal,
+        )
         candidates = sorted(temp_dir.glob(f"*.{video_format}"))
         if not candidates:
             candidates = sorted(temp_dir.glob("*"))
@@ -97,8 +171,23 @@ def download_video_proxy(
         candidates[0].replace(destination)
 
 
-def ensure_ytdlp_ready() -> None:
-    version_text = _yt_dlp_version_text()
+def ensure_ytdlp_ready(
+    *,
+    log_path: Path | None = None,
+    pipeline_logger: PipelineLogger | None = None,
+    job_id: str | None = None,
+    video_id: str | None = None,
+    stage: str | None = None,
+    ordinal: int | None = None,
+) -> None:
+    version_text = _yt_dlp_version_text(
+        log_path=log_path,
+        pipeline_logger=pipeline_logger,
+        job_id=job_id,
+        video_id=video_id,
+        stage=stage,
+        ordinal=ordinal,
+    )
     version = _parse_version_tuple(version_text)
     if version is None or version < MIN_YT_DLP_VERSION:
         raise ExternalToolError(
@@ -120,10 +209,35 @@ def ensure_ytdlp_ready() -> None:
             ),
             error_code="yt_dlp_js_runtime_missing",
         )
+    return version_text
+
+
+def _yt_dlp_version_text(
+    *,
+    log_path: Path | None = None,
+    pipeline_logger: PipelineLogger | None = None,
+    job_id: str | None = None,
+    video_id: str | None = None,
+    stage: str | None = None,
+    ordinal: int | None = None,
+) -> str:
+    if log_path is None and pipeline_logger is None:
+        return _cached_ytdlp_version_text()
+    completed = run_subprocess(
+        ["yt-dlp", "--version"],
+        error_code="yt_dlp_version_check_failed",
+        log_path=log_path,
+        pipeline_logger=pipeline_logger,
+        job_id=job_id,
+        video_id=video_id,
+        stage=stage,
+        ordinal=ordinal,
+    )
+    return completed.stdout.strip()
 
 
 @functools.cache
-def _yt_dlp_version_text() -> str:
+def _cached_ytdlp_version_text() -> str:
     completed = run_subprocess(
         ["yt-dlp", "--version"],
         error_code="yt_dlp_version_check_failed",

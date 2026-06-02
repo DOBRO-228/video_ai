@@ -10,6 +10,7 @@ The stage loads video metadata, timeline events, chunks, style claims, and frame
 
 When `speech_turns` are available, video notes render speaker-aware dialogue instead of a single unlabeled speech block.
 Style claims are rendered in the video note and in their corresponding chunk notes.
+Markdown is a human navigation view. JSONL remains the machine-readable source for importers.
 
 ## Inputs
 
@@ -33,6 +34,7 @@ The stage can be skipped when the index note, video note, and every expected chu
 ## Important Notes
 
 - Obsidian notes are presentation exports, not canonical data.
+- Do not import Obsidian notes into the same KB/RAG index as JSONL chunks; use the JSONL manifest allowlist for machine ingestion.
 - Canonical claim data remains `claims/style_claims.jsonl`; Markdown should not become the source of truth.
 - Keep presenter blocks conditional so recurring background presenter descriptions do not spam notes.
 - Keep speaker role labels human-readable in Russian: `Ведущий` and `Закадровый вопрос`.

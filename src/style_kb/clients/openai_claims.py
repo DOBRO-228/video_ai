@@ -8,11 +8,18 @@ from typing import Any
 from openai import OpenAI
 
 from style_kb.clients._retry import OnRetry, RetryPolicy, call_with_retry
+from style_kb.clients.provider_diagnostics import (
+    ProviderCallDiagnostics,
+    cached_openai_diagnostics,
+    openai_response_diagnostics,
+    start_operation,
+)
 from style_kb.errors import MissingApiKeyError, ProviderError
+from style_kb.models import ClaimType, ConfidenceLevel
 from style_kb.utils.files import read_json, write_json_atomic
 
-CLAIM_TYPES = ["rule", "recommendation", "warning", "definition", "example", "exception"]
-CONFIDENCE_LEVELS = ["low", "medium", "high"]
+CLAIM_TYPES = ClaimType.values()
+CONFIDENCE_LEVELS = ConfidenceLevel.values()
 
 
 @dataclass(slots=True)
@@ -21,6 +28,7 @@ class ClaimsAnalysisResult:
     raw_payload: dict[str, Any]
     usage: dict[str, int]
     model: str | None
+    diagnostics: ProviderCallDiagnostics
 
 
 class OpenAIClaimsClient:
@@ -61,6 +69,7 @@ class OpenAIClaimsClient:
                 json.dumps(chunk_payload, ensure_ascii=False, indent=2, sort_keys=True),
             ]
         )
+        timer = start_operation()
         try:
             response = call_with_retry(
                 lambda: self.client.responses.create(
@@ -82,7 +91,14 @@ class OpenAIClaimsClient:
             raise ProviderError(str(error), error_code="openai_claims_failed", details=str(error)) from error
 
         raw_payload = response.model_dump(mode="json")
-        cached_payload = {"request": request_metadata, "response": raw_payload}
+        diagnostics = openai_response_diagnostics(
+            response,
+            raw_payload,
+            timer=timer,
+            raw_output_path=raw_output_path,
+        )
+        raw_payload["_style_kb_diagnostics"] = diagnostics.to_dict()
+        cached_payload = {"request": request_metadata, "diagnostics": diagnostics.to_dict(), "response": raw_payload}
         write_json_atomic(raw_output_path, cached_payload)
         return _result_from_cached_payload(cached_payload, fallback_output_text=response.output_text)
 
@@ -154,16 +170,19 @@ def _result_from_cached_payload(
         ) from error
     usage = raw_payload.get("usage") or {}
     output_details = usage.get("output_tokens_details") or {}
+    usage_payload = {
+        "input_tokens": int(usage.get("input_tokens") or 0),
+        "output_tokens": int(usage.get("output_tokens") or 0),
+        "reasoning_tokens": int(output_details.get("reasoning_tokens") or 0),
+        "total_tokens": int(usage.get("total_tokens") or 0),
+    }
+    model = str(raw_payload.get("model")) if raw_payload.get("model") is not None else None
     return ClaimsAnalysisResult(
         payload=payload,
         raw_payload=cached_payload,
-        usage={
-            "input_tokens": int(usage.get("input_tokens") or 0),
-            "output_tokens": int(usage.get("output_tokens") or 0),
-            "reasoning_tokens": int(output_details.get("reasoning_tokens") or 0),
-            "total_tokens": int(usage.get("total_tokens") or 0),
-        },
-        model=str(raw_payload.get("model")) if raw_payload.get("model") is not None else None,
+        usage=usage_payload,
+        model=model,
+        diagnostics=cached_openai_diagnostics(cached_payload, raw_payload, model=model, usage=usage_payload),
     )
 
 

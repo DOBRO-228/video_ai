@@ -95,7 +95,7 @@ vision:
   presenter_low_confidence_disables_recurrence: true
   include_nearby_transcript: true
   transcript_context_before_seconds: 5
-  transcript_context_after_seconds: 5
+  transcript_context_after_seconds: 2
   ocr: true
   prompt_file: visual_menswear_ru.txt
 

@@ -2,16 +2,29 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from time import perf_counter
 
 from style_kb.clients._retry import OnRetry
+from style_kb.clients.provider_diagnostics import ProviderCallDiagnostics, ProviderName
 from style_kb.clients.openai_vision import OpenAIVisionClient, VisionAnalysisResult, load_cached_visual_result
+from style_kb.diagnostics import PipelineEvent
 from style_kb.errors import StageExecutionError
-from style_kb.models import FrameRef, PresenterContext, PresenterProfile, Scene, SpeechSegment, VisualEvent
+from style_kb.models import (
+    ConfidenceLevel,
+    FrameRef,
+    PresenterContext,
+    PresenterProfile,
+    PresenterRelevance,
+    Scene,
+    SpeechSegment,
+    VisualEvent,
+)
 from style_kb.pipeline.base import Stage, StageContext, StageResult
 from style_kb.stages.common import (
     load_frame_refs,
@@ -19,13 +32,137 @@ from style_kb.stages.common import (
     load_speech_segments,
     load_visual_events,
     log_openai_retry,
+    emit_stage_validation_failed,
+    emit_provider_event,
+    provider_error_extra,
+    ProviderOperation,
+    request_id_from_error,
     youtube_source_ref,
 )
+from style_kb.stages.diagnostics import validation_preview
 from style_kb.utils.collections import stable_unique
 from style_kb.utils.files import append_text
 from style_kb.utils.ids import visual_event_id
 from style_kb.utils.pydantic_io import read_model, write_model, write_models_jsonl
 from style_kb.utils.time import build_timestamp_url
+
+_SCENE_CONTENT_MAX_ATTEMPTS = 2
+_BASELINE_LEAKAGE_MARKER_THRESHOLD = 1
+_BASELINE_LEAKAGE_FIELDS = (
+    "visual_summary",
+    "observations",
+    "interpretations",
+    "items",
+    "style_topics",
+    "notes",
+)
+_GENERIC_BASELINE_MARKERS = frozenset(
+    {
+        "образ",
+        "общий вид",
+        "деловой стиль",
+        "формальный стиль",
+        "классический стиль",
+        "формальный деловой стиль",
+    }
+)
+_TECHNICAL_VISUAL_PATTERNS = (
+    r"\bобразовательн\w*\s+формат\w*",
+    r"\bформат\w*\s+(?:видео|контент\w*|подач\w*)",
+    r"\bвизуальн\w*\s+подач\w*",
+    r"\bподач\w*\s+на\s+экран\w*",
+    r"\b(?:крупн\w*|средн\w*|общ\w*)\s+план\w*\b",
+    r"\b(?:ракурс\w*|кадр\w*|камер\w*|съемк\w*|съёмк\w*|монтаж\w*)\b",
+    r"\b(?:заставк\w*|оверле\w*|overlay|overlays|on\s+screen|screen)\b",
+    r"\b(?:экран\w*|текстов\w*\s+вставк\w*|надпис\w*|слайд\w*|slide|slides)\b",
+    r"\b(?:visual\s+aids?|instructional\s+aids?|presentation|presentational|formal\s+presentation)\b",
+    r"\b(?:фон\w*|background|интерьер\w*|книжн\w*\s+полк\w*|полк\w*|стол\w*|камин\w*)\b",
+    r"\b(?:микрофон\w*|петличк\w*|lapel\s+mic|microphone)\b",
+)
+_BARE_COLOR_LABELS = frozenset(
+    {
+        "белый",
+        "белая",
+        "белое",
+        "белые",
+        "черный",
+        "черная",
+        "черное",
+        "черные",
+        "чёрный",
+        "чёрная",
+        "чёрное",
+        "чёрные",
+        "серый",
+        "серая",
+        "серое",
+        "серые",
+        "зеленый",
+        "зеленая",
+        "зеленое",
+        "зеленые",
+        "зелёный",
+        "зелёная",
+        "зелёное",
+        "зелёные",
+        "синий",
+        "синяя",
+        "синее",
+        "синие",
+        "красный",
+        "красная",
+        "красное",
+        "красные",
+        "коричневый",
+        "коричневая",
+        "коричневое",
+        "коричневые",
+        "бежевый",
+        "бежевая",
+        "бежевое",
+        "бежевые",
+        "оранжевый",
+        "оранжевая",
+        "оранжевое",
+        "оранжевые",
+        "желтый",
+        "желтая",
+        "желтое",
+        "желтые",
+        "жёлтый",
+        "жёлтая",
+        "жёлтое",
+        "жёлтые",
+        "white",
+        "black",
+        "gray",
+        "grey",
+        "green",
+        "red",
+        "blue",
+        "brown",
+        "beige",
+        "orange",
+        "yellow",
+        "mustard",
+    }
+)
+
+
+class _VisualListField(StrEnum):
+    ITEMS = "items"
+    STYLE_TOPICS = "style_topics"
+
+
+class _SceneValidationStatus(StrEnum):
+    CACHE_INVALID = "cache-invalid"
+    RETRY = "retry"
+    FAILED = "failed"
+
+
+class _SceneProgressStatus(StrEnum):
+    CACHED = "cached"
+    COMPLETED = "completed"
 
 
 @dataclass(slots=True)
@@ -34,7 +171,7 @@ class _SceneTask:
     scene: Scene
     frames: list[FrameRef]
     image_paths: list[Path]
-    transcript_context: str
+    transcript_context: dict[str, object]
     transcript_words: int
     raw_output_path: Path
 
@@ -45,6 +182,15 @@ class _SceneResult:
     analysis: VisionAnalysisResult
     cached: bool
     wall_seconds: float
+
+
+@dataclass(slots=True)
+class _VisualContentLeakage:
+    reason: str
+    error_code: str
+    markers: list[str]
+    fields: dict[str, list[str]]
+    structured_errors: list[dict[str, object]]
 
 
 class Stage10DescribeVisuals(Stage):
@@ -68,10 +214,21 @@ class Stage10DescribeVisuals(Stage):
     def validate_outputs(self, context: StageContext) -> bool:
         if not context.paths.visual_events_jsonl.exists() or not context.paths.visual_presenter_profile.exists():
             return False
-        read_model(context.paths.visual_presenter_profile, PresenterProfile)
-        scenes = load_scenes(context.paths.scenes_jsonl) if context.paths.scenes_jsonl.exists() else []
-        visual_events = load_visual_events(context.paths.visual_events_jsonl)
-        return bool(visual_events) and (not scenes or len(visual_events) == len(scenes))
+        try:
+            presenter_profile = _effective_presenter_profile(
+                context,
+                read_model(context.paths.visual_presenter_profile, PresenterProfile),
+            )
+            scenes = load_scenes(context.paths.scenes_jsonl) if context.paths.scenes_jsonl.exists() else []
+            visual_events = load_visual_events(context.paths.visual_events_jsonl)
+        except Exception:
+            return False
+        if not visual_events or (scenes and len(visual_events) != len(scenes)):
+            return False
+        return not _visual_events_have_baseline_leakage(
+            visual_events,
+            presenter_profile,
+        ) and not _visual_events_have_technical_visual_labels(visual_events)
 
     def run(self, context: StageContext) -> StageResult:
         prompt_text = _prompt_path(context).read_text(encoding="utf-8")
@@ -89,11 +246,12 @@ class Stage10DescribeVisuals(Stage):
                 scene=scene,
                 frames=frame_map.get(scene.scene_id, []),
                 image_paths=[context.paths.job_dir / frame.path for frame in frame_map.get(scene.scene_id, [])],
-                transcript_context=_nearby_transcript(scene.start, scene.end, speech_segments, context),
-                transcript_words=_transcript_word_count(scene.start, scene.end, speech_segments, context),
+                transcript_context=transcript_context,
+                transcript_words=_transcript_context_word_count(transcript_context),
                 raw_output_path=context.paths.visual_raw_scene(scene.scene_id),
             )
             for index, scene in enumerate(scenes, start=1)
+            for transcript_context in [_scene_transcript_context(scene.start, scene.end, speech_segments, context)]
         ]
         newest_input_mtime = _newest_input_mtime(_scene_cache_input_files(context))
         total_scenes = len(tasks)
@@ -111,7 +269,12 @@ class Stage10DescribeVisuals(Stage):
         pending_tasks: list[_SceneTask] = []
 
         for task in tasks:
-            cached_result = _load_cached_result(task, newest_input_mtime)
+            cached_result = _load_cached_result(
+                context,
+                task,
+                newest_input_mtime,
+                presenter_profile=effective_profile,
+            )
             if cached_result is None:
                 pending_tasks.append(task)
                 continue
@@ -133,11 +296,13 @@ class Stage10DescribeVisuals(Stage):
                 future_map = {
                     executor.submit(
                         _request_scene_analysis,
+                        context=context,
                         task=task,
                         system_prompt=scene_prompt,
                         detail=context.config.vision.detail,
                         api_key=api_key,
                         model=context.config.vision.model,
+                        presenter_profile=effective_profile,
                         on_retry=_scene_retry_logger(context, task),
                     ): task
                     for task in pending_tasks
@@ -202,9 +367,9 @@ class Stage10DescribeVisuals(Stage):
                 "total_tokens_total": total_tokens,
                 "presenter_profile_detected": presenter_profile.has_primary_presenter,
                 "presenter_profile_confidence": presenter_profile.confidence,
-                "presenter_background_scenes_count": presenter_counts["background"],
-                "presenter_brief_scenes_count": presenter_counts["brief"],
-                "presenter_primary_example_scenes_count": presenter_counts["primary_example"],
+                "presenter_background_scenes_count": presenter_counts[PresenterRelevance.BACKGROUND.value],
+                "presenter_brief_scenes_count": presenter_counts[PresenterRelevance.BRIEF.value],
+                "presenter_primary_example_scenes_count": presenter_counts[PresenterRelevance.PRIMARY_EXAMPLE.value],
             },
         )
 
@@ -227,7 +392,7 @@ def _load_or_build_presenter_profile(
     if not context.config.vision.presenter_bootstrap_enabled:
         profile = PresenterProfile(
             has_primary_presenter=False,
-            confidence="low",
+            confidence=ConfidenceLevel.LOW,
             baseline_summary="",
             recurring_visual_markers=[],
             notes="Presenter bootstrap is disabled in config.",
@@ -251,11 +416,53 @@ def _load_or_build_presenter_profile(
         model=context.config.vision.model,
         on_retry=_presenter_retry_logger(context),
     )
-    analysis = client.build_presenter_profile(
-        system_prompt=prompt_path.read_text(encoding="utf-8"),
-        image_paths=image_paths,
-        detail=context.config.vision.detail,
-        raw_output_path=context.paths.visual_raw_presenter_profile,
+    emit_provider_event(
+        context,
+        PipelineEvent.PROVIDER_REQUEST_STARTED,
+        stage_name=Stage10DescribeVisuals.name,
+        ordinal=Stage10DescribeVisuals.ordinal,
+        operation=ProviderOperation.VISION_PRESENTER_PROFILE,
+        diagnostics=ProviderCallDiagnostics(
+            provider=ProviderName.OPENAI,
+            model=context.config.vision.model,
+            raw_output_path=str(context.paths.visual_raw_presenter_profile),
+        ),
+        message="presenter profile request started",
+        extra={"images_count": len(image_paths)},
+    )
+    try:
+        analysis = client.build_presenter_profile(
+            system_prompt=prompt_path.read_text(encoding="utf-8"),
+            image_paths=image_paths,
+            detail=context.config.vision.detail,
+            raw_output_path=context.paths.visual_raw_presenter_profile,
+        )
+    except Exception as error:
+        emit_provider_event(
+            context,
+            PipelineEvent.PROVIDER_REQUEST_FAILED,
+            stage_name=Stage10DescribeVisuals.name,
+            ordinal=Stage10DescribeVisuals.ordinal,
+            operation=ProviderOperation.VISION_PRESENTER_PROFILE,
+            diagnostics=ProviderCallDiagnostics(
+                provider=ProviderName.OPENAI,
+                model=context.config.vision.model,
+                raw_output_path=str(context.paths.visual_raw_presenter_profile),
+                request_id=request_id_from_error(error),
+            ),
+            message="presenter profile request failed",
+            extra={**provider_error_extra(error), "images_count": len(image_paths)},
+        )
+        raise
+    emit_provider_event(
+        context,
+        PipelineEvent.PROVIDER_REQUEST_COMPLETED,
+        stage_name=Stage10DescribeVisuals.name,
+        ordinal=Stage10DescribeVisuals.ordinal,
+        operation=ProviderOperation.VISION_PRESENTER_PROFILE,
+        diagnostics=analysis.diagnostics,
+        message="presenter profile request completed",
+        extra={"images_count": len(image_paths)},
     )
     profile = PresenterProfile.model_validate(analysis.payload)
     write_model(context.paths.visual_presenter_profile, profile)
@@ -267,7 +474,7 @@ def _effective_presenter_profile(context: StageContext, profile: PresenterProfil
     if (
         context.config.vision.presenter_low_confidence_disables_recurrence
         and profile.has_primary_presenter
-        and profile.confidence == "low"
+        and profile.confidence == ConfidenceLevel.LOW
     ):
         return PresenterProfile(
             has_primary_presenter=False,
@@ -325,23 +532,103 @@ def _scene_prompt(prompt_text: str, profile: PresenterProfile) -> str:
             prompt_text.strip(),
             "Профиль повторяющегося ведущего для этого видео:",
             presenter_profile_json,
-            "Если has_primary_presenter=true, используй этот профиль только для распознавания повторяющегося baseline. Не копируй baseline в основные поля сцены, если relevance=background.",
+            "Если has_primary_presenter=true, используй этот профиль только для распознавания повторяющегося baseline. Не копируй baseline в основные поля сцены при любом relevance, включая primary_example. Основные поля должны содержать только scene-specific визуальную информацию о мужском стиле: новые примеры, демонстрации деталей одежды, смену одежды, новые предметы гардероба или реальные отличия от baseline.",
         ]
     )
 
 
-def _nearby_transcript(start: float, end: float, speech_segments: list[SpeechSegment], context: StageContext) -> str:
+def _scene_transcript_context(start: float, end: float, speech_segments: list[SpeechSegment], context: StageContext) -> dict[str, object]:
     before = context.config.vision.transcript_context_before_seconds
     after = context.config.vision.transcript_context_after_seconds
+    if not context.config.vision.include_nearby_transcript:
+        return {
+            "scene_time": {"start": round(start, 3), "end": round(end, 3)},
+            "rules": _transcript_context_rules(),
+            "previous_context": _transcript_window_payload(window_start=start, window_end=start, segments=[]),
+            "current_scene_context": _transcript_window_payload(window_start=start, window_end=end, segments=[]),
+            "next_context": _transcript_window_payload(window_start=end, window_end=end, segments=[]),
+        }
     lower = max(0.0, start - before)
     upper = end + after
-    texts = [segment.text for segment in speech_segments if segment.end >= lower and segment.start <= upper]
-    return "\n".join(texts)
+    current_segments = _overlapping_segments(speech_segments, start, end)
+    current_ids = {segment.segment_id for segment in current_segments}
+    previous_segments = (
+        [
+            segment
+            for segment in _overlapping_segments(speech_segments, lower, start)
+            if segment.segment_id not in current_ids
+        ]
+        if before > 0
+        else []
+    )
+    next_segments = (
+        [
+            segment
+            for segment in _overlapping_segments(speech_segments, end, upper)
+            if segment.segment_id not in current_ids
+        ]
+        if after > 0
+        else []
+    )
+    return {
+        "scene_time": {"start": round(start, 3), "end": round(end, 3)},
+        "rules": _transcript_context_rules(),
+        "previous_context": _transcript_window_payload(
+            window_start=lower,
+            window_end=start,
+            segments=previous_segments,
+        ),
+        "current_scene_context": _transcript_window_payload(
+            window_start=start,
+            window_end=end,
+            segments=current_segments,
+        ),
+        "next_context": _transcript_window_payload(
+            window_start=end,
+            window_end=upper,
+            segments=next_segments,
+        ),
+    }
 
 
-def _transcript_word_count(start: float, end: float, speech_segments: list[SpeechSegment], context: StageContext) -> int:
-    transcript = _nearby_transcript(start, end, speech_segments, context)
-    return len(transcript.split())
+def _transcript_context_rules() -> dict[str, str]:
+    return {
+        "visual_evidence_source": "current_scene_frames_only",
+        "transcript_role": "context_only_not_visual_evidence",
+        "previous_context_role": "boundary_orientation_only",
+        "next_context_role": "boundary_orientation_only_do_not_describe_as_current_scene",
+    }
+
+
+def _overlapping_segments(speech_segments: list[SpeechSegment], start: float, end: float) -> list[SpeechSegment]:
+    if end <= start:
+        return []
+    return [segment for segment in speech_segments if segment.start < end and segment.end > start]
+
+
+def _transcript_window_payload(
+    *,
+    window_start: float,
+    window_end: float,
+    segments: list[SpeechSegment],
+) -> dict[str, object]:
+    text = "\n".join(segment.text for segment in segments if segment.text.strip())
+    return {
+        "window_start": round(window_start, 3),
+        "window_end": round(window_end, 3),
+        "segment_count": len(segments),
+        "word_count": len(text.split()),
+        "text": text,
+    }
+
+
+def _transcript_context_word_count(transcript_context: dict[str, object]) -> int:
+    total = 0
+    for key in ("previous_context", "current_scene_context", "next_context"):
+        value = transcript_context.get(key)
+        if isinstance(value, dict):
+            total += int(value.get("word_count") or 0)
+    return total
 
 
 def _prompt_path(context: StageContext) -> Path:
@@ -364,7 +651,13 @@ def _newest_input_mtime(paths: list[Path]) -> float:
     return max(existing) if existing else 0.0
 
 
-def _load_cached_result(task: _SceneTask, newest_input_mtime: float) -> _SceneResult | None:
+def _load_cached_result(
+    context: StageContext,
+    task: _SceneTask,
+    newest_input_mtime: float,
+    *,
+    presenter_profile: PresenterProfile,
+) -> _SceneResult | None:
     if not task.raw_output_path.exists():
         return None
     if task.raw_output_path.stat().st_mtime < newest_input_mtime:
@@ -373,28 +666,121 @@ def _load_cached_result(task: _SceneTask, newest_input_mtime: float) -> _SceneRe
     if not isinstance(analysis.payload.get("presenter_context"), dict):
         return None
     PresenterContext.model_validate(analysis.payload["presenter_context"])
+    leakage = _visual_content_leakage_from_payload(analysis.payload, presenter_profile)
+    if leakage is not None:
+        _log_vision_content_validation(
+            context,
+            task=task,
+            status=_SceneValidationStatus.CACHE_INVALID,
+            attempt=0,
+            max_attempts=_SCENE_CONTENT_MAX_ATTEMPTS,
+            leakage=leakage,
+        )
+        return None
     return _SceneResult(task=task, analysis=analysis, cached=True, wall_seconds=0.0)
 
 
 def _request_scene_analysis(
     *,
+    context: StageContext,
     task: _SceneTask,
     system_prompt: str,
     detail: str,
     api_key: str | None,
     model: str,
+    presenter_profile: PresenterProfile,
     on_retry: OnRetry | None = None,
 ) -> _SceneResult:
     started_at = perf_counter()
     client = OpenAIVisionClient(api_key, model=model, on_retry=on_retry)
-    analysis = client.describe_scene(
-        system_prompt=system_prompt,
-        transcript_context=task.transcript_context,
-        image_paths=task.image_paths,
-        detail=detail,
-        raw_output_path=task.raw_output_path,
+    leakage: _VisualContentLeakage | None = None
+    for attempt in range(1, _SCENE_CONTENT_MAX_ATTEMPTS + 1):
+        event_extra = {
+            "scene_order": task.order,
+            "scene_index": task.scene.index,
+            "scene_id": task.scene.scene_id,
+            "attempt": attempt,
+            "max_attempts": _SCENE_CONTENT_MAX_ATTEMPTS,
+            "frames_count": len(task.frames),
+        }
+        emit_provider_event(
+            context,
+            PipelineEvent.PROVIDER_REQUEST_STARTED,
+            stage_name=Stage10DescribeVisuals.name,
+            ordinal=Stage10DescribeVisuals.ordinal,
+            operation=ProviderOperation.VISION_SCENE,
+            diagnostics=ProviderCallDiagnostics(
+                provider=ProviderName.OPENAI,
+                model=model,
+                raw_output_path=str(task.raw_output_path),
+            ),
+            attempt=attempt,
+            message="scene vision request started",
+            extra=event_extra,
+        )
+        try:
+            analysis = client.describe_scene(
+                system_prompt=_scene_prompt_for_attempt(system_prompt, leakage),
+                transcript_context=task.transcript_context,
+                image_paths=task.image_paths,
+                detail=detail,
+                raw_output_path=task.raw_output_path,
+            )
+        except Exception as error:
+            emit_provider_event(
+                context,
+                PipelineEvent.PROVIDER_REQUEST_FAILED,
+                stage_name=Stage10DescribeVisuals.name,
+                ordinal=Stage10DescribeVisuals.ordinal,
+                operation=ProviderOperation.VISION_SCENE,
+                diagnostics=ProviderCallDiagnostics(
+                    provider=ProviderName.OPENAI,
+                    model=model,
+                    raw_output_path=str(task.raw_output_path),
+                    request_id=request_id_from_error(error),
+                ),
+                attempt=attempt,
+                message="scene vision request failed",
+                extra={**provider_error_extra(error), **event_extra},
+            )
+            raise
+        emit_provider_event(
+            context,
+            PipelineEvent.PROVIDER_REQUEST_COMPLETED,
+            stage_name=Stage10DescribeVisuals.name,
+            ordinal=Stage10DescribeVisuals.ordinal,
+            operation=ProviderOperation.VISION_SCENE,
+            diagnostics=analysis.diagnostics,
+            attempt=attempt,
+            message="scene vision request completed",
+            extra=event_extra,
+        )
+        leakage = _visual_content_leakage_from_payload(analysis.payload, presenter_profile)
+        if leakage is None:
+            return _SceneResult(task=task, analysis=analysis, cached=False, wall_seconds=perf_counter() - started_at)
+
+        status = (
+            _SceneValidationStatus.RETRY
+            if attempt < _SCENE_CONTENT_MAX_ATTEMPTS
+            else _SceneValidationStatus.FAILED
+        )
+        _log_vision_content_validation(
+            context,
+            task=task,
+            status=status,
+            attempt=attempt,
+            max_attempts=_SCENE_CONTENT_MAX_ATTEMPTS,
+            leakage=leakage,
+        )
+        if status == _SceneValidationStatus.RETRY:
+            _emit_content_validation_retry_progress(context, task=task, attempt=attempt, leakage=leakage)
+
+    assert leakage is not None
+    raise StageExecutionError(
+        "OpenAI vision response polluted scene-specific visual fields",
+        error_code=leakage.error_code,
+        details=_visual_content_leakage_details(leakage),
     )
-    return _SceneResult(task=task, analysis=analysis, cached=False, wall_seconds=perf_counter() - started_at)
 
 
 def _build_visual_event(context: StageContext, task: _SceneTask, analysis: VisionAnalysisResult) -> VisualEvent:
@@ -414,19 +800,262 @@ def _build_visual_event(context: StageContext, task: _SceneTask, analysis: Visio
         observations=stable_unique(payload.get("observations") or []),
         interpretations=stable_unique(payload.get("interpretations") or []),
         on_screen_text=stable_unique(payload.get("on_screen_text") or []),
-        items=stable_unique(payload.get("items") or []),
-        colors=stable_unique(payload.get("colors") or []),
-        style_topics=stable_unique(payload.get("style_topics") or []),
-        confidence=str(payload.get("confidence") or "medium"),
+        items=_sanitize_visual_labels(payload.get("items") or [], _VisualListField.ITEMS),
+        style_topics=_sanitize_visual_labels(payload.get("style_topics") or [], _VisualListField.STYLE_TOPICS),
+        confidence=ConfidenceLevel(str(payload.get("confidence") or ConfidenceLevel.MEDIUM.value)),
         notes=str(payload.get("notes") or ""),
         source_refs=[youtube_source_ref(context.job.video_id, scene.start, scene.end, modality="visual")],
     )
 
 
+def _scene_prompt_for_attempt(system_prompt: str, leakage: _VisualContentLeakage | None) -> str:
+    if leakage is None:
+        return system_prompt
+    feedback = [
+        "",
+        f"Нарушение предыдущей попытки: {leakage.reason}.",
+        "Исправь ответ: основные поля сцены должны содержать только scene-specific визуальную информацию о мужском стиле.",
+        "Не копируй baseline повторяющегося ведущего в visual_summary, observations, interpretations, items, style_topics или notes.",
+        "Не пиши про формат видео, экран, слайды, текстовые вставки, оверлеи, кадр, камеру, крупный/средний план, фон, интерьер или предметы съемочной обстановки.",
+        "Найденные markers:",
+        *[f"- {marker}" for marker in leakage.markers],
+        "Поля с нарушениями:",
+        *[f"- {field}: {', '.join(markers)}" for field, markers in leakage.fields.items()],
+    ]
+    return system_prompt.rstrip() + "\n" + "\n".join(feedback)
+
+
+def _visual_events_have_baseline_leakage(visual_events: list[VisualEvent], presenter_profile: PresenterProfile) -> bool:
+    return any(
+        _baseline_leakage_from_payload(event.model_dump(mode="json"), presenter_profile) is not None
+        for event in visual_events
+    )
+
+
+def _visual_events_have_technical_visual_labels(visual_events: list[VisualEvent]) -> bool:
+    return any(_technical_visual_leakage_from_payload(event.model_dump(mode="json")) is not None for event in visual_events)
+
+
+def _sanitize_visual_labels(values: object, field: _VisualListField) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    return [
+        value
+        for value in stable_unique(_clean_visual_label(item) for item in values)
+        if not _should_drop_visual_label(value, field)
+    ]
+
+
+def _should_drop_visual_label(value: str, field: _VisualListField) -> bool:
+    normalized = _normalize_visual_label(value)
+    if not normalized:
+        return True
+    if normalized in _BARE_COLOR_LABELS:
+        return True
+    if field == _VisualListField.ITEMS:
+        return _matches_any_pattern(normalized, _TECHNICAL_VISUAL_PATTERNS)
+    if field == _VisualListField.STYLE_TOPICS:
+        return _matches_any_pattern(normalized, _TECHNICAL_VISUAL_PATTERNS)
+    return False
+
+
+def _clean_visual_label(value: object) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _normalize_visual_label(value: str) -> str:
+    text = value.casefold().replace("ё", "е")
+    text = re.sub(r"[-‐‑‒–—]+", " ", text)
+    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text, flags=re.UNICODE).strip()
+
+
+def _matches_any_pattern(value: str, patterns: tuple[str, ...]) -> bool:
+    return any(re.search(pattern, value, flags=re.UNICODE) is not None for pattern in patterns)
+
+
+def _visual_content_leakage_from_payload(
+    payload: dict,
+    presenter_profile: PresenterProfile,
+) -> _VisualContentLeakage | None:
+    baseline_leakage = _baseline_leakage_from_payload(payload, presenter_profile)
+    if baseline_leakage is not None:
+        return baseline_leakage
+    return _technical_visual_leakage_from_payload(payload)
+
+
+def _technical_visual_leakage_from_payload(payload: dict) -> _VisualContentLeakage | None:
+    fields: dict[str, list[str]] = {}
+    structured_errors: list[dict[str, object]] = []
+    for field in ("visual_summary", "observations", "interpretations", "items", "style_topics", "notes"):
+        markers = _technical_visual_markers(payload.get(field))
+        if not markers:
+            continue
+        fields[field] = markers
+        structured_errors.extend(
+            {
+                "code": "openai_vision_technical_visual_label",
+                "message": "scene-specific field contains technical presentation or background label",
+                "field": field,
+                "marker": marker,
+                "preview": validation_preview(payload.get(field)),
+            }
+            for marker in markers
+        )
+    if not fields:
+        return None
+    markers = stable_unique(marker for field_markers in fields.values() for marker in field_markers)
+    return _VisualContentLeakage(
+        reason="technical_visual_label_leakage",
+        error_code="openai_vision_technical_visual_label",
+        markers=markers,
+        fields=fields,
+        structured_errors=structured_errors,
+    )
+
+
+def _technical_visual_markers(value: object) -> list[str]:
+    values = value if isinstance(value, list) else [value]
+    markers: list[str] = []
+    for item in values:
+        raw_text = _clean_visual_label(item)
+        normalized = _normalize_visual_label(raw_text)
+        if not normalized:
+            continue
+        if normalized in _BARE_COLOR_LABELS:
+            markers.append(raw_text)
+            continue
+        if _matches_any_pattern(normalized, _TECHNICAL_VISUAL_PATTERNS):
+            markers.append(raw_text)
+    return stable_unique(markers)
+
+
+def _baseline_leakage_from_payload(payload: dict, presenter_profile: PresenterProfile) -> _VisualContentLeakage | None:
+    if not presenter_profile.has_primary_presenter:
+        return None
+
+    presenter_context = PresenterContext.model_validate(payload.get("presenter_context"))
+    if not presenter_context.is_recurring:
+        return None
+
+    markers_by_key = _baseline_markers_by_key(presenter_profile)
+    if not markers_by_key:
+        return None
+
+    leaked_fields: dict[str, list[str]] = {}
+    structured_errors: list[dict[str, object]] = []
+    leaked_marker_keys: set[str] = set()
+    for field in _BASELINE_LEAKAGE_FIELDS:
+        raw_field_text = _field_text(payload.get(field))
+        normalized_text = _normalize_baseline_text(raw_field_text)
+        if not normalized_text:
+            continue
+        field_marker_keys = [
+            marker_key
+            for marker_key in markers_by_key
+            if marker_key in normalized_text
+        ]
+        if not field_marker_keys:
+            continue
+        leaked_fields[field] = [markers_by_key[marker_key] for marker_key in field_marker_keys]
+        structured_errors.extend(
+            {
+                "code": "openai_vision_baseline_leakage",
+                "message": "scene-specific field repeats recurring presenter baseline marker",
+                "field": field,
+                "marker": markers_by_key[marker_key],
+                "preview": validation_preview(raw_field_text),
+            }
+            for marker_key in field_marker_keys
+        )
+        leaked_marker_keys.update(field_marker_keys)
+
+    if len(leaked_marker_keys) < _BASELINE_LEAKAGE_MARKER_THRESHOLD:
+        return None
+    return _VisualContentLeakage(
+        reason="recurring_presenter_baseline_leakage",
+        error_code="openai_vision_baseline_leakage",
+        markers=[markers_by_key[marker_key] for marker_key in sorted(leaked_marker_keys)],
+        fields=leaked_fields,
+        structured_errors=structured_errors,
+    )
+
+
+def _baseline_markers_by_key(presenter_profile: PresenterProfile) -> dict[str, str]:
+    markers: dict[str, str] = {}
+    for marker in presenter_profile.recurring_visual_markers:
+        _add_baseline_marker(markers, marker, require_phrase=False)
+    for marker in _baseline_summary_markers(presenter_profile.baseline_summary):
+        _add_baseline_marker(markers, marker, require_phrase=True)
+    return markers
+
+
+def _add_baseline_marker(markers: dict[str, str], value: str, *, require_phrase: bool) -> None:
+    marker = " ".join(str(value or "").split())
+    marker_key = _normalize_baseline_text(marker)
+    if not marker_key or marker_key in markers:
+        return
+    if _is_generic_baseline_marker(marker_key):
+        return
+    if require_phrase and (len(marker_key) < 14 or len(marker_key.split()) < 2):
+        return
+    markers[marker_key] = marker
+
+
+def _is_generic_baseline_marker(marker_key: str) -> bool:
+    return marker_key in _GENERIC_BASELINE_MARKERS or marker_key.startswith("общий вид ")
+
+
+def _baseline_summary_markers(summary: str) -> list[str]:
+    return [
+        part.strip()
+        for part in re.split(r"[,;]", summary)
+        if part.strip()
+    ]
+
+
+def _field_text(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return " ".join(str(item) for item in value)
+    return ""
+
+
+def _normalize_baseline_text(value: str) -> str:
+    text = value.casefold().replace("ё", "е")
+    text = re.sub(r"[-‐‑‒–—]+", " ", text)
+    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text, flags=re.UNICODE).strip()
+
+
+def _visual_content_leakage_details(leakage: _VisualContentLeakage) -> str:
+    lines = [
+        f"reason: {leakage.reason}",
+        f"markers_count: {len(leakage.markers)}",
+        f"structured_errors_count: {len(leakage.structured_errors)}",
+        "markers:",
+        *[f"  - {marker}" for marker in leakage.markers],
+        "fields:",
+    ]
+    for field, markers in leakage.fields.items():
+        lines.append(f"  - {field}: {', '.join(markers)}")
+    lines.append("structured_error_previews:")
+    lines.extend(
+        f"  - {entry.get('field', '-')}: marker={entry.get('marker', '-')} preview={entry.get('preview', '-')}"
+        for entry in leakage.structured_errors[:5]
+    )
+    return "\n".join(lines)
+
+
 def _presenter_relevance_counts(visual_events: list[VisualEvent]) -> dict[str, int]:
-    counts = {"background": 0, "brief": 0, "primary_example": 0}
+    counts = {
+        PresenterRelevance.BACKGROUND.value: 0,
+        PresenterRelevance.BRIEF.value: 0,
+        PresenterRelevance.PRIMARY_EXAMPLE.value: 0,
+    }
     for event in visual_events:
-        relevance = event.presenter_context.relevance
+        relevance = event.presenter_context.relevance.value
         if relevance in counts:
             counts[relevance] += 1
     return counts
@@ -439,13 +1068,20 @@ def _log_presenter_profile(
     analysis: VisionAnalysisResult,
     image_paths: list[Path],
 ) -> None:
+    diagnostics = analysis.diagnostics
     lines = [
         "",
         "[presenter-profile]",
+        f"run_id: {context.run_id or '-'}",
         f"has_primary_presenter: {profile.has_primary_presenter}",
         f"confidence: {profile.confidence}",
         f"images_count: {len(image_paths)}",
-        f"model: {analysis.model or '-'}",
+        f"model: {diagnostics.model or '-'}",
+        f"request_id: {diagnostics.request_id or '-'}",
+        f"response_id: {diagnostics.response_id or '-'}",
+        f"started_at: {diagnostics.started_at or '-'}",
+        f"finished_at: {diagnostics.finished_at or '-'}",
+        f"duration_seconds: {_format_seconds(diagnostics.duration_seconds)}",
         f"input_tokens: {analysis.usage['input_tokens']}",
         f"output_tokens: {analysis.usage['output_tokens']}",
         f"reasoning_tokens: {analysis.usage['reasoning_tokens']}",
@@ -466,19 +1102,30 @@ def _log_scene_result(
     completed: int,
     total_scenes: int,
 ) -> None:
+    status = _scene_progress_status(result)
+    diagnostics = result.analysis.diagnostics
     lines = [
         "",
         "[scene-summary]",
+        f"run_id: {context.run_id or '-'}",
         f"scene_order: {result.task.order}/{total_scenes}",
         f"completed_progress: {completed}/{total_scenes}",
         f"scene_index: {result.task.scene.index}",
         f"scene_id: {result.task.scene.scene_id}",
-        f"status: {'cached' if result.cached else 'completed'}",
+        f"status: {status.value}",
         f"frames_count: {len(result.task.frames)}",
         f"transcript_words: {result.task.transcript_words}",
+        f"previous_transcript_words: {_transcript_window_word_count(result.task.transcript_context, 'previous_context')}",
+        f"current_transcript_words: {_transcript_window_word_count(result.task.transcript_context, 'current_scene_context')}",
+        f"next_transcript_words: {_transcript_window_word_count(result.task.transcript_context, 'next_context')}",
         f"wall_seconds: {_format_seconds(result.wall_seconds)}",
+        f"started_at: {diagnostics.started_at or '-'}",
+        f"finished_at: {diagnostics.finished_at or '-'}",
+        f"duration_seconds: {_format_seconds(diagnostics.duration_seconds)}",
         f"remote_duration_seconds: {_format_seconds(result.analysis.remote_duration_seconds)}",
-        f"model: {result.analysis.model or '-'}",
+        f"model: {diagnostics.model or '-'}",
+        f"request_id: {diagnostics.request_id or '-'}",
+        f"response_id: {diagnostics.response_id or '-'}",
         f"input_tokens: {result.analysis.usage['input_tokens']}",
         f"output_tokens: {result.analysis.usage['output_tokens']}",
         f"reasoning_tokens: {result.analysis.usage['reasoning_tokens']}",
@@ -489,72 +1136,71 @@ def _log_scene_result(
     append_text(context.paths.stage_log(Stage10DescribeVisuals.name), "\n".join(lines), encoding="utf-8")
 
 
-def _scene_retry_logger(context: StageContext, task: _SceneTask) -> OnRetry:
-    def _log_retry(attempt: int, delay_seconds: float, error: BaseException) -> None:
-        log_openai_retry(
-            context.paths.stage_log(Stage10DescribeVisuals.name),
-            attempt=attempt,
-            delay_seconds=delay_seconds,
-            error=error,
-            context_lines=[
-                "operation: describe_scene",
-                f"scene_order: {task.order}",
-                f"scene_id: {task.scene.scene_id}",
-                f"raw_output: {task.raw_output_path}",
-            ],
-        )
-
-    return _log_retry
-
-
-def _presenter_retry_logger(context: StageContext) -> OnRetry:
-    def _log_retry(attempt: int, delay_seconds: float, error: BaseException) -> None:
-        log_openai_retry(
-            context.paths.stage_log(Stage10DescribeVisuals.name),
-            attempt=attempt,
-            delay_seconds=delay_seconds,
-            error=error,
-            context_lines=[
-                "operation: presenter_profile",
-                f"raw_output: {context.paths.visual_raw_presenter_profile}",
-            ],
-        )
-
-    return _log_retry
-
-
-def _log_concurrent_abort(
+def _log_vision_content_validation(
     context: StageContext,
     *,
-    error: BaseException,
-    completed: int,
-    total_scenes: int,
-    cancelled_tasks: list[_SceneTask],
-    in_flight_tasks: list[_SceneTask],
+    task: _SceneTask,
+    status: _SceneValidationStatus,
+    attempt: int,
+    max_attempts: int,
+    leakage: _VisualContentLeakage,
 ) -> None:
     lines = [
         "",
-        "[concurrent-abort]",
-        f"completed_progress: {completed}/{total_scenes}",
-        f"error: {type(error).__name__}: {error}",
-        f"cancelled_count: {len(cancelled_tasks)}",
-        f"in_flight_count: {len(in_flight_tasks)}",
-        "cancelled_tasks:",
-        *[_task_log_line(task) for task in cancelled_tasks],
-        "in_flight_tasks:",
-        *[_task_log_line(task) for task in in_flight_tasks],
-        "",
+        "[vision-content-validation]",
+        f"run_id: {context.run_id or '-'}",
+        f"scene_order: {task.order}",
+        f"scene_index: {task.scene.index}",
+        f"scene_id: {task.scene.scene_id}",
+        f"status: {status.value}",
+        f"attempt: {attempt}/{max_attempts}",
+        f"reason: {leakage.reason}",
+        f"markers_count: {len(leakage.markers)}",
+        "markers:",
+        *[f"  - {marker}" for marker in leakage.markers],
+        "fields:",
     ]
+    for field, markers in leakage.fields.items():
+        lines.append(f"  - {field}: {', '.join(markers)}")
+    lines.append("structured_error_previews:")
+    lines.extend(
+        "  - "
+        f"{entry.get('field', '-')}"
+        f" marker={entry.get('marker', '-')}"
+        f" preview={entry.get('preview', '-')}"
+        for entry in leakage.structured_errors[:5]
+    )
+    lines.extend(
+        [
+            f"raw_output: {task.raw_output_path}",
+            "",
+        ]
+    )
     append_text(context.paths.stage_log(Stage10DescribeVisuals.name), "\n".join(lines), encoding="utf-8")
+    validation_errors = [
+        f"field {field} contains blocked visual content: {', '.join(markers)}"
+        for field, markers in leakage.fields.items()
+    ]
+    emit_stage_validation_failed(
+        context,
+        stage_name=Stage10DescribeVisuals.name,
+        ordinal=Stage10DescribeVisuals.ordinal,
+        error_code=leakage.error_code,
+        message="vision content validation failed",
+        validation_errors=validation_errors,
+        structured_errors=leakage.structured_errors,
+        raw_output_path=task.raw_output_path,
+        attempt=attempt,
+        extra={"scene_order": task.order, "scene_id": task.scene.scene_id, "status": status.value},
+    )
 
 
-def _emit_concurrent_abort_progress(
+def _emit_content_validation_retry_progress(
     context: StageContext,
     *,
-    completed: int,
-    total_scenes: int,
-    cancelled_count: int,
-    in_flight_count: int,
+    task: _SceneTask,
+    attempt: int,
+    leakage: _VisualContentLeakage,
 ) -> None:
     if context.progress_callback is None:
         return
@@ -562,17 +1208,14 @@ def _emit_concurrent_abort_progress(
         " ".join(
             [
                 f"[10 {Stage10DescribeVisuals.name}]",
-                "abort",
-                f"done={completed}/{total_scenes}",
-                f"cancelled={cancelled_count}",
-                f"in_flight={in_flight_count}",
+                f"scene {task.order}",
+                _SceneValidationStatus.RETRY.value,
+                f"attempt={attempt + 1}/{_SCENE_CONTENT_MAX_ATTEMPTS}",
+                f"reason={leakage.reason}",
+                f"markers={len(leakage.markers)}",
             ]
         )
     )
-
-
-def _task_log_line(task: _SceneTask) -> str:
-    return f"  - scene_order={task.order} scene_id={task.scene.scene_id} raw_output={task.raw_output_path}"
 
 
 def _emit_scene_progress(
@@ -584,13 +1227,13 @@ def _emit_scene_progress(
 ) -> None:
     if context.progress_callback is None:
         return
-    status = "cached" if result.cached else "completed"
+    status = _scene_progress_status(result)
     context.progress_callback(
         " ".join(
             [
                 f"[10 {Stage10DescribeVisuals.name}]",
                 f"scene {result.task.order}/{total_scenes}",
-                status,
+                status.value,
                 f"done={completed}/{total_scenes}",
                 f"frames={len(result.task.frames)}",
                 f"wall={_format_seconds(result.wall_seconds)}s",
@@ -600,10 +1243,24 @@ def _emit_scene_progress(
     )
 
 
+def _scene_progress_status(result: _SceneResult) -> _SceneProgressStatus:
+    return _SceneProgressStatus.CACHED if result.cached else _SceneProgressStatus.COMPLETED
+
+
 def _format_seconds(value: float | None) -> str:
     if value is None:
         return "-"
     return f"{value:.2f}"
+
+
+def _transcript_window_word_count(transcript_context: dict[str, object], key: str) -> int:
+    value = transcript_context.get(key)
+    if not isinstance(value, dict):
+        return 0
+    try:
+        return int(value.get("word_count") or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _dedupe_paths(paths: list[Path]) -> list[Path]:
@@ -627,6 +1284,7 @@ def _scene_retry_logger(context: StageContext, task: _SceneTask) -> OnRetry:
             delay_seconds=delay,
             error=error,
             context_lines=[
+                f"run_id: {context.run_id or '-'}",
                 f"scene_index: {task.scene.index}",
                 f"scene_id: {task.scene.scene_id}",
             ],
@@ -644,7 +1302,7 @@ def _presenter_retry_logger(context: StageContext) -> OnRetry:
             attempt=attempt,
             delay_seconds=delay,
             error=error,
-            context_lines=["operation: presenter_profile_bootstrap"],
+            context_lines=[f"run_id: {context.run_id or '-'}", "operation: presenter_profile_bootstrap"],
         )
 
     return _on_retry
@@ -662,14 +1320,23 @@ def _log_concurrent_abort(
     lines = [
         "",
         "[concurrent-abort]",
+        f"run_id: {context.run_id or '-'}",
         f"error: {type(error).__name__}: {error}",
         f"completed: {completed}/{total_scenes}",
         f"cancelled_count: {len(cancelled_tasks)}",
         f"in_flight_count: {len(in_flight_tasks)}",
         "cancelled_scenes:",
-        *[f"  - {task.scene.scene_id} (index {task.scene.index})" for task in cancelled_tasks],
+        *[
+            f"  - {task.scene.scene_id} (index {task.scene.index}) raw_output={task.raw_output_path}"
+            for task in cancelled_tasks[:10]
+        ],
+        *([f"  - ... {len(cancelled_tasks) - 10} more"] if len(cancelled_tasks) > 10 else []),
         "in_flight_scenes:",
-        *[f"  - {task.scene.scene_id} (index {task.scene.index})" for task in in_flight_tasks],
+        *[
+            f"  - {task.scene.scene_id} (index {task.scene.index}) raw_output={task.raw_output_path}"
+            for task in in_flight_tasks[:10]
+        ],
+        *([f"  - ... {len(in_flight_tasks) - 10} more"] if len(in_flight_tasks) > 10 else []),
         "note: in_flight requests keep running until completion; their raw outputs"
         " are saved to disk and reused on the next run",
         "",
@@ -685,8 +1352,11 @@ def _log_in_flight_finalization(
     context: StageContext,
     in_flight_map: dict[Future, _SceneTask],
 ) -> None:
-    lines = ["", "[concurrent-abort-finalized]"]
-    for future, task in in_flight_map.items():
+    lines = ["", "[concurrent-abort-finalized]", f"run_id: {context.run_id or '-'}"]
+    for index, (future, task) in enumerate(in_flight_map.items()):
+        if index >= 10:
+            lines.append(f"  - ... {len(in_flight_map) - 10} more")
+            break
         if future.cancelled():
             lines.append(
                 f"  - scene_id={task.scene.scene_id} index={task.scene.index}"
@@ -695,15 +1365,21 @@ def _log_in_flight_finalization(
             continue
         future_error = future.exception()
         if future_error is None:
-            lines.append(
-                f"  - scene_id={task.scene.scene_id} index={task.scene.index}"
-                f" status=completed_after_abort raw_output={task.raw_output_path}"
-            )
+            result = future.result()
+            diagnostics = result.analysis.diagnostics
+            lines.append(f"  - scene_id={task.scene.scene_id} index={task.scene.index} status=completed_after_abort")
+            lines.append(f"    raw_output: {task.raw_output_path}")
+            lines.append(f"    request_id: {diagnostics.request_id or '-'}")
+            lines.append(f"    response_id: {diagnostics.response_id or '-'}")
+            lines.append(f"    started_at: {diagnostics.started_at or '-'}")
+            lines.append(f"    finished_at: {diagnostics.finished_at or '-'}")
+            lines.append(f"    duration_seconds: {_format_seconds(diagnostics.duration_seconds)}")
         else:
             lines.append(
                 f"  - scene_id={task.scene.scene_id} index={task.scene.index}"
                 f" status=failed_after_abort error={type(future_error).__name__}: {future_error}"
             )
+            lines.append(f"    request_id: {request_id_from_error(future_error) or '-'}")
     lines.append("")
     append_text(
         context.paths.stage_log(Stage10DescribeVisuals.name),

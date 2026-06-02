@@ -4,10 +4,11 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Iterator
 
-from style_kb.models import Job, StageStatus
+from style_kb.models import Job, JobState, StageState, StageStatus
 
 
 def utc_now() -> datetime:
@@ -28,6 +29,14 @@ def _json_dump(value: Any) -> str:
 
 def _json_load(value: str) -> Any:
     return json.loads(value)
+
+
+def _db_value(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return _to_iso(value)
+    if isinstance(value, StrEnum):
+        return value.value
+    return value
 
 
 class StateRepository:
@@ -73,7 +82,7 @@ class StateRepository:
                     job_id,
                     video_id,
                     url,
-                    "pending",
+                    JobState.PENDING.value,
                     None,
                     None,
                     None,
@@ -113,10 +122,8 @@ class StateRepository:
         assignments = []
         values = []
         for key, value in fields.items():
-            if isinstance(value, datetime):
-                value = _to_iso(value)
             assignments.append(f"{key} = ?")
-            values.append(value)
+            values.append(_db_value(value))
         assignments.append("updated_at = ?")
         values.append(_to_iso(utc_now()))
         values.append(job_id)
@@ -152,7 +159,7 @@ class StateRepository:
                         job_id,
                         stage_name,
                         ordinal,
-                        "pending",
+                        StageState.PENDING.value,
                         0,
                         None,
                         None,
@@ -202,7 +209,7 @@ class StateRepository:
                 WHERE job_id = ? AND stage_name = ?
                 """,
                 (
-                    "running",
+                    StageState.RUNNING.value,
                     current.attempt + 1,
                     _to_iso(utc_now()),
                     None,
@@ -226,7 +233,7 @@ class StateRepository:
         *,
         job_id: str,
         stage_name: str,
-        status: str,
+        status: StageState,
         output_files: list[str],
         remote_refs: dict[str, Any],
         metrics: dict[str, Any],
@@ -240,7 +247,7 @@ class StateRepository:
                 WHERE job_id = ? AND stage_name = ?
                 """,
                 (
-                    status,
+                    status.value,
                     _to_iso(utc_now()),
                     _json_dump(output_files),
                     _json_dump(remote_refs),
@@ -271,7 +278,7 @@ class StateRepository:
                 SET status = ?, finished_at = ?, error_code = ?, error_message = ?
                 WHERE job_id = ? AND stage_name = ?
                 """,
-                ("failed", _to_iso(utc_now()), error_code, error_message, job_id, stage_name),
+                (StageState.FAILED.value, _to_iso(utc_now()), error_code, error_message, job_id, stage_name),
             )
         stage = self.get_stage(job_id, stage_name)
         if stage is None:
@@ -321,4 +328,3 @@ class StateRepository:
                 "metrics": _json_load(row["metrics"]),
             }
         )
-

@@ -55,6 +55,7 @@ The stage can be skipped only when `chunk_plan.json` matches current config/prom
 - A QA split that cannot be merged without exceeding hard chunk limits is allowed only with a warning in `chunk_plan_warnings.json`, chunk plan notes, stage log, and console progress.
 - `title`, `channel`, and canonical video URL come from `metadata/video_info.json`, not from a best-effort timeline fallback.
 - Chunks preserve source refs and YouTube timestamp URLs.
+- `chunks/raw/*` files are diagnostic/cache artifacts. They are retained for reuse and post-mortem analysis, but must not be imported into a future KB or read as style knowledge by agents.
 
 ## Related Code
 

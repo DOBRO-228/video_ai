@@ -6,17 +6,30 @@ import os
 import re
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 from style_kb.clients._retry import OnRetry
+from style_kb.clients.provider_diagnostics import ProviderCallDiagnostics, ProviderName
 from style_kb.clients.openai_chunk_planner import (
     ChunkPlanAnalysisResult,
     OpenAIChunkPlannerClient,
     load_cached_chunk_plan_result,
 )
+from style_kb.diagnostics import PipelineEvent
 from style_kb.errors import ProviderError, StageExecutionError
-from style_kb.models import Chunk, ChunkPlan, ChunkPlanItem, SourceRef, SpeechSegment, TimelineEvent, VideoInfo
+from style_kb.models import (
+    Chunk,
+    ChunkPlan,
+    ChunkPlanItem,
+    PresenterRelevance,
+    SourceRef,
+    SpeakerRole,
+    SpeechSegment,
+    TimelineEvent,
+    VideoInfo,
+)
 from style_kb.pipeline.base import Stage, StageContext, StageResult
 from style_kb.stages.common import (
     load_chunks,
@@ -24,8 +37,15 @@ from style_kb.stages.common import (
     load_timeline_events,
     load_video_info,
     log_openai_retry,
+    emit_stage_validation_failed,
+    emit_provider_event,
+    provider_error_extra,
+    provider_event_data,
+    ProviderOperation,
+    request_id_from_error,
     youtube_source_ref,
 )
+from style_kb.stages.diagnostics import validation_preview
 from style_kb.utils.collections import stable_unique
 from style_kb.utils.files import append_text, read_json, write_json_atomic
 from style_kb.utils.ids import chunk_id
@@ -40,6 +60,10 @@ _RETRYABLE_PLANNER_ERROR_CODES = {
     "openai_chunk_planner_json_parse_failed",
     "openai_chunk_planner_output_missing",
 }
+
+
+class _PlannerWarningSeverity(StrEnum):
+    WARNING = "warning"
 
 
 @dataclass(slots=True)
@@ -67,6 +91,7 @@ class _WindowPlanResult:
     attempts: int
     errors: list[dict[str, Any]]
     cache_hit: bool
+    diagnostics: ProviderCallDiagnostics | None = None
 
 
 class _WindowPlanError(ProviderError):
@@ -251,8 +276,25 @@ def _build_chunk_plan(
     )
     final_errors, chunks = _validate_plan_and_materialize(plan, speech_segments, timeline_events, context, video_info)
     if final_errors:
-        validation_errors.append({"scope": "global", "errors": final_errors})
+        structured_errors = _global_plan_structured_errors(final_errors, plan, speech_segments, context)
+        raw_output_paths = [
+            result.diagnostics.raw_output_path
+            for result in window_results
+            if result.diagnostics is not None and result.diagnostics.raw_output_path is not None
+        ]
+        validation_errors.append({"scope": "global", "errors": final_errors, "structured_errors": structured_errors})
         _write_plan_errors(context, validation_errors)
+        emit_stage_validation_failed(
+            context,
+            stage_name=Stage12BuildChunks.name,
+            ordinal=Stage12BuildChunks.ordinal,
+            error_code="openai_chunk_planner_invalid_plan",
+            message="chunk plan global validation failed",
+            validation_errors=final_errors,
+            structured_errors=structured_errors,
+            extra={"scope": "global", "raw_output_paths": raw_output_paths},
+            raw_output_path=context.paths.chunk_plan,
+        )
         raise ProviderError(
             "OpenAI chunk planner returned an invalid global plan",
             error_code="openai_chunk_planner_invalid_plan",
@@ -323,6 +365,15 @@ def _plan_windows(
                             "window_index": window.window_index,
                             "attempt": None,
                             "errors": [str(error)],
+                            "structured_errors": [
+                                _chunk_validation_entry(
+                                    code=error.error_code,
+                                    message=str(error),
+                                    window=window,
+                                    field="response",
+                                    preview=str(error),
+                                )
+                            ],
                             "raw_output": None,
                         }
                     )
@@ -341,6 +392,15 @@ def _plan_windows(
                             "window_index": window.window_index,
                             "attempt": None,
                             "errors": [f"{type(error).__name__}: {error}"],
+                            "structured_errors": [
+                                _chunk_validation_entry(
+                                    code="openai_chunk_planner_unexpected_error",
+                                    message=f"{type(error).__name__}: {error}",
+                                    window=window,
+                                    field="response",
+                                    preview=str(error),
+                                )
+                            ],
                             "raw_output": None,
                         }
                     )
@@ -421,21 +481,105 @@ def _plan_window_with_retries(
     for attempt in range(1, context.config.chunking.max_retries + 1):
         constraints_payload = _constraints_payload(context, window, prompt_sha, feedback)
         items: list[ChunkPlanItem] = []
+        result: ChunkPlanAnalysisResult | None = None
+        raw_output_path = context.paths.chunk_plan_raw_attempt(window.window_index, attempt)
+        event_extra = {
+            "window_index": window.window_index,
+            "attempt": attempt,
+            "max_retries": context.config.chunking.max_retries,
+            "core_segments_count": len(window.core_segments),
+        }
+        emit_provider_event(
+            context,
+            PipelineEvent.PROVIDER_REQUEST_STARTED,
+            stage_name=Stage12BuildChunks.name,
+            ordinal=Stage12BuildChunks.ordinal,
+            operation=ProviderOperation.CHUNK_PLAN,
+            diagnostics=ProviderCallDiagnostics(
+                provider=ProviderName.OPENAI,
+                model=context.config.chunking.model,
+                raw_output_path=str(raw_output_path),
+            ),
+            attempt=attempt,
+            message="chunk plan request started",
+            extra=event_extra,
+        )
         try:
             result = client.plan_chunks(
                 system_prompt=system_prompt,
                 planner_payload=planner_payload,
                 constraints_payload=constraints_payload,
-                raw_output_path=context.paths.chunk_plan_raw_attempt(window.window_index, attempt),
+                raw_output_path=raw_output_path,
             )
-            items = _plan_items_from_payload(result.payload, context)
-            validation_errors = _window_plan_validation_errors(items, window, context)
         except ProviderError as error:
+            emit_provider_event(
+                context,
+                PipelineEvent.PROVIDER_REQUEST_FAILED,
+                stage_name=Stage12BuildChunks.name,
+                ordinal=Stage12BuildChunks.ordinal,
+                operation=ProviderOperation.CHUNK_PLAN,
+                diagnostics=ProviderCallDiagnostics(
+                    provider=ProviderName.OPENAI,
+                    model=context.config.chunking.model,
+                    raw_output_path=str(raw_output_path),
+                    request_id=request_id_from_error(error),
+                ),
+                attempt=attempt,
+                message="chunk plan request failed",
+                extra={**provider_error_extra(error), **event_extra},
+            )
             if error.error_code not in _RETRYABLE_PLANNER_ERROR_CODES:
                 raise
             validation_errors = [str(error)]
+            structured_validation_errors = [
+                _chunk_validation_entry(
+                    code=error.error_code,
+                    message=validation_errors[0],
+                    window=window,
+                    field="response",
+                    preview=validation_errors[0],
+                )
+            ]
+        else:
+            emit_provider_event(
+                context,
+                PipelineEvent.PROVIDER_REQUEST_COMPLETED,
+                stage_name=Stage12BuildChunks.name,
+                ordinal=Stage12BuildChunks.ordinal,
+                operation=ProviderOperation.CHUNK_PLAN,
+                diagnostics=result.diagnostics,
+                attempt=attempt,
+                message="chunk plan request completed",
+                extra=event_extra,
+            )
+            try:
+                items = _plan_items_from_payload(result.payload, context)
+                validation_errors = _window_plan_validation_errors(items, window, context)
+            except ProviderError as error:
+                if error.error_code not in _RETRYABLE_PLANNER_ERROR_CODES:
+                    raise
+                validation_errors = [str(error)]
+            structured_validation_errors = _window_plan_structured_errors(
+                validation_errors,
+                items=items,
+                window=window,
+                context=context,
+            )
         if not validation_errors:
-            _log_plan_attempt(context, window=window, attempt=attempt, items=items, validation_errors=[])
+            _log_plan_attempt(
+                context,
+                window=window,
+                attempt=attempt,
+                items=items,
+                validation_errors=[],
+                analysis=result,
+                structured_errors=[],
+            )
+            if result is None:
+                raise ProviderError(
+                    "OpenAI chunk planner produced no analysis result",
+                    error_code="openai_chunk_planner_output_missing",
+                )
             _write_window_cache(
                 context.paths.chunk_plan_window_cache(window.window_index),
                 request_metadata=request_metadata,
@@ -449,16 +593,40 @@ def _plan_window_with_retries(
                 attempts=attempt,
                 errors=errors,
                 cache_hit=False,
+                diagnostics=result.diagnostics,
             )
+        diagnostics = result.diagnostics if result is not None else None
         errors.append(
             {
                 "window_index": window.window_index,
                 "attempt": attempt,
                 "errors": validation_errors,
-                "raw_output": str(context.paths.chunk_plan_raw_attempt(window.window_index, attempt)),
+                "structured_errors": structured_validation_errors,
+                "raw_output": str(raw_output_path),
+                "diagnostics": diagnostics.to_dict() if diagnostics is not None else None,
             }
         )
-        _log_plan_attempt(context, window=window, attempt=attempt, items=items, validation_errors=validation_errors)
+        _log_plan_attempt(
+            context,
+            window=window,
+            attempt=attempt,
+            items=items,
+            validation_errors=validation_errors,
+            analysis=result,
+            structured_errors=structured_validation_errors,
+        )
+        emit_stage_validation_failed(
+            context,
+            stage_name=Stage12BuildChunks.name,
+            ordinal=Stage12BuildChunks.ordinal,
+            error_code="openai_chunk_planner_invalid_plan",
+            message=f"chunk plan validation failed for window {window.window_index}",
+            validation_errors=validation_errors,
+            structured_errors=structured_validation_errors,
+            raw_output_path=raw_output_path,
+            attempt=attempt,
+            extra={"window_index": window.window_index},
+        )
         feedback = validation_errors
 
     raise _WindowPlanError(
@@ -507,22 +675,43 @@ def _load_cached_window_result(
         )
         return None
     if validation_errors:
+        structured_errors = _window_plan_structured_errors(
+            validation_errors,
+            items=items,
+            window=window,
+            context=context,
+        )
         _log_window_cache(
             context,
             window=window,
             cache_path=cache_path,
             cache_hit=False,
             validation_errors=validation_errors,
+            structured_errors=structured_errors,
+            analysis=analysis,
+        )
+        emit_stage_validation_failed(
+            context,
+            stage_name=Stage12BuildChunks.name,
+            ordinal=Stage12BuildChunks.ordinal,
+            error_code="openai_chunk_planner_invalid_plan",
+            message=f"cached chunk plan validation failed for window {window.window_index}",
+            validation_errors=validation_errors,
+            structured_errors=structured_errors,
+            raw_output_path=cache_path,
+            attempt=0,
+            extra={"window_index": window.window_index, "cache_hit": True},
         )
         return None
 
-    _log_window_cache(context, window=window, cache_path=cache_path, cache_hit=True, validation_errors=[])
+    _log_window_cache(context, window=window, cache_path=cache_path, cache_hit=True, validation_errors=[], analysis=analysis)
     return _WindowPlanResult(
         window_index=window.window_index,
         items=items,
         attempts=0,
         errors=[],
         cache_hit=True,
+        diagnostics=analysis.diagnostics.with_updates(raw_output_path=str(cache_path), cached=True),
     )
 
 
@@ -543,6 +732,10 @@ def _write_window_cache(
                 "planner_input": planner_payload,
             },
             "response": analysis.raw_payload,
+            "diagnostics": provider_event_data(
+                operation=ProviderOperation.CHUNK_PLAN,
+                diagnostics=analysis.diagnostics.with_updates(raw_output_path=str(cache_path), cached=False),
+            ),
         },
     )
 
@@ -658,6 +851,142 @@ def _window_plan_validation_errors(
         errors.append(f"window coverage mismatch missing={missing} duplicated={stable_unique(duplicated)}")
     errors.extend(_question_answer_boundary_errors(items, window.core_segments, context))
     return errors
+
+
+def _window_plan_structured_errors(
+    errors: list[str],
+    *,
+    items: list[ChunkPlanItem],
+    window: _PlannerWindow,
+    context: StageContext,
+) -> list[dict[str, Any]]:
+    return [
+        _chunk_validation_entry(
+            code=_chunk_validation_code(error),
+            message=error,
+            window=window,
+            field=_chunk_validation_field(error),
+            preview=_chunk_validation_preview(error, items, window, context),
+        )
+        for error in errors
+    ]
+
+
+def _global_plan_structured_errors(
+    errors: list[str],
+    plan: ChunkPlan,
+    speech_segments: list[SpeechSegment],
+    context: StageContext,
+) -> list[dict[str, Any]]:
+    windows = _planner_windows(speech_segments, context)
+    fallback_window = windows[0] if windows else _PlannerWindow(window_index=0, core_segments=speech_segments, context_before=[], context_after=[])
+    structured_errors: list[dict[str, Any]] = []
+    for error in errors:
+        chunk_index = _chunk_index_from_error(error)
+        item = next((candidate for candidate in plan.chunks if candidate.chunk_index == chunk_index), None)
+        preview: Any
+        field = _chunk_validation_field(error)
+        if item is not None:
+            preview = getattr(item, field) if hasattr(item, field) else item.model_dump(mode="json")
+        elif "coverage mismatch" in error:
+            preview = {"expected_segment_ids": [segment.segment_id for segment in speech_segments], "message": error}
+        else:
+            preview = error
+        entry = _chunk_validation_entry(
+            code=_chunk_validation_code(error),
+            message=error,
+            window=fallback_window,
+            field=field,
+            preview=preview,
+        )
+        entry["scope"] = "global"
+        structured_errors.append(entry)
+    return structured_errors
+
+
+def _chunk_validation_entry(
+    *,
+    code: str,
+    message: str,
+    window: _PlannerWindow,
+    field: str,
+    preview: Any,
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "code": code,
+        "message": message,
+        "window_index": window.window_index,
+        "field": field,
+        "preview": validation_preview(preview),
+    }
+    chunk_index = _chunk_index_from_error(message)
+    if chunk_index is not None:
+        entry["chunk_index"] = chunk_index
+    return entry
+
+
+def _chunk_validation_code(error: str) -> str:
+    if "speech_segment_ids" in error:
+        return "openai_chunk_planner_segment_ids"
+    if "max_words" in error or "max_speech_segments" in error:
+        return "openai_chunk_planner_chunk_limits"
+    if "title" in error or "boundary_reason" in error or "topics" in error or "notes" in error:
+        return "openai_chunk_planner_metadata"
+    if "coverage mismatch" in error:
+        return "openai_chunk_planner_coverage"
+    if "offscreen question" in error:
+        return "openai_chunk_planner_question_answer_split"
+    return "openai_chunk_planner_invalid_plan"
+
+
+def _chunk_validation_field(error: str) -> str:
+    if "speech_segment_ids" in error or "segment ids" in error:
+        return "speech_segment_ids"
+    if "title" in error:
+        return "title"
+    if "boundary_reason" in error:
+        return "boundary_reason"
+    if "topics" in error:
+        return "topics"
+    if "notes" in error:
+        return "notes"
+    if "coverage mismatch" in error:
+        return "coverage"
+    return "chunk_plan"
+
+
+def _chunk_validation_preview(
+    error: str,
+    items: list[ChunkPlanItem],
+    window: _PlannerWindow,
+    context: StageContext,
+) -> Any:
+    chunk_index = _chunk_index_from_error(error)
+    if chunk_index is not None:
+        item = next((candidate for candidate in items if candidate.chunk_index == chunk_index), None)
+        if item is not None:
+            field = _chunk_validation_field(error)
+            if field == "speech_segment_ids":
+                return item.speech_segment_ids
+            if hasattr(item, field):
+                return getattr(item, field)
+            return item.model_dump(mode="json")
+    if "offscreen question" in error:
+        ids = re.findall(r"seg_[A-Za-z0-9_-]+|[A-Za-z0-9_-]+_seg_\d+", error)
+        segment_map = {segment.segment_id: segment for segment in window.core_segments}
+        return [
+            {"segment_id": segment_id, "text": segment_map[segment_id].text}
+            for segment_id in ids
+            if segment_id in segment_map
+        ] or error
+    if "coverage mismatch" in error:
+        return {"expected_segment_ids": [segment.segment_id for segment in window.core_segments], "message": error}
+    return error
+
+
+def _chunk_index_from_error(error: str) -> int | None:
+    match = re.search(r"chunk (\d+)", error)
+    return int(match.group(1)) if match else None
 
 
 def _plan_validation_errors(
@@ -1152,14 +1481,15 @@ def _presenter_brief(events: list[TimelineEvent]) -> str:
     briefs = [
         event.presenter_context.narrative_brief
         for event in events
-        if event.presenter_context.relevance in {"brief", "primary_example"} and event.presenter_context.narrative_brief
+        if event.presenter_context.relevance in {PresenterRelevance.BRIEF, PresenterRelevance.PRIMARY_EXAMPLE}
+        and event.presenter_context.narrative_brief
     ]
     return " ".join(stable_unique(briefs)).strip()
 
 
 def _dialogue_text_from_segments(segments: list[SpeechSegment]) -> str:
     lines = []
-    speakers_by_role: dict[str, set[str]] = {}
+    speakers_by_role: dict[SpeakerRole, set[str]] = {}
     for segment in segments:
         if segment.speaker_role and segment.speaker:
             speakers_by_role.setdefault(segment.speaker_role, set()).add(segment.speaker)
@@ -1190,12 +1520,12 @@ def _dialogue_text_from_segments(segments: list[SpeechSegment]) -> str:
     return "\n".join(line for line in lines if not line.endswith(": "))
 
 
-def _speaker_label(speaker_role: str | None, speaker: str | None, *, include_speaker: bool = False) -> str:
-    if speaker_role == "host":
+def _speaker_label(speaker_role: SpeakerRole | None, speaker: str | None, *, include_speaker: bool = False) -> str:
+    if speaker_role == SpeakerRole.HOST:
         if include_speaker and speaker:
             return f"Ведущий ({speaker})"
         return "Ведущий"
-    if speaker_role == "offscreen_questioner":
+    if speaker_role == SpeakerRole.OFFSCREEN_QUESTIONER:
         if include_speaker and speaker:
             return f"Закадровый вопрос ({speaker})"
         return "Закадровый вопрос"
@@ -1280,7 +1610,7 @@ def _question_answer_boundary_warnings(
         warnings.append(
             {
                 "code": "question_answer_split_due_to_chunk_limits",
-                "severity": "warning",
+                "severity": _PlannerWarningSeverity.WARNING.value,
                 "message": (
                     f"offscreen question {left_last.segment_id} is split from nearby host answer "
                     f"{right_first.segment_id} because merging adjacent chunks would exceed chunk limits"
@@ -1299,7 +1629,7 @@ def _question_answer_boundary_warnings(
 
 
 def _is_question_answer_pair(left: SpeechSegment, right: SpeechSegment, context: StageContext) -> bool:
-    if left.speaker_role != "offscreen_questioner" or right.speaker_role != "host":
+    if left.speaker_role != SpeakerRole.OFFSCREEN_QUESTIONER or right.speaker_role != SpeakerRole.HOST:
         return False
     gap_seconds = max(0.0, right.start - left.end)
     return gap_seconds <= context.config.chunking.question_answer_merge_seconds
@@ -1462,18 +1792,22 @@ def _log_window_planning_abort(
     lines = [
         "",
         "[chunk-plan-concurrent-abort]",
+        f"run_id: {context.run_id or '-'}",
         f"failed_window_index: {failed_window.window_index}",
         f"error: {type(error).__name__}: {error}",
         f"validation_errors_count: {len(validation_errors)}",
         f"completed_windows_count: {len(completed_window_indexes)}",
         "completed_window_indexes:",
-        *[f"  - {window_index}" for window_index in completed_window_indexes],
+        *[f"  - {window_index}" for window_index in completed_window_indexes[:20]],
+        *([f"  - ... {len(completed_window_indexes) - 20} more"] if len(completed_window_indexes) > 20 else []),
         f"cancelled_count: {len(cancelled_windows)}",
         "cancelled_windows:",
-        *[f"  - {window.window_index}" for window in cancelled_windows],
+        *[f"  - {window.window_index}" for window in cancelled_windows[:20]],
+        *([f"  - ... {len(cancelled_windows) - 20} more"] if len(cancelled_windows) > 20 else []),
         f"in_flight_count: {len(in_flight_windows)}",
         "in_flight_windows:",
-        *[f"  - {window.window_index}" for window in in_flight_windows],
+        *[f"  - {window.window_index}" for window in in_flight_windows[:20]],
+        *([f"  - ... {len(in_flight_windows) - 20} more"] if len(in_flight_windows) > 20 else []),
         "",
     ]
     append_text(context.paths.stage_log(Stage12BuildChunks.name), "\n".join(lines), encoding="utf-8")
@@ -1488,6 +1822,7 @@ def _log_stale_chunk_plan_raw_removal(
     lines = [
         "",
         "[chunk-plan-stale-raw-cleanup]",
+        f"run_id: {context.run_id or '-'}",
         f"windows_count: {windows_count}",
         f"removed_count: {len(removed_paths)}",
         "removed_files:",
@@ -1504,21 +1839,34 @@ def _log_window_in_flight_finalization(
     lines = [
         "",
         "[chunk-plan-in-flight-finalization]",
+        f"run_id: {context.run_id or '-'}",
         f"in_flight_count: {len(in_flight_map)}",
         "in_flight_windows:",
     ]
-    for future, window in sorted(in_flight_map.items(), key=lambda item: item[1].window_index):
+    for index, (future, window) in enumerate(sorted(in_flight_map.items(), key=lambda item: item[1].window_index)):
+        if index >= 20:
+            lines.append(f"  - ... {len(in_flight_map) - 20} more")
+            break
         if future.cancelled():
             lines.append(f"  - {window.window_index} status=cancelled_after_abort")
             continue
         future_error = future.exception()
         if future_error is None:
+            result = future.result()
+            diagnostics = result.diagnostics
             lines.append(f"  - {window.window_index} status=completed_after_abort")
+            lines.append(f"    request_id: {diagnostics.request_id if diagnostics is not None else '-'}")
+            lines.append(f"    response_id: {diagnostics.response_id if diagnostics is not None else '-'}")
+            lines.append(f"    started_at: {diagnostics.started_at if diagnostics is not None else '-'}")
+            lines.append(f"    finished_at: {diagnostics.finished_at if diagnostics is not None else '-'}")
+            lines.append(f"    duration_seconds: {_format_seconds(diagnostics.duration_seconds if diagnostics is not None else None)}")
+            lines.append(f"    raw_output: {diagnostics.raw_output_path if diagnostics is not None else '-'}")
         else:
             lines.append(
                 f"  - {window.window_index} status=failed_after_abort "
                 f"error={type(future_error).__name__}: {future_error}"
             )
+            lines.append(f"    request_id: {request_id_from_error(future_error) or '-'}")
     lines.append("")
     append_text(context.paths.stage_log(Stage12BuildChunks.name), "\n".join(lines), encoding="utf-8")
 
@@ -1544,6 +1892,7 @@ def _log_plan_warnings(context: StageContext, warnings: list[dict[str, Any]]) ->
     lines = [
         "",
         "[chunk-plan-warnings]",
+        f"run_id: {context.run_id or '-'}",
         f"warnings_count: {len(warnings)}",
         "warnings:",
         *[
@@ -1572,16 +1921,37 @@ def _log_plan_attempt(
     attempt: int,
     items: list[ChunkPlanItem],
     validation_errors: list[str],
+    analysis: ChunkPlanAnalysisResult | None = None,
+    structured_errors: list[dict[str, Any]] | None = None,
 ) -> None:
+    structured_errors = structured_errors or []
+    diagnostics = analysis.diagnostics if analysis is not None else None
     lines = [
         "",
         "[chunk-plan-attempt]",
+        f"run_id: {context.run_id or '-'}",
         f"window_index: {window.window_index}",
         f"attempt: {attempt}",
         f"planned_chunks_count: {len(items)}",
+        f"model: {diagnostics.model if diagnostics is not None and diagnostics.model else '-'}",
+        f"request_id: {diagnostics.request_id if diagnostics is not None and diagnostics.request_id else '-'}",
+        f"response_id: {diagnostics.response_id if diagnostics is not None and diagnostics.response_id else '-'}",
+        f"started_at: {diagnostics.started_at if diagnostics is not None and diagnostics.started_at else '-'}",
+        f"finished_at: {diagnostics.finished_at if diagnostics is not None and diagnostics.finished_at else '-'}",
+        f"duration_seconds: {_format_seconds(diagnostics.duration_seconds if diagnostics is not None else None)}",
         f"validation_errors_count: {len(validation_errors)}",
+        f"structured_errors_count: {len(structured_errors)}",
         "validation_errors:",
-        *[f"  - {error}" for error in validation_errors],
+        *[f"  - {error}" for error in validation_errors[:20]],
+        *([f"  - ... {len(validation_errors) - 20} more"] if len(validation_errors) > 20 else []),
+        "structured_error_previews:",
+        *[
+            "  - "
+            f"{entry.get('code', '-')}"
+            f" field={entry.get('field', '-')}"
+            f" preview={entry.get('preview', '-')}"
+            for entry in structured_errors[:5]
+        ],
         "",
     ]
     append_text(context.paths.stage_log(Stage12BuildChunks.name), "\n".join(lines), encoding="utf-8")
@@ -1594,16 +1964,37 @@ def _log_window_cache(
     cache_path: Path,
     cache_hit: bool,
     validation_errors: list[str],
+    analysis: ChunkPlanAnalysisResult | None = None,
+    structured_errors: list[dict[str, Any]] | None = None,
 ) -> None:
+    structured_errors = structured_errors or []
+    diagnostics = analysis.diagnostics if analysis is not None else None
     lines = [
         "",
         "[chunk-plan-cache]",
+        f"run_id: {context.run_id or '-'}",
         f"window_index: {window.window_index}",
         f"cache_hit: {cache_hit}",
         f"cache_path: {cache_path}",
+        f"model: {diagnostics.model if diagnostics is not None and diagnostics.model else '-'}",
+        f"request_id: {diagnostics.request_id if diagnostics is not None and diagnostics.request_id else '-'}",
+        f"response_id: {diagnostics.response_id if diagnostics is not None and diagnostics.response_id else '-'}",
+        f"started_at: {diagnostics.started_at if diagnostics is not None and diagnostics.started_at else '-'}",
+        f"finished_at: {diagnostics.finished_at if diagnostics is not None and diagnostics.finished_at else '-'}",
+        f"duration_seconds: {_format_seconds(diagnostics.duration_seconds if diagnostics is not None else None)}",
         f"validation_errors_count: {len(validation_errors)}",
+        f"structured_errors_count: {len(structured_errors)}",
         "validation_errors:",
-        *[f"  - {error}" for error in validation_errors],
+        *[f"  - {error}" for error in validation_errors[:20]],
+        *([f"  - ... {len(validation_errors) - 20} more"] if len(validation_errors) > 20 else []),
+        "structured_error_previews:",
+        *[
+            "  - "
+            f"{entry.get('code', '-')}"
+            f" field={entry.get('field', '-')}"
+            f" preview={entry.get('preview', '-')}"
+            for entry in structured_errors[:5]
+        ],
         "",
     ]
     append_text(context.paths.stage_log(Stage12BuildChunks.name), "\n".join(lines), encoding="utf-8")
@@ -1616,10 +2007,16 @@ def _chunk_retry_logger(context: StageContext) -> OnRetry:
             attempt=attempt,
             delay_seconds=delay_seconds,
             error=error,
-            context_lines=["operation: chunk_plan"],
+            context_lines=[f"run_id: {context.run_id or '-'}", "operation: chunk_plan"],
         )
 
     return _log_retry
+
+
+def _format_seconds(value: float | None) -> str:
+    if value is None:
+        return "-"
+    return f"{value:.2f}"
 
 
 def _prompt_path(context: StageContext) -> Path:

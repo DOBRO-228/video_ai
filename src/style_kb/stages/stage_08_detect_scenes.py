@@ -7,6 +7,7 @@ from style_kb.clients.media import duration_seconds, ffprobe_json, fps
 from style_kb.models import Scene
 from style_kb.pipeline.base import Stage, StageContext, StageResult
 from style_kb.stages.common import load_scenes, youtube_source_ref
+from style_kb.stages.diagnostics import append_stage_summary
 from style_kb.utils.files import read_json
 from style_kb.utils.ids import scene_id
 from style_kb.utils.pydantic_io import write_models_jsonl
@@ -41,6 +42,7 @@ class Stage08DetectScenes(Stage):
         detected = scene_manager.get_scene_list()
 
         scenes: list[Scene] = []
+        fallback_used = not detected
         if not detected:
             scenes.append(
                 _scene_from_range(
@@ -76,7 +78,27 @@ class Stage08DetectScenes(Stage):
                 )
 
         write_models_jsonl(context.paths.scenes_jsonl, scenes)
-        return StageResult(output_files=self.output_files(context), metrics={"scenes_count": len(scenes)})
+        min_scene_len_frames = max(1, int(round(context.config.scene_detection.min_scene_len_seconds * frame_rate)))
+        append_stage_summary(
+            context,
+            self.name,
+            "scene-detection-summary",
+            {
+                "detector": "AdaptiveDetector",
+                "min_scene_len_seconds": context.config.scene_detection.min_scene_len_seconds,
+                "min_scene_len_frames": min_scene_len_frames,
+                "video_fps": frame_rate,
+                "video_duration": video_duration,
+                "detected_scene_count": len(detected),
+                "scenes_count": len(scenes),
+                "fallback_used": fallback_used,
+                "scenes_path": str(context.paths.scenes_jsonl),
+            },
+        )
+        return StageResult(
+            output_files=self.output_files(context),
+            metrics={"scenes_count": len(scenes), "fallback_used": fallback_used, "fps": frame_rate},
+        )
 
 
 def _scene_from_range(context: StageContext, *, index: int, start: float, end: float, frame_rate: float) -> Scene:

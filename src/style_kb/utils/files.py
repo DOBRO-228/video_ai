@@ -35,6 +35,7 @@ def append_text(path: Path, payload: str, *, encoding: str = "utf-8") -> None:
     with lock:
         with path.open("a", encoding=encoding) as handle:
             handle.write(payload)
+            handle.flush()
 
 
 def _append_lock(path: Path) -> threading.Lock:

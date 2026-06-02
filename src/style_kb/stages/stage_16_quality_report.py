@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from style_kb.clients.media import duration_seconds
 from style_kb.errors import StageExecutionError
-from style_kb.models import PresenterProfile, QualityReport, SpeakerDiarization, VisualEvent
+from style_kb.models import (
+    ConfidenceLevel,
+    PresenterProfile,
+    PresenterRelevance,
+    QualityReport,
+    SpeakerDiarization,
+    VisualEvent,
+)
 from style_kb.pipeline.base import Stage, StageContext, StageResult
 from style_kb.stages.common import (
     load_chunks,
@@ -136,8 +143,10 @@ def _presenter_warnings(context: StageContext, visual_events: list[VisualEvent],
         return warnings
 
     recurring_events = [event for event in visual_events if event.presenter_context.is_recurring]
-    background_events = [event for event in recurring_events if event.presenter_context.relevance == "background"]
-    if profile.confidence == "high" and not recurring_events:
+    background_events = [
+        event for event in recurring_events if event.presenter_context.relevance == PresenterRelevance.BACKGROUND
+    ]
+    if profile.confidence == ConfidenceLevel.HIGH and not recurring_events:
         warnings.append("presenter profile detected a recurring presenter, but no visual events are marked recurring")
 
     baseline_values = {event.presenter_context.baseline_summary.strip() for event in recurring_events if event.presenter_context.baseline_summary.strip()}
@@ -149,7 +158,7 @@ def _presenter_warnings(context: StageContext, visual_events: list[VisualEvent],
         warnings.append("background presenter baseline appears in scene-specific visual fields too often")
 
     chunks_with_brief = [chunk for chunk in chunks if chunk.presenter_brief.strip()]
-    if profile.confidence == "high" and not chunks_with_brief:
+    if profile.confidence == ConfidenceLevel.HIGH and not chunks_with_brief:
         warnings.append("presenter_brief is empty for all chunks despite high-confidence recurring presenter")
     return warnings
 
@@ -164,7 +173,6 @@ def _event_mentions_presenter_baseline(event: VisualEvent, profile: PresenterPro
             event.visual_summary,
             " ".join(event.observations),
             " ".join(event.items),
-            " ".join(event.colors),
             " ".join(event.style_topics),
         ]
     ).lower()

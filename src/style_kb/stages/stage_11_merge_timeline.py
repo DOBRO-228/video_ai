@@ -16,6 +16,7 @@ from style_kb.stages.common import (
     read_payload,
     youtube_source_ref,
 )
+from style_kb.stages.diagnostics import append_stage_summary
 from style_kb.utils.collections import stable_unique
 from style_kb.utils.files import write_json_atomic
 from style_kb.utils.ids import timeline_event_id
@@ -46,16 +47,18 @@ class Stage11MergeTimeline(Stage):
     def validate_outputs(self, context: StageContext) -> bool:
         if not context.paths.timeline_events_jsonl.exists() or not context.paths.timeline_media_durations.exists():
             return False
-        actual_media_durations = read_payload(context.paths.timeline_media_durations)
-        _validate_media_durations(actual_media_durations, context.job.video_id)
-        expected_media_durations = _expected_media_durations(context, actual_media_durations)
-        if actual_media_durations != expected_media_durations:
+        try:
+            actual_media_durations = read_payload(context.paths.timeline_media_durations)
+            _validate_media_durations(actual_media_durations, context.job.video_id)
+            expected_media_durations = _expected_media_durations(context, actual_media_durations)
+            if actual_media_durations != expected_media_durations:
+                return False
+            actual_events = load_timeline_events(context.paths.timeline_events_jsonl)
+            expected_events = _build_timeline_events(context, media_durations=expected_media_durations)
+        except Exception:
             return False
-
-        actual_events = load_timeline_events(context.paths.timeline_events_jsonl)
         if not actual_events:
             return False
-        expected_events = _build_timeline_events(context, media_durations=expected_media_durations)
         if len(actual_events) != len(expected_events):
             return False
         return all(
@@ -65,14 +68,53 @@ class Stage11MergeTimeline(Stage):
 
     def run(self, context: StageContext) -> StageResult:
         media_durations = _build_media_durations(context)
+        scenes = load_scenes(context.paths.scenes_jsonl)
+        visual_events = load_visual_events(context.paths.visual_events_jsonl)
+        speech_segments = load_speech_segments(context.paths.stt_speech_segments)
+        speech_tokens = load_speech_tokens(context.paths.stt_speech_tokens)
+        append_stage_summary(
+            context,
+            self.name,
+            "timeline-merge-preflight",
+            {
+                "media_durations": media_durations,
+                "duration_mismatch_limit_seconds": _DURATION_MISMATCH_LIMIT_SECONDS,
+                "scenes_count": len(scenes),
+                "visual_events_count": len(visual_events),
+                "speech_segments_count": len(speech_segments),
+                "speech_tokens_count": len(speech_tokens),
+                "timeline_events_path": str(context.paths.timeline_events_jsonl),
+                "media_durations_path": str(context.paths.timeline_media_durations),
+            },
+        )
         timeline_events = _build_timeline_events(context, media_durations=media_durations)
         write_json_atomic(context.paths.timeline_media_durations, media_durations)
         write_models_jsonl(context.paths.timeline_events_jsonl, timeline_events)
+        append_stage_summary(
+            context,
+            self.name,
+            "timeline-merge-summary",
+            {
+                "media_durations": media_durations,
+                "duration_mismatch_limit_seconds": _DURATION_MISMATCH_LIMIT_SECONDS,
+                "scenes_count": len(scenes),
+                "visual_events_count": len(visual_events),
+                "speech_segments_count": len(speech_segments),
+                "speech_tokens_count": len(speech_tokens),
+                "timeline_events_count": len(timeline_events),
+                "timeline_events_path": str(context.paths.timeline_events_jsonl),
+                "media_durations_path": str(context.paths.timeline_media_durations),
+            },
+        )
         return StageResult(
             output_files=self.output_files(context),
             metrics={
                 "timeline_events_count": len(timeline_events),
                 "audio_video_duration_abs": media_durations["audio_video_duration_abs"],
+                "scenes_count": len(scenes),
+                "visual_events_count": len(visual_events),
+                "speech_segments_count": len(speech_segments),
+                "speech_tokens_count": len(speech_tokens),
             },
         )
 
@@ -100,6 +142,7 @@ def _build_timeline_events(context: StageContext, *, media_durations: dict) -> l
             raise StageExecutionError(
                 f"missing visual event for scene {scene.scene_id}",
                 error_code="missing_visual_event",
+                details=_missing_visual_event_details(scene.scene_id, scenes, visual_events),
             )
         timeline_events.append(
             _build_scene_timeline_event(
@@ -130,6 +173,16 @@ def _build_media_durations(context: StageContext) -> dict:
         "metadata_duration": video_info.duration,
         "audio_video_duration_abs": audio_video_duration_abs,
     }
+
+
+def _missing_visual_event_details(scene_id: str, scenes: list[Scene], visual_events: dict[str, VisualEvent]) -> str:
+    available_scene_ids = [scene.scene_id for scene in scenes]
+    available_visual_scene_ids = sorted(visual_events)
+    return (
+        f"missing_scene_id: {scene_id}\n"
+        f"available_scene_ids: {available_scene_ids[:20]}\n"
+        f"available_visual_scene_ids: {available_visual_scene_ids[:20]}"
+    )
 
 
 def _expected_media_durations(context: StageContext, existing_media_durations: dict) -> dict:
@@ -210,7 +263,6 @@ def _build_scene_timeline_event(
         visual_summary=visual_event.visual_summary,
         on_screen_text=stable_unique(visual_event.on_screen_text),
         items=stable_unique(visual_event.items),
-        colors=stable_unique(visual_event.colors),
         topics=stable_unique(visual_event.style_topics),
         scene_id=scene.scene_id,
         speech_segment_ids=scene_segment_ids,

@@ -11,6 +11,7 @@ from style_kb.errors import ProviderError
 from style_kb.models import ProviderSource, SpeechSegment, SpeechToken
 from style_kb.pipeline.base import Stage, StageContext, StageResult
 from style_kb.stages.common import load_speech_segments, load_speech_tokens, read_payload, youtube_source_ref
+from style_kb.stages.diagnostics import append_stage_summary
 from style_kb.utils.files import append_text
 from style_kb.utils.ids import speech_segment_id
 from style_kb.utils.pydantic_io import write_models_jsonl
@@ -155,12 +156,36 @@ class Stage07BuildSpeechSegments(Stage):
             units=units,
         )
         write_models_jsonl(context.paths.stt_speech_segments, segments)
+        durations = [round(segment.end - segment.start, 3) for segment in segments]
+        words = [_word_count_from_tokens(tokens[_token_position(tokens, segment.token_start_index) : _token_position(tokens, segment.token_end_index) + 1]) for segment in segments]
+        raw_payload = read_payload(context.paths.stt_speech_segments_raw)
+        openai_response_id = raw_payload.get("id")
+        append_stage_summary(
+            context,
+            self.name,
+            "speech-segmentation-summary",
+            {
+                "raw_output_path": str(context.paths.stt_speech_segments_raw),
+                "openai_response_id": openai_response_id,
+                "provider": context.config.speech_segmentation.provider,
+                "model": context.config.speech_segmentation.model,
+                "accepted_attempt": attempts_used,
+                "segments_count": len(segments),
+                "semantic_units_count": len(units),
+                "duration_seconds": _distribution(durations),
+                "word_count": _distribution(words),
+                "semantic_boundary_violations": _semantic_boundary_violations(segments)[:5],
+            },
+        )
         return StageResult(
             output_files=self.output_files(context),
+            remote_refs={"openai_response_id": openai_response_id} if openai_response_id else {},
             metrics={
                 "segments_count": len(segments),
                 "semantic_units_count": len(units),
                 "segmentation_attempts": attempts_used,
+                "max_segment_duration": max(durations) if durations else 0,
+                "max_segment_words": max(words) if words else 0,
             },
         )
 
@@ -564,6 +589,23 @@ def _unit_payload(unit: _TranscriptUnit) -> dict[str, object]:
         "speaker": unit.speaker,
         "speaker_role": unit.speaker_role,
         "text": unit.text,
+    }
+
+
+def _token_position(tokens: list[SpeechToken], token_index: int) -> int:
+    for position, token in enumerate(tokens):
+        if token.token_index == token_index:
+            return position
+    return 0
+
+
+def _distribution(values: list[float | int]) -> dict[str, float | int]:
+    if not values:
+        return {"min": 0, "max": 0, "avg": 0}
+    return {
+        "min": min(values),
+        "max": max(values),
+        "avg": round(sum(values) / len(values), 3),
     }
 
 

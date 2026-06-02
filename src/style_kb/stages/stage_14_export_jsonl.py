@@ -24,23 +24,10 @@ class Stage14ExportJsonl(Stage):
         ]
 
     def output_files(self, context: StageContext) -> list:
-        return sorted(context.paths.export_jsonl_dir.glob("*.jsonl"))
+        return _expected_outputs(context)
 
     def validate_outputs(self, context: StageContext) -> bool:
-        expected = [
-            context.paths.export_jsonl("video_info.jsonl"),
-            context.paths.export_jsonl("speaker_diarization.jsonl"),
-            context.paths.export_jsonl("speech_tokens.jsonl"),
-            context.paths.export_jsonl("speech_segments.jsonl"),
-            context.paths.export_jsonl("scenes.jsonl"),
-            context.paths.export_jsonl("frame_refs.jsonl"),
-            context.paths.export_jsonl("visual_events.jsonl"),
-            context.paths.export_jsonl("timeline_events.jsonl"),
-            context.paths.export_jsonl("chunks.jsonl"),
-            context.paths.export_jsonl("chunk_plan.jsonl"),
-            context.paths.export_jsonl("style_claims.jsonl"),
-        ]
-        return all(path.exists() for path in expected)
+        return all(path.exists() for path in _expected_outputs(context))
 
     def run(self, context: StageContext) -> StageResult:
         outputs = export_jsonl_bundle(
@@ -58,3 +45,20 @@ class Stage14ExportJsonl(Stage):
             export_dir=context.paths.export_jsonl_dir,
         )
         return StageResult(output_files=outputs, metrics={"exported_files": len(outputs)})
+
+
+def _expected_outputs(context: StageContext) -> list:
+    return [
+        context.paths.export_jsonl("video_info.jsonl"),
+        context.paths.export_jsonl("speaker_diarization.jsonl"),
+        context.paths.export_jsonl("speech_tokens.jsonl"),
+        context.paths.export_jsonl("speech_segments.jsonl"),
+        context.paths.export_jsonl("scenes.jsonl"),
+        context.paths.export_jsonl("frame_refs.jsonl"),
+        context.paths.export_jsonl("visual_events.jsonl"),
+        context.paths.export_jsonl("timeline_events.jsonl"),
+        context.paths.export_jsonl("chunks.jsonl"),
+        context.paths.export_jsonl("chunk_plan.jsonl"),
+        context.paths.export_jsonl("style_claims.jsonl"),
+        context.paths.export_jsonl("manifest.json"),
+    ]

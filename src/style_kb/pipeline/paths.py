@@ -82,6 +82,18 @@ class JobPaths:
         return self.job_dir / "logs"
 
     @property
+    def pipeline_events_jsonl(self) -> Path:
+        return self.logs_dir / "pipeline.jsonl"
+
+    @property
+    def pipeline_log(self) -> Path:
+        return self.pipeline_events_jsonl
+
+    @property
+    def pipeline_human_log(self) -> Path:
+        return self.logs_dir / "pipeline.log"
+
+    @property
     def metadata_raw_ytdlp(self) -> Path:
         return self.metadata_dir / "raw_ytdlp.json"
 
@@ -142,6 +154,14 @@ class JobPaths:
         return self.frames_dir / "frame_refs.jsonl"
 
     @property
+    def frame_extraction_report(self) -> Path:
+        return self.frames_dir / "frame_extraction_report.json"
+
+    @property
+    def frame_extraction_events_jsonl(self) -> Path:
+        return self.logs_dir / "09_extract_keyframes.jsonl"
+
+    @property
     def visual_events_jsonl(self) -> Path:
         return self.visual_dir / "visual_events.jsonl"
 
@@ -192,6 +212,14 @@ class JobPaths:
     @property
     def quality_report(self) -> Path:
         return self.reports_dir / "quality_report.json"
+
+    @property
+    def failure_report(self) -> Path:
+        return self.reports_dir / "failure_report.json"
+
+    @property
+    def partial_quality_report(self) -> Path:
+        return self.reports_dir / "partial_quality_report.json"
 
     @property
     def cleanup_report(self) -> Path:
@@ -252,14 +280,17 @@ class JobPaths:
             path.mkdir(parents=True, exist_ok=True)
 
     def artifact_summary(self) -> dict[str, str]:
-        return {
+        artifacts = {
             "job_dir": str(self.job_dir),
             "timeline_events": str(self.timeline_events_jsonl),
             "timeline_media_durations": str(self.timeline_media_durations),
             "chunks": str(self.chunks_jsonl),
             "chunk_plan": str(self.chunk_plan),
-            "chunk_plan_warnings": str(self.chunk_plan_warnings),
             "style_claims": str(self.style_claims_jsonl),
+            "jsonl_manifest": str(self.export_jsonl("manifest.json")),
             "quality_report": str(self.quality_report),
             "obsidian_index": str(self.obsidian_index),
         }
+        if self.chunk_plan_warnings.exists():
+            artifacts["chunk_plan_warnings"] = str(self.chunk_plan_warnings)
+        return artifacts

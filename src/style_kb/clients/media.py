@@ -3,11 +3,21 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from style_kb.diagnostics import PipelineLogger
 from style_kb.errors import MediaToolError
 from style_kb.utils.process import run_subprocess
 
 
-def ffprobe_json(media_path: Path, *, log_path: Path) -> dict:
+def ffprobe_json(
+    media_path: Path,
+    *,
+    log_path: Path,
+    pipeline_logger: PipelineLogger | None = None,
+    job_id: str | None = None,
+    video_id: str | None = None,
+    stage: str | None = None,
+    ordinal: int | None = None,
+) -> dict:
     args = [
         "ffprobe",
         "-v",
@@ -18,7 +28,16 @@ def ffprobe_json(media_path: Path, *, log_path: Path) -> dict:
         "-show_streams",
         str(media_path),
     ]
-    completed = run_subprocess(args, error_code="ffprobe_failed", log_path=log_path)
+    completed = run_subprocess(
+        args,
+        error_code="ffprobe_failed",
+        log_path=log_path,
+        pipeline_logger=pipeline_logger,
+        job_id=job_id,
+        video_id=video_id,
+        stage=stage,
+        ordinal=ordinal,
+    )
     return json.loads(completed.stdout)
 
 
@@ -40,7 +59,19 @@ def fps(ffprobe_payload: dict) -> float:
     return float(numerator) / float(denominator)
 
 
-def extract_frame(video_path: Path, *, timestamp: float, destination: Path, log_path: Path) -> None:
+def extract_frame(
+    video_path: Path,
+    *,
+    timestamp: float,
+    destination: Path,
+    log_path: Path,
+    pipeline_logger: PipelineLogger | None = None,
+    job_id: str | None = None,
+    video_id: str | None = None,
+    stage: str | None = None,
+    ordinal: int | None = None,
+    text_log_streams: bool = True,
+) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     temp_path = destination.parent / f"{destination.stem}.tmp{destination.suffix}"
     args = [
@@ -58,7 +89,17 @@ def extract_frame(video_path: Path, *, timestamp: float, destination: Path, log_
         "-y",
         str(temp_path),
     ]
-    run_subprocess(args, error_code="ffmpeg_extract_frame_failed", log_path=log_path)
+    run_subprocess(
+        args,
+        error_code="ffmpeg_extract_frame_failed",
+        log_path=log_path,
+        pipeline_logger=pipeline_logger,
+        job_id=job_id,
+        video_id=video_id,
+        stage=stage,
+        ordinal=ordinal,
+        text_log_streams=text_log_streams,
+    )
     if not temp_path.exists() or temp_path.stat().st_size == 0:
         raise MediaToolError("ffmpeg did not create frame image", error_code="frame_missing")
     temp_path.replace(destination)

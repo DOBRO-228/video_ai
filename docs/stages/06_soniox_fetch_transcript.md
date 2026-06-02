@@ -37,6 +37,7 @@ The stage can be skipped when raw transcript, speaker diarization, and token JSO
 - Token timestamps are the source of truth for later speech clipping in `11_merge_timeline`.
 - `speaker` is the raw Soniox speaker id; `speaker_role` is the repository-level semantic role.
 - Keep console progress compact during polling; detailed provider payloads belong in logs/artifacts.
+- `stt/transcript_raw.json` is retained for audit/debugging provider normalization. It is not KB input.
 
 ## Related Code
 

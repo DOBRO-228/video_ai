@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from style_kb.utils.files import copy_file_atomic, read_json, write_jsonl_atomic
+from style_kb.utils.files import copy_file_atomic, read_json, write_json_atomic, write_jsonl_atomic
 
 
 def export_jsonl_bundle(
@@ -33,6 +33,7 @@ def export_jsonl_bundle(
         export_dir / "chunks.jsonl",
         export_dir / "chunk_plan.jsonl",
         export_dir / "style_claims.jsonl",
+        export_dir / "manifest.json",
     ]
     write_jsonl_atomic(outputs[0], [read_json(video_info_path)])
     write_jsonl_atomic(outputs[1], [read_json(speaker_diarization_path)])
@@ -45,4 +46,35 @@ def export_jsonl_bundle(
     copy_file_atomic(chunks_path, outputs[8])
     write_jsonl_atomic(outputs[9], [read_json(chunk_plan_path)])
     copy_file_atomic(style_claims_path, outputs[10])
+    write_json_atomic(outputs[11], _export_manifest())
     return outputs
+
+
+def _export_manifest() -> dict:
+    return {
+        "schema_version": 1,
+        "source_of_truth": "jsonl",
+        "kb_import_allowlist": ["chunks.jsonl", "style_claims.jsonl"],
+        "files": [
+            _manifest_entry("video_info.jsonl", role="audit"),
+            _manifest_entry("speaker_diarization.jsonl", role="audit"),
+            _manifest_entry("speech_tokens.jsonl", role="audit"),
+            _manifest_entry("speech_segments.jsonl", role="audit"),
+            _manifest_entry("scenes.jsonl", role="audit"),
+            _manifest_entry("frame_refs.jsonl", role="audit"),
+            _manifest_entry("visual_events.jsonl", role="audit"),
+            _manifest_entry("timeline_events.jsonl", role="audit"),
+            _manifest_entry("chunks.jsonl", role="knowledge", kb_import=True),
+            _manifest_entry("chunk_plan.jsonl", role="audit"),
+            _manifest_entry("style_claims.jsonl", role="knowledge", kb_import=True),
+        ],
+    }
+
+
+def _manifest_entry(filename: str, *, role: str, kb_import: bool = False) -> dict:
+    return {
+        "filename": filename,
+        "role": role,
+        "kb_import": kb_import,
+        "rag": kb_import,
+    }

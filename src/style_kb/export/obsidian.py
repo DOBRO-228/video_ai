@@ -4,7 +4,7 @@ from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader
 
-from style_kb.models import Chunk, StyleClaim, TimelineEvent, VideoInfo
+from style_kb.models import Chunk, SpeakerRole, SpeechTurn, StyleClaim, TimelineEvent, VideoInfo
 from style_kb.utils.files import write_text_atomic
 
 
@@ -37,6 +37,7 @@ def render_obsidian_export(
         timeline_events=timeline_events,
         style_claims=style_claims,
         event_frame_links=event_frame_links,
+        speech_turn_label=_speech_turn_label,
     )
     write_text_atomic(video_note_path, video_rendered.rstrip() + "\n")
 
@@ -47,3 +48,11 @@ def render_obsidian_export(
         write_text_atomic(path, rendered.rstrip() + "\n")
         outputs.append(path)
     return outputs
+
+
+def _speech_turn_label(turn: SpeechTurn) -> str:
+    if turn.speaker_role == SpeakerRole.HOST:
+        return f"Ведущий ({turn.speaker})" if turn.speaker else "Ведущий"
+    if turn.speaker_role == SpeakerRole.OFFSCREEN_QUESTIONER:
+        return f"Закадровый вопрос ({turn.speaker})" if turn.speaker else "Закадровый вопрос"
+    return turn.speaker or "Голос"

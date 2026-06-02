@@ -9,7 +9,14 @@ from typing import Any
 from openai import OpenAI
 
 from style_kb.clients._retry import OnRetry, RetryPolicy, call_with_retry
+from style_kb.clients.provider_diagnostics import (
+    ProviderCallDiagnostics,
+    cached_openai_diagnostics,
+    openai_response_diagnostics,
+    start_operation,
+)
 from style_kb.errors import MissingApiKeyError, ProviderError
+from style_kb.models import ConfidenceLevel, PresenterRelevance, PresenterRole
 from style_kb.utils.files import read_json, write_json_atomic
 
 PRESENTER_CONTEXT_SCHEMA: dict[str, Any] = {
@@ -17,13 +24,13 @@ PRESENTER_CONTEXT_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
     "properties": {
         "present": {"type": "boolean"},
-        "role": {"type": "string", "enum": ["none", "primary_presenter", "other_person"]},
+        "role": {"type": "string", "enum": PresenterRole.values()},
         "is_recurring": {"type": "boolean"},
-        "relevance": {"type": "string", "enum": ["none", "background", "brief", "primary_example"]},
+        "relevance": {"type": "string", "enum": PresenterRelevance.values()},
         "baseline_summary": {"type": "string"},
         "scene_deltas": {"type": "array", "items": {"type": "string"}},
         "narrative_brief": {"type": "string"},
-        "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+        "confidence": {"type": "string", "enum": ConfidenceLevel.values()},
     },
     "required": [
         "present",
@@ -46,9 +53,8 @@ VISUAL_RESPONSE_SCHEMA: dict[str, Any] = {
         "interpretations": {"type": "array", "items": {"type": "string"}},
         "on_screen_text": {"type": "array", "items": {"type": "string"}},
         "items": {"type": "array", "items": {"type": "string"}},
-        "colors": {"type": "array", "items": {"type": "string"}},
         "style_topics": {"type": "array", "items": {"type": "string"}},
-        "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+        "confidence": {"type": "string", "enum": ConfidenceLevel.values()},
         "notes": {"type": "string"},
         "presenter_context": PRESENTER_CONTEXT_SCHEMA,
     },
@@ -58,7 +64,6 @@ VISUAL_RESPONSE_SCHEMA: dict[str, Any] = {
         "interpretations",
         "on_screen_text",
         "items",
-        "colors",
         "style_topics",
         "confidence",
         "notes",
@@ -71,7 +76,7 @@ PRESENTER_PROFILE_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
     "properties": {
         "has_primary_presenter": {"type": "boolean"},
-        "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+        "confidence": {"type": "string", "enum": ConfidenceLevel.values()},
         "baseline_summary": {"type": "string"},
         "recurring_visual_markers": {"type": "array", "items": {"type": "string"}},
         "notes": {"type": "string"},
@@ -93,6 +98,7 @@ class VisionAnalysisResult:
     usage: dict[str, int]
     model: str | None
     remote_duration_seconds: float | None
+    diagnostics: ProviderCallDiagnostics
 
 
 class OpenAIVisionClient:
@@ -118,19 +124,21 @@ class OpenAIVisionClient:
         self,
         *,
         system_prompt: str,
-        transcript_context: str,
+        transcript_context: dict[str, Any],
         image_paths: list[Path],
         detail: str,
         raw_output_path: Path,
     ) -> VisionAnalysisResult:
+        transcript_context_json = json.dumps(transcript_context, ensure_ascii=False, indent=2, sort_keys=True)
         content: list[dict[str, Any]] = [
             {
                 "type": "input_text",
                 "text": "\n\n".join(
                     [
                         system_prompt.strip(),
-                        "Контекст транскрипта:",
-                        transcript_context.strip() or "(пусто)",
+                        "Структурированный контекст транскрипта для текущей визуальной сцены:",
+                        transcript_context_json,
+                        "Используй current_scene_context только как смысловой контекст. previous_context и next_context нужны только для ориентира на границах сцены. Не описывай содержимое previous_context или next_context как визуально присутствующее в текущих кадрах.",
                     ]
                 ),
             }
@@ -171,6 +179,7 @@ class OpenAIVisionClient:
         raw_output_path: Path,
         error_code: str,
     ) -> VisionAnalysisResult:
+        timer = start_operation()
         try:
             response = call_with_retry(
                 lambda: self.client.responses.create(
@@ -192,6 +201,13 @@ class OpenAIVisionClient:
             raise ProviderError(str(error), error_code=error_code, details=str(error)) from error
 
         raw_payload = response.model_dump(mode="json")
+        diagnostics = openai_response_diagnostics(
+            response,
+            raw_payload,
+            timer=timer,
+            raw_output_path=raw_output_path,
+        )
+        raw_payload["_style_kb_diagnostics"] = diagnostics.to_dict()
         write_json_atomic(raw_output_path, raw_payload)
         return _result_from_raw_payload(raw_payload, fallback_output_text=response.output_text)
 
@@ -237,17 +253,20 @@ def _result_from_raw_payload(
     completed_at = raw_payload.get("completed_at")
     if isinstance(created_at, (int, float)) and isinstance(completed_at, (int, float)):
         remote_duration = max(0.0, float(completed_at) - float(created_at))
+    usage_payload = {
+        "input_tokens": int(usage.get("input_tokens") or 0),
+        "output_tokens": int(usage.get("output_tokens") or 0),
+        "reasoning_tokens": int(output_details.get("reasoning_tokens") or 0),
+        "total_tokens": int(usage.get("total_tokens") or 0),
+    }
+    model = str(raw_payload.get("model")) if raw_payload.get("model") is not None else None
     return VisionAnalysisResult(
         payload=payload,
         raw_payload=raw_payload,
-        usage={
-            "input_tokens": int(usage.get("input_tokens") or 0),
-            "output_tokens": int(usage.get("output_tokens") or 0),
-            "reasoning_tokens": int(output_details.get("reasoning_tokens") or 0),
-            "total_tokens": int(usage.get("total_tokens") or 0),
-        },
-        model=str(raw_payload.get("model")) if raw_payload.get("model") is not None else None,
+        usage=usage_payload,
+        model=model,
         remote_duration_seconds=remote_duration,
+        diagnostics=cached_openai_diagnostics(raw_payload, raw_payload, model=model, usage=usage_payload),
     )
 
 

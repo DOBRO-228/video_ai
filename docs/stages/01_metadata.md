@@ -28,7 +28,7 @@ The stage can be skipped only when `video_info.json` parses as `VideoInfo` and i
 ## Important Notes
 
 - This is the first external YouTube call.
-- Keep raw metadata for debugging provider/download issues.
+- Keep `metadata/raw_ytdlp.json` for debugging provider/download issues. It is a diagnostic artifact, not KB input.
 - Do not add user-facing metadata options to the CLI.
 - Downstream timestamp URLs depend on this stage preserving the job `video_id`.
 
@@ -37,4 +37,3 @@ The stage can be skipped only when `video_info.json` parses as `VideoInfo` and i
 - `src/style_kb/stages/stage_01_metadata.py`
 - `src/style_kb/clients/ytdlp.py`
 - `src/style_kb/models.py::VideoInfo`
-
