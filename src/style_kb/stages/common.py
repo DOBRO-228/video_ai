@@ -85,6 +85,7 @@ class ProviderOperation(StrEnum):
     VISION_PRESENTER_PROFILE = "vision_presenter_profile"
     CHUNK_PLAN = "chunk_plan"
     CLAIMS_EXTRACT = "claims_extract"
+    CLAIMS_CURATE = "claims_curate"
     SONIOX_UPLOAD = "soniox_upload"
     SONIOX_CREATE_TRANSCRIPTION = "soniox_create_transcription"
     SONIOX_WAIT_TRANSCRIPTION = "soniox_wait_transcription"

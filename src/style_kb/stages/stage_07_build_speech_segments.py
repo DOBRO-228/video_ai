@@ -12,7 +12,7 @@ from style_kb.models import ProviderSource, SpeechSegment, SpeechToken
 from style_kb.pipeline.base import Stage, StageContext, StageResult
 from style_kb.stages.common import load_speech_segments, load_speech_tokens, read_payload, youtube_source_ref
 from style_kb.stages.diagnostics import append_stage_summary
-from style_kb.utils.files import append_text
+from style_kb.utils.files import append_text, copy_file_atomic
 from style_kb.utils.ids import speech_segment_id
 from style_kb.utils.pydantic_io import write_models_jsonl
 from style_kb.utils.time import build_timestamp_url
@@ -148,7 +148,7 @@ class Stage07BuildSpeechSegments(Stage):
             os.environ.get("OPENAI_API_KEY"),
             model=context.config.speech_segmentation.model,
         )
-        segments, attempts_used = _segment_with_retries(
+        segments, attempts_used, raw_attempt_paths = _segment_with_retries(
             context=context,
             client=client,
             base_prompt_text=base_prompt_text,
@@ -166,6 +166,10 @@ class Stage07BuildSpeechSegments(Stage):
             "speech-segmentation-summary",
             {
                 "raw_output_path": str(context.paths.stt_speech_segments_raw),
+                "accepted_raw_attempt_output_path": str(
+                    context.paths.stt_speech_segments_raw_attempt(attempts_used)
+                ),
+                "raw_attempt_output_paths": [str(path) for path in raw_attempt_paths],
                 "openai_response_id": openai_response_id,
                 "provider": context.config.speech_segmentation.provider,
                 "model": context.config.speech_segmentation.model,
@@ -178,7 +182,7 @@ class Stage07BuildSpeechSegments(Stage):
             },
         )
         return StageResult(
-            output_files=self.output_files(context),
+            output_files=[*self.output_files(context), *raw_attempt_paths],
             remote_refs={"openai_response_id": openai_response_id} if openai_response_id else {},
             metrics={
                 "segments_count": len(segments),
@@ -197,9 +201,12 @@ def _segment_with_retries(
     base_prompt_text: str,
     tokens: list[SpeechToken],
     units: list[_TranscriptUnit],
-) -> tuple[list[SpeechSegment], int]:
+) -> tuple[list[SpeechSegment], int, list[Path]]:
     previous_violations: list[str] = []
+    raw_attempt_paths: list[Path] = []
     for attempt in range(1, _SEGMENTATION_MAX_ATTEMPTS + 1):
+        raw_attempt_path = context.paths.stt_speech_segments_raw_attempt(attempt)
+        raw_attempt_paths.append(raw_attempt_path)
         payload = client.segment_transcript(
             system_prompt=_build_prompt(base_prompt_text, previous_violations, attempt),
             transcript_text=_join_tokens(tokens),
@@ -215,15 +222,16 @@ def _segment_with_retries(
                 "units_count": len(units),
                 "retry_feedback": previous_violations,
             },
-            raw_output_path=context.paths.stt_speech_segments_raw,
+            raw_output_path=raw_attempt_path,
         )
         segments = _segments_from_payload(payload, units, tokens, context)
         segments = _merge_short_same_speaker_segments(segments, tokens, context)
         violations = _semantic_boundary_violations(segments)
         if not violations:
-            return segments, attempt
+            copy_file_atomic(raw_attempt_path, context.paths.stt_speech_segments_raw)
+            return segments, attempt, raw_attempt_paths
         previous_violations = violations
-        _log_retry_attempt(context, attempt=attempt, violations=violations)
+        _log_retry_attempt(context, attempt=attempt, raw_output_path=raw_attempt_path, violations=violations)
         if context.progress_callback is not None and attempt < _SEGMENTATION_MAX_ATTEMPTS:
             context.progress_callback(
                 f"[07 {Stage07BuildSpeechSegments.name}] retry {attempt + 1}/{_SEGMENTATION_MAX_ATTEMPTS} semantic-boundary-violations={len(violations)}"
@@ -480,11 +488,18 @@ def _semantic_boundary_violations(segments: list[SpeechSegment]) -> list[str]:
     return violations
 
 
-def _log_retry_attempt(context: StageContext, *, attempt: int, violations: list[str]) -> None:
+def _log_retry_attempt(
+    context: StageContext,
+    *,
+    attempt: int,
+    raw_output_path: Path,
+    violations: list[str],
+) -> None:
     lines = [
         "",
         "[semantic-retry]",
         f"attempt: {attempt}",
+        f"raw_output_path: {raw_output_path}",
         f"violations_count: {len(violations)}",
         "violations:",
         *[f"  - {violation}" for violation in violations[:20]],

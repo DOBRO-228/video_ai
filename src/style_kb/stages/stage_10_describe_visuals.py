@@ -41,12 +41,14 @@ from style_kb.stages.common import (
 )
 from style_kb.stages.diagnostics import validation_preview
 from style_kb.utils.collections import stable_unique
-from style_kb.utils.files import append_text
+from style_kb.utils.files import append_text, read_json, write_json_atomic
 from style_kb.utils.ids import visual_event_id
 from style_kb.utils.pydantic_io import read_model, write_model, write_models_jsonl
 from style_kb.utils.time import build_timestamp_url
 
 _SCENE_CONTENT_MAX_ATTEMPTS = 2
+_CONTENT_VALIDATION_METADATA_KEY = "_style_kb_content_validation"
+_CONTENT_VALIDATION_ACCEPTED_WITH_WARNING = "accepted_with_warning"
 _BASELINE_LEAKAGE_MARKER_THRESHOLD = 1
 _BASELINE_LEAKAGE_FIELDS = (
     "visual_summary",
@@ -157,12 +159,14 @@ class _VisualListField(StrEnum):
 class _SceneValidationStatus(StrEnum):
     CACHE_INVALID = "cache-invalid"
     RETRY = "retry"
-    FAILED = "failed"
+    ACCEPTED_WITH_WARNING = "accepted-with-warning"
 
 
 class _SceneProgressStatus(StrEnum):
     CACHED = "cached"
+    CACHED_WITH_WARNING = "cached-with-warning"
     COMPLETED = "completed"
+    COMPLETED_WITH_WARNING = "completed-with-warning"
 
 
 @dataclass(slots=True)
@@ -182,6 +186,8 @@ class _SceneResult:
     analysis: VisionAnalysisResult
     cached: bool
     wall_seconds: float
+    raw_output_paths: list[Path]
+    technical_leakage: _VisualContentLeakage | None = None
 
 
 @dataclass(slots=True)
@@ -191,6 +197,38 @@ class _VisualContentLeakage:
     markers: list[str]
     fields: dict[str, list[str]]
     structured_errors: list[dict[str, object]]
+
+
+def empty_baseline_leakage_metrics() -> dict[str, int]:
+    return {
+        "baseline_leakage_scenes_count": 0,
+        "baseline_leakage_markers_total": 0,
+        "baseline_leakage_unique_markers_count": 0,
+        "baseline_leakage_fields_count": 0,
+        "baseline_leakage_structured_errors_count": 0,
+        "baseline_leakage_visual_summary_count": 0,
+        "baseline_leakage_observations_count": 0,
+        "baseline_leakage_interpretations_count": 0,
+        "baseline_leakage_items_count": 0,
+        "baseline_leakage_style_topics_count": 0,
+        "baseline_leakage_notes_count": 0,
+    }
+
+
+def empty_technical_leakage_metrics() -> dict[str, int]:
+    return {
+        "technical_leakage_scenes_count": 0,
+        "technical_leakage_markers_total": 0,
+        "technical_leakage_unique_markers_count": 0,
+        "technical_leakage_fields_count": 0,
+        "technical_leakage_structured_errors_count": 0,
+        "technical_leakage_visual_summary_count": 0,
+        "technical_leakage_observations_count": 0,
+        "technical_leakage_interpretations_count": 0,
+        "technical_leakage_items_count": 0,
+        "technical_leakage_style_topics_count": 0,
+        "technical_leakage_notes_count": 0,
+    }
 
 
 class Stage10DescribeVisuals(Stage):
@@ -215,20 +253,13 @@ class Stage10DescribeVisuals(Stage):
         if not context.paths.visual_events_jsonl.exists() or not context.paths.visual_presenter_profile.exists():
             return False
         try:
-            presenter_profile = _effective_presenter_profile(
-                context,
-                read_model(context.paths.visual_presenter_profile, PresenterProfile),
-            )
             scenes = load_scenes(context.paths.scenes_jsonl) if context.paths.scenes_jsonl.exists() else []
             visual_events = load_visual_events(context.paths.visual_events_jsonl)
         except Exception:
             return False
         if not visual_events or (scenes and len(visual_events) != len(scenes)):
             return False
-        return not _visual_events_have_baseline_leakage(
-            visual_events,
-            presenter_profile,
-        ) and not _visual_events_have_technical_visual_labels(visual_events)
+        return True
 
     def run(self, context: StageContext) -> StageResult:
         prompt_text = _prompt_path(context).read_text(encoding="utf-8")
@@ -273,12 +304,11 @@ class Stage10DescribeVisuals(Stage):
                 context,
                 task,
                 newest_input_mtime,
-                presenter_profile=effective_profile,
             )
             if cached_result is None:
                 pending_tasks.append(task)
                 continue
-            output_files.append(task.raw_output_path)
+            output_files.extend(cached_result.raw_output_paths)
             visual_events[task.order] = _build_visual_event(context, task, cached_result.analysis)
             completed += 1
             cached_count += 1
@@ -302,7 +332,6 @@ class Stage10DescribeVisuals(Stage):
                         detail=context.config.vision.detail,
                         api_key=api_key,
                         model=context.config.vision.model,
-                        presenter_profile=effective_profile,
                         on_retry=_scene_retry_logger(context, task),
                     ): task
                     for task in pending_tasks
@@ -341,7 +370,7 @@ class Stage10DescribeVisuals(Stage):
                                 _log_in_flight_finalization(context, in_flight_map)
                             raise error
                         result = future.result()
-                        output_files.append(task.raw_output_path)
+                        output_files.extend(result.raw_output_paths)
                         visual_events[task.order] = _build_visual_event(context, task, result.analysis)
                         completed += 1
                         api_count += 1
@@ -355,6 +384,10 @@ class Stage10DescribeVisuals(Stage):
         ordered_visual_events = [visual_events[index] for index in sorted(visual_events)]
         write_models_jsonl(context.paths.visual_events_jsonl, ordered_visual_events)
         presenter_counts = _presenter_relevance_counts(ordered_visual_events)
+        baseline_leakage_metrics = baseline_leakage_metrics_for_events(ordered_visual_events, effective_profile)
+        technical_leakage_metrics = technical_leakage_metrics_for_events(ordered_visual_events)
+        _log_baseline_leakage_summary(context, baseline_leakage_metrics)
+        _log_technical_leakage_summary(context, technical_leakage_metrics)
         return StageResult(
             output_files=_dedupe_paths(output_files),
             metrics={
@@ -370,6 +403,8 @@ class Stage10DescribeVisuals(Stage):
                 "presenter_background_scenes_count": presenter_counts[PresenterRelevance.BACKGROUND.value],
                 "presenter_brief_scenes_count": presenter_counts[PresenterRelevance.BRIEF.value],
                 "presenter_primary_example_scenes_count": presenter_counts[PresenterRelevance.PRIMARY_EXAMPLE.value],
+                **baseline_leakage_metrics,
+                **technical_leakage_metrics,
             },
         )
 
@@ -655,8 +690,6 @@ def _load_cached_result(
     context: StageContext,
     task: _SceneTask,
     newest_input_mtime: float,
-    *,
-    presenter_profile: PresenterProfile,
 ) -> _SceneResult | None:
     if not task.raw_output_path.exists():
         return None
@@ -666,8 +699,8 @@ def _load_cached_result(
     if not isinstance(analysis.payload.get("presenter_context"), dict):
         return None
     PresenterContext.model_validate(analysis.payload["presenter_context"])
-    leakage = _visual_content_leakage_from_payload(analysis.payload, presenter_profile)
-    if leakage is not None:
+    leakage = _technical_visual_leakage_from_payload(analysis.payload)
+    if leakage is not None and not _raw_payload_has_accepted_technical_warning(analysis.raw_payload):
         _log_vision_content_validation(
             context,
             task=task,
@@ -677,7 +710,53 @@ def _load_cached_result(
             leakage=leakage,
         )
         return None
-    return _SceneResult(task=task, analysis=analysis, cached=True, wall_seconds=0.0)
+    return _SceneResult(
+        task=task,
+        analysis=analysis,
+        cached=True,
+        wall_seconds=0.0,
+        raw_output_paths=[task.raw_output_path],
+        technical_leakage=leakage,
+    )
+
+
+def _raw_payload_has_accepted_technical_warning(raw_payload: dict) -> bool:
+    metadata = raw_payload.get(_CONTENT_VALIDATION_METADATA_KEY)
+    return isinstance(metadata, dict) and metadata.get("status") == _CONTENT_VALIDATION_ACCEPTED_WITH_WARNING
+
+
+def _write_scene_canonical_raw(
+    *,
+    attempt_raw_path: Path,
+    canonical_raw_path: Path,
+    attempt: int,
+    max_attempts: int,
+    leakage: _VisualContentLeakage | None,
+) -> None:
+    payload = read_json(attempt_raw_path)
+    diagnostics = payload.get("_style_kb_diagnostics")
+    if isinstance(diagnostics, dict):
+        diagnostics["raw_output_path"] = str(canonical_raw_path)
+    payload[_CONTENT_VALIDATION_METADATA_KEY] = {
+        "status": _CONTENT_VALIDATION_ACCEPTED_WITH_WARNING if leakage is not None else "accepted",
+        "attempt": attempt,
+        "max_attempts": max_attempts,
+        "attempt_raw_output_path": str(attempt_raw_path),
+        "technical_leakage": _content_validation_metadata(leakage),
+    }
+    write_json_atomic(canonical_raw_path, payload)
+
+
+def _content_validation_metadata(leakage: _VisualContentLeakage | None) -> dict[str, object] | None:
+    if leakage is None:
+        return None
+    return {
+        "reason": leakage.reason,
+        "error_code": leakage.error_code,
+        "markers": leakage.markers,
+        "fields": leakage.fields,
+        "structured_errors_count": len(leakage.structured_errors),
+    }
 
 
 def _request_scene_analysis(
@@ -688,13 +767,15 @@ def _request_scene_analysis(
     detail: str,
     api_key: str | None,
     model: str,
-    presenter_profile: PresenterProfile,
     on_retry: OnRetry | None = None,
 ) -> _SceneResult:
     started_at = perf_counter()
     client = OpenAIVisionClient(api_key, model=model, on_retry=on_retry)
     leakage: _VisualContentLeakage | None = None
+    raw_attempt_paths: list[Path] = []
     for attempt in range(1, _SCENE_CONTENT_MAX_ATTEMPTS + 1):
+        raw_attempt_path = context.paths.visual_raw_scene_attempt(task.scene.scene_id, attempt)
+        raw_attempt_paths.append(raw_attempt_path)
         event_extra = {
             "scene_order": task.order,
             "scene_index": task.scene.index,
@@ -712,7 +793,7 @@ def _request_scene_analysis(
             diagnostics=ProviderCallDiagnostics(
                 provider=ProviderName.OPENAI,
                 model=model,
-                raw_output_path=str(task.raw_output_path),
+                raw_output_path=str(raw_attempt_path),
             ),
             attempt=attempt,
             message="scene vision request started",
@@ -724,7 +805,7 @@ def _request_scene_analysis(
                 transcript_context=task.transcript_context,
                 image_paths=task.image_paths,
                 detail=detail,
-                raw_output_path=task.raw_output_path,
+                raw_output_path=raw_attempt_path,
             )
         except Exception as error:
             emit_provider_event(
@@ -736,7 +817,7 @@ def _request_scene_analysis(
                 diagnostics=ProviderCallDiagnostics(
                     provider=ProviderName.OPENAI,
                     model=model,
-                    raw_output_path=str(task.raw_output_path),
+                    raw_output_path=str(raw_attempt_path),
                     request_id=request_id_from_error(error),
                 ),
                 attempt=attempt,
@@ -755,14 +836,27 @@ def _request_scene_analysis(
             message="scene vision request completed",
             extra=event_extra,
         )
-        leakage = _visual_content_leakage_from_payload(analysis.payload, presenter_profile)
+        leakage = _technical_visual_leakage_from_payload(analysis.payload)
         if leakage is None:
-            return _SceneResult(task=task, analysis=analysis, cached=False, wall_seconds=perf_counter() - started_at)
+            _write_scene_canonical_raw(
+                attempt_raw_path=raw_attempt_path,
+                canonical_raw_path=task.raw_output_path,
+                attempt=attempt,
+                max_attempts=_SCENE_CONTENT_MAX_ATTEMPTS,
+                leakage=None,
+            )
+            return _SceneResult(
+                task=task,
+                analysis=analysis,
+                cached=False,
+                wall_seconds=perf_counter() - started_at,
+                raw_output_paths=[task.raw_output_path, *raw_attempt_paths],
+            )
 
         status = (
             _SceneValidationStatus.RETRY
             if attempt < _SCENE_CONTENT_MAX_ATTEMPTS
-            else _SceneValidationStatus.FAILED
+            else _SceneValidationStatus.ACCEPTED_WITH_WARNING
         )
         _log_vision_content_validation(
             context,
@@ -771,15 +865,31 @@ def _request_scene_analysis(
             attempt=attempt,
             max_attempts=_SCENE_CONTENT_MAX_ATTEMPTS,
             leakage=leakage,
+            raw_output_path=raw_attempt_path,
         )
         if status == _SceneValidationStatus.RETRY:
             _emit_content_validation_retry_progress(context, task=task, attempt=attempt, leakage=leakage)
+            continue
 
-    assert leakage is not None
+        _write_scene_canonical_raw(
+            attempt_raw_path=raw_attempt_path,
+            canonical_raw_path=task.raw_output_path,
+            attempt=attempt,
+            max_attempts=_SCENE_CONTENT_MAX_ATTEMPTS,
+            leakage=leakage,
+        )
+        return _SceneResult(
+            task=task,
+            analysis=analysis,
+            cached=False,
+            wall_seconds=perf_counter() - started_at,
+            raw_output_paths=[task.raw_output_path, *raw_attempt_paths],
+            technical_leakage=leakage,
+        )
+
     raise StageExecutionError(
-        "OpenAI vision response polluted scene-specific visual fields",
-        error_code=leakage.error_code,
-        details=_visual_content_leakage_details(leakage),
+        "OpenAI vision response did not produce a usable scene analysis",
+        error_code="openai_vision_scene_analysis_missing",
     )
 
 
@@ -814,9 +924,9 @@ def _scene_prompt_for_attempt(system_prompt: str, leakage: _VisualContentLeakage
     feedback = [
         "",
         f"Нарушение предыдущей попытки: {leakage.reason}.",
-        "Исправь ответ: основные поля сцены должны содержать только scene-specific визуальную информацию о мужском стиле.",
-        "Не копируй baseline повторяющегося ведущего в visual_summary, observations, interpretations, items, style_topics или notes.",
-        "Не пиши про формат видео, экран, слайды, текстовые вставки, оверлеи, кадр, камеру, крупный/средний план, фон, интерьер или предметы съемочной обстановки.",
+        "Исправь ответ: основные поля сцены должны содержать только визуально подтверждённую информацию о мужском стиле.",
+        "Не пиши про формат видео, экран, слайды, текстовые вставки, оверлеи, кадр, камеру, крупный/средний план, фон, интерьер или предметы съёмочной обстановки.",
+        "Если нарушение связано только с экранным текстом, перенеси читаемый текст в on_screen_text и очисти остальные scene-specific поля.",
         "Найденные markers:",
         *[f"- {marker}" for marker in leakage.markers],
         "Поля с нарушениями:",
@@ -825,15 +935,47 @@ def _scene_prompt_for_attempt(system_prompt: str, leakage: _VisualContentLeakage
     return system_prompt.rstrip() + "\n" + "\n".join(feedback)
 
 
-def _visual_events_have_baseline_leakage(visual_events: list[VisualEvent], presenter_profile: PresenterProfile) -> bool:
-    return any(
-        _baseline_leakage_from_payload(event.model_dump(mode="json"), presenter_profile) is not None
-        for event in visual_events
-    )
+def baseline_leakage_metrics_for_events(
+    visual_events: list[VisualEvent],
+    presenter_profile: PresenterProfile,
+) -> dict[str, int]:
+    metrics = empty_baseline_leakage_metrics()
+    unique_markers: set[str] = set()
+    for event in visual_events:
+        leakage = _baseline_leakage_from_payload(event.model_dump(mode="json"), presenter_profile)
+        if leakage is None:
+            continue
+        metrics["baseline_leakage_scenes_count"] += 1
+        metrics["baseline_leakage_markers_total"] += len(leakage.markers)
+        metrics["baseline_leakage_fields_count"] += len(leakage.fields)
+        metrics["baseline_leakage_structured_errors_count"] += len(leakage.structured_errors)
+        unique_markers.update(leakage.markers)
+        for field, markers in leakage.fields.items():
+            metric_name = f"baseline_leakage_{field}_count"
+            if metric_name in metrics:
+                metrics[metric_name] += len(markers)
+    metrics["baseline_leakage_unique_markers_count"] = len(unique_markers)
+    return metrics
 
 
-def _visual_events_have_technical_visual_labels(visual_events: list[VisualEvent]) -> bool:
-    return any(_technical_visual_leakage_from_payload(event.model_dump(mode="json")) is not None for event in visual_events)
+def technical_leakage_metrics_for_events(visual_events: list[VisualEvent]) -> dict[str, int]:
+    metrics = empty_technical_leakage_metrics()
+    unique_markers: set[str] = set()
+    for event in visual_events:
+        leakage = _technical_visual_leakage_from_payload(event.model_dump(mode="json"))
+        if leakage is None:
+            continue
+        metrics["technical_leakage_scenes_count"] += 1
+        metrics["technical_leakage_markers_total"] += len(leakage.markers)
+        metrics["technical_leakage_fields_count"] += len(leakage.fields)
+        metrics["technical_leakage_structured_errors_count"] += len(leakage.structured_errors)
+        unique_markers.update(leakage.markers)
+        for field, markers in leakage.fields.items():
+            metric_name = f"technical_leakage_{field}_count"
+            if metric_name in metrics:
+                metrics[metric_name] += len(markers)
+    metrics["technical_leakage_unique_markers_count"] = len(unique_markers)
+    return metrics
 
 
 def _sanitize_visual_labels(values: object, field: _VisualListField) -> list[str]:
@@ -872,16 +1014,6 @@ def _normalize_visual_label(value: str) -> str:
 
 def _matches_any_pattern(value: str, patterns: tuple[str, ...]) -> bool:
     return any(re.search(pattern, value, flags=re.UNICODE) is not None for pattern in patterns)
-
-
-def _visual_content_leakage_from_payload(
-    payload: dict,
-    presenter_profile: PresenterProfile,
-) -> _VisualContentLeakage | None:
-    baseline_leakage = _baseline_leakage_from_payload(payload, presenter_profile)
-    if baseline_leakage is not None:
-        return baseline_leakage
-    return _technical_visual_leakage_from_payload(payload)
 
 
 def _technical_visual_leakage_from_payload(payload: dict) -> _VisualContentLeakage | None:
@@ -1131,6 +1263,55 @@ def _log_scene_result(
         f"reasoning_tokens: {result.analysis.usage['reasoning_tokens']}",
         f"total_tokens: {result.analysis.usage['total_tokens']}",
         f"raw_output: {result.task.raw_output_path}",
+    ]
+    if result.technical_leakage is not None:
+        lines.extend(
+            [
+                f"technical_leakage_reason: {result.technical_leakage.reason}",
+                f"technical_leakage_markers_count: {len(result.technical_leakage.markers)}",
+            ]
+        )
+    lines.append("")
+    append_text(context.paths.stage_log(Stage10DescribeVisuals.name), "\n".join(lines), encoding="utf-8")
+
+
+def _log_baseline_leakage_summary(context: StageContext, metrics: dict[str, int]) -> None:
+    lines = [
+        "",
+        "[baseline-leakage-summary]",
+        f"run_id: {context.run_id or '-'}",
+        f"scenes_count: {metrics['baseline_leakage_scenes_count']}",
+        f"markers_total: {metrics['baseline_leakage_markers_total']}",
+        f"unique_markers_count: {metrics['baseline_leakage_unique_markers_count']}",
+        f"fields_count: {metrics['baseline_leakage_fields_count']}",
+        f"structured_errors_count: {metrics['baseline_leakage_structured_errors_count']}",
+        f"visual_summary_count: {metrics['baseline_leakage_visual_summary_count']}",
+        f"observations_count: {metrics['baseline_leakage_observations_count']}",
+        f"interpretations_count: {metrics['baseline_leakage_interpretations_count']}",
+        f"items_count: {metrics['baseline_leakage_items_count']}",
+        f"style_topics_count: {metrics['baseline_leakage_style_topics_count']}",
+        f"notes_count: {metrics['baseline_leakage_notes_count']}",
+        "",
+    ]
+    append_text(context.paths.stage_log(Stage10DescribeVisuals.name), "\n".join(lines), encoding="utf-8")
+
+
+def _log_technical_leakage_summary(context: StageContext, metrics: dict[str, int]) -> None:
+    lines = [
+        "",
+        "[technical-leakage-summary]",
+        f"run_id: {context.run_id or '-'}",
+        f"scenes_count: {metrics['technical_leakage_scenes_count']}",
+        f"markers_total: {metrics['technical_leakage_markers_total']}",
+        f"unique_markers_count: {metrics['technical_leakage_unique_markers_count']}",
+        f"fields_count: {metrics['technical_leakage_fields_count']}",
+        f"structured_errors_count: {metrics['technical_leakage_structured_errors_count']}",
+        f"visual_summary_count: {metrics['technical_leakage_visual_summary_count']}",
+        f"observations_count: {metrics['technical_leakage_observations_count']}",
+        f"interpretations_count: {metrics['technical_leakage_interpretations_count']}",
+        f"items_count: {metrics['technical_leakage_items_count']}",
+        f"style_topics_count: {metrics['technical_leakage_style_topics_count']}",
+        f"notes_count: {metrics['technical_leakage_notes_count']}",
         "",
     ]
     append_text(context.paths.stage_log(Stage10DescribeVisuals.name), "\n".join(lines), encoding="utf-8")
@@ -1144,7 +1325,9 @@ def _log_vision_content_validation(
     attempt: int,
     max_attempts: int,
     leakage: _VisualContentLeakage,
+    raw_output_path: Path | None = None,
 ) -> None:
+    effective_raw_output_path = raw_output_path or task.raw_output_path
     lines = [
         "",
         "[vision-content-validation]",
@@ -1172,11 +1355,13 @@ def _log_vision_content_validation(
     )
     lines.extend(
         [
-            f"raw_output: {task.raw_output_path}",
+            f"raw_output: {effective_raw_output_path}",
             "",
         ]
     )
     append_text(context.paths.stage_log(Stage10DescribeVisuals.name), "\n".join(lines), encoding="utf-8")
+    if status == _SceneValidationStatus.ACCEPTED_WITH_WARNING:
+        return
     validation_errors = [
         f"field {field} contains blocked visual content: {', '.join(markers)}"
         for field, markers in leakage.fields.items()
@@ -1189,7 +1374,7 @@ def _log_vision_content_validation(
         message="vision content validation failed",
         validation_errors=validation_errors,
         structured_errors=leakage.structured_errors,
-        raw_output_path=task.raw_output_path,
+        raw_output_path=effective_raw_output_path,
         attempt=attempt,
         extra={"scene_order": task.order, "scene_id": task.scene.scene_id, "status": status.value},
     )
@@ -1244,7 +1429,13 @@ def _emit_scene_progress(
 
 
 def _scene_progress_status(result: _SceneResult) -> _SceneProgressStatus:
-    return _SceneProgressStatus.CACHED if result.cached else _SceneProgressStatus.COMPLETED
+    if result.cached:
+        if result.technical_leakage is not None:
+            return _SceneProgressStatus.CACHED_WITH_WARNING
+        return _SceneProgressStatus.CACHED
+    if result.technical_leakage is not None:
+        return _SceneProgressStatus.COMPLETED_WITH_WARNING
+    return _SceneProgressStatus.COMPLETED
 
 
 def _format_seconds(value: float | None) -> str:

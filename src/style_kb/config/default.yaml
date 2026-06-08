@@ -133,6 +133,13 @@ style_claims:
   prompt_file: style_claims_ru.txt
   max_claims_per_chunk: 5
   max_retries: 3
+  curate:
+    enabled: true
+    provider: openai
+    model: gpt-5-mini
+    prompt_file: style_claims_curate_ru.txt
+    reasoning_effort: medium
+    max_retries: 1
 
 export:
   formats:

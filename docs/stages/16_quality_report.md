@@ -6,13 +6,12 @@ Summarize pipeline quality, coverage, durations, counts, warnings, and artifact 
 
 ## How It Works
 
-The stage loads all canonical upstream artifacts, verifies that timeline and chunks are non-empty, reads media durations, computes coverage ratios, and writes a `QualityReport`. It also emits presenter-aware warnings when recurring presenter handling appears unstable and claim-aware warnings when extracted style knowledge is missing.
+The stage loads all canonical upstream artifacts, verifies that timeline and chunks are non-empty, reads media durations, computes coverage ratios, and writes a `QualityReport`. It also emits presenter-aware warnings when recurring presenter handling appears unstable, including non-blocking recurring presenter baseline leakage, technical visual leakage warnings, soft presentation-noise warnings for final visual/chunk fields, and claim-aware warnings when extracted style knowledge is missing.
 
 ## Inputs
 
 - `metadata/video_info.json`
-- `downloads/audio.ffprobe.json`
-- `downloads/video_proxy.ffprobe.json`
+- `timeline/media_durations.json`
 - `stt/speaker_diarization.json`
 - `stt/speech_tokens.jsonl`
 - `stt/speech_segments.jsonl`
@@ -35,8 +34,13 @@ The stage can be skipped when `quality_report.json` exists and parses as `Qualit
 ## Important Notes
 
 - This is the last stage that should inspect all canonical data before cleanup.
+- Duration checks use `timeline/media_durations.json` so the report can be regenerated after cleanup removes downloaded media diagnostics.
 - Failed jobs retain media/frames for resume and debugging because cleanup runs only after this stage.
 - Warnings should be diagnostic; hard failures should be reserved for impossible consistency states.
+- Recurring presenter baseline leakage is a quality warning/metric, not a hard failure.
+- Technical presentation leakage that remains after visual retry is a quality warning/metric, not a hard failure.
+- Presentation-noise metrics are broader than strict technical leakage. They flag wording such as visual placement, appearance/change language, and presentation-style phrasing that may still be useful to inspect but must not fail or rewrite the job.
+- `quality_report.json` includes a `metrics` object for non-fatal quality counters in addition to human-readable warnings.
 - Speaker count is not fixed. Quality report warns only when diarization is enabled but no speaker labels are detected.
 - Empty style claims are a warning, not a hard failure, because some chunks may contain only service or promotional content.
 

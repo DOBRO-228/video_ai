@@ -13,6 +13,11 @@ from pydantic import ValidationError as PydanticValidationError
 from style_kb.clients._retry import OnRetry
 from style_kb.clients.provider_diagnostics import ProviderCallDiagnostics, ProviderName
 from style_kb.clients.openai_claims import ClaimsAnalysisResult, OpenAIClaimsClient, load_cached_claims_result
+from style_kb.clients.openai_claims_curate import (
+    ClaimsCurateResult,
+    OpenAIClaimsCurateClient,
+    load_cached_claims_curate_result,
+)
 from style_kb.diagnostics import PipelineEvent
 from style_kb.errors import ProviderError, StageExecutionError
 from style_kb.models import (
@@ -44,7 +49,7 @@ from style_kb.utils.files import append_text, write_json_atomic
 from style_kb.utils.ids import style_claim_id
 from style_kb.utils.pydantic_io import write_models_jsonl
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _CLAIM_TYPES = set(ClaimType.values())
 _CONFIDENCE_LEVELS = set(ConfidenceLevel.values())
 _RECOVERABLE_PROVIDER_ERROR_CODES = {
@@ -106,6 +111,42 @@ _TECHNICAL_PHRASES = {
     "источник и временной диапазон",
     "связанные события таймлайна",
 }
+_EVIDENCE_META_PREFIX_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:в\s+)?chunk|"
+    r"on[- ]screen|"
+    r"в\s+видео|"
+    r"в\s+кадре|"
+    r"ведущий|"
+    r"визуально"
+    r")\s*(?:[:：-]|\s+говорится\s*,?\s*(?:что\s*)?|\s+)?",
+    re.IGNORECASE,
+)
+_CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
+_LATIN_HOMOGLYPH_RE = re.compile(r"[AaEeOoPpCcXxYyKkMm]")
+_LATIN_TO_CYRILLIC_HOMOGLYPHS = str.maketrans(
+    {
+        "A": "А",
+        "a": "а",
+        "E": "Е",
+        "e": "е",
+        "O": "О",
+        "o": "о",
+        "P": "Р",
+        "p": "р",
+        "C": "С",
+        "c": "с",
+        "X": "Х",
+        "x": "х",
+        "Y": "У",
+        "y": "у",
+        "K": "К",
+        "k": "к",
+        "M": "М",
+        "m": "м",
+    }
+)
+_MAX_TOPICS_PER_CLAIM = 8
 
 
 @dataclass(slots=True)
@@ -118,6 +159,39 @@ class _ChunkClaimsResult:
     total_tokens: int
     cache_hit: bool
     diagnostics: ProviderCallDiagnostics | None = None
+
+
+@dataclass(slots=True)
+class _ClaimsCleanupResult:
+    claims: list[StyleClaim]
+    changed_claims_count: int
+    evidence_meta_prefix_cleaned_count: int
+    homoglyph_cleaned_fields_count: int
+    topics_truncated_count: int
+
+
+@dataclass(slots=True)
+class _CuratedClaimsResult:
+    claims: list[StyleClaim]
+    raw_files: list[Path]
+    input_tokens: int
+    output_tokens: int
+    reasoning_tokens: int
+    total_tokens: int
+    metrics: dict[str, Any]
+
+
+@dataclass(slots=True)
+class _CurateApplication:
+    claims: list[StyleClaim]
+    decisions: list[dict[str, Any]]
+    invalid_decisions: list[dict[str, Any]]
+    missing_decision_ids: list[str]
+    merged_claim_ids: list[str]
+    confidence_changes: list[dict[str, str]]
+    split_candidates: list[dict[str, Any]]
+    rewrite_suggestions: list[dict[str, str]]
+    applies_to_notes: list[dict[str, str]]
 
 
 class _RecoverableClaimsOutputError(ProviderError):
@@ -140,20 +214,27 @@ class Stage13ExtractStyleClaims(Stage):
     ordinal = 13
 
     def input_files(self, context: StageContext) -> list:
-        return [
+        inputs = [
             context.paths.timeline_events_jsonl,
             context.paths.chunks_jsonl,
             _prompt_path(context),
         ]
+        if context.config.style_claims.curate.enabled:
+            inputs.append(_curate_prompt_path(context))
+        return inputs
 
     def output_files(self, context: StageContext) -> list:
         outputs = [context.paths.style_claims_jsonl, context.paths.style_claims_raw]
+        if context.config.style_claims.curate.enabled:
+            outputs.append(context.paths.style_claims_curate_raw)
         if context.paths.style_claims_errors.exists():
             outputs.append(context.paths.style_claims_errors)
         return outputs
 
     def validate_outputs(self, context: StageContext) -> bool:
         if not context.paths.style_claims_jsonl.exists() or not context.paths.style_claims_raw.exists():
+            return False
+        if context.config.style_claims.curate.enabled and not context.paths.style_claims_curate_raw.exists():
             return False
         summary = read_payload(context.paths.style_claims_raw)
         if not _summary_matches_config(summary, context):
@@ -228,13 +309,27 @@ class Stage13ExtractStyleClaims(Stage):
             reasoning_tokens += chunk_result.reasoning_tokens
             total_tokens += chunk_result.total_tokens
 
-        style_claims = _dedupe_claims(all_candidates, context.job.video_id)
+        cleanup_result = _cleanup_claims(all_candidates)
+        cleaned_candidates = cleanup_result.claims
+        style_claims_after_exact_dedupe = _dedupe_claims(cleaned_candidates, context.job.video_id)
+        curate_result = _curate_claims_if_enabled(context, style_claims_after_exact_dedupe)
+        style_claims = curate_result.claims
+        raw_output_files.extend(curate_result.raw_files)
+        input_tokens += curate_result.input_tokens
+        output_tokens += curate_result.output_tokens
+        reasoning_tokens += curate_result.reasoning_tokens
+        total_tokens += curate_result.total_tokens
         summary = _summary_payload(
             context=context,
             chunks=chunks,
             raw_files=canonical_raw_files,
+            prompt_sha=prompt_sha,
+            style_claims=style_claims,
             claims_before_dedupe=len(all_candidates),
+            claims_after_exact_dedupe=len(style_claims_after_exact_dedupe),
             claims_after_dedupe=len(style_claims),
+            cleanup_result=cleanup_result,
+            curate_metrics=curate_result.metrics,
             legacy_raw_cache_removed_count=legacy_raw_cache_removed_count,
         )
         write_models_jsonl(context.paths.style_claims_jsonl, style_claims)
@@ -246,10 +341,16 @@ class Stage13ExtractStyleClaims(Stage):
             metrics={
                 "style_claims_count": len(style_claims),
                 "claims_before_dedupe": len(all_candidates),
+                "claims_after_exact_dedupe": len(style_claims_after_exact_dedupe),
                 "cached_chunks_count": cached_chunks,
                 "api_chunks_count": api_chunks,
                 "legacy_raw_cache_removed_count": legacy_raw_cache_removed_count,
                 "claim_retry_errors_count": len(claim_errors),
+                "deterministic_cleanup_changed_claims_count": cleanup_result.changed_claims_count,
+                "curate_merged_count": curate_result.metrics.get("curate_merged_count", 0),
+                "curate_confidence_changed_count": curate_result.metrics.get("curate_confidence_changed_count", 0),
+                "curate_split_candidates_count": curate_result.metrics.get("curate_split_candidates_count", 0),
+                "curate_rewrite_suggestions_count": curate_result.metrics.get("curate_rewrite_suggestions_count", 0),
                 "input_tokens_total": input_tokens,
                 "output_tokens_total": output_tokens,
                 "reasoning_tokens_total": reasoning_tokens,
@@ -623,6 +724,577 @@ def _merge_source_refs(left: list[SourceRef], right: list[SourceRef]) -> list[So
     return merged
 
 
+def _cleanup_claims(claims: list[StyleClaim]) -> _ClaimsCleanupResult:
+    cleaned_claims: list[StyleClaim] = []
+    changed_claims_count = 0
+    evidence_meta_prefix_cleaned_count = 0
+    homoglyph_cleaned_fields_count = 0
+    topics_truncated_count = 0
+
+    for claim in claims:
+        update: dict[str, Any] = {}
+        scalar_fields = {
+            "subject": claim.subject,
+            "claim": claim.claim,
+            "rationale": claim.rationale,
+        }
+        for field_name, value in scalar_fields.items():
+            cleaned, homoglyph_changed = _cleanup_text(value)
+            if cleaned != value:
+                update[field_name] = cleaned
+                if homoglyph_changed:
+                    homoglyph_cleaned_fields_count += 1
+
+        list_fields = {
+            "conditions": claim.conditions,
+            "applies_to": claim.applies_to,
+            "avoid": claim.avoid,
+            "prefer": claim.prefer,
+            "evidence": claim.evidence,
+            "topics": claim.topics,
+        }
+        for field_name, values in list_fields.items():
+            cleaned_values: list[str] = []
+            for value in values:
+                if field_name == "evidence":
+                    stripped = _strip_evidence_meta_prefix(value)
+                    if stripped != value:
+                        evidence_meta_prefix_cleaned_count += 1
+                    value = stripped
+                cleaned, homoglyph_changed = _cleanup_text(value)
+                if homoglyph_changed:
+                    homoglyph_cleaned_fields_count += 1
+                if cleaned:
+                    cleaned_values.append(cleaned)
+            cleaned_values = stable_unique(cleaned_values)
+            if field_name == "topics" and len(cleaned_values) > _MAX_TOPICS_PER_CLAIM:
+                cleaned_values = cleaned_values[:_MAX_TOPICS_PER_CLAIM]
+                topics_truncated_count += 1
+            if cleaned_values != values:
+                update[field_name] = cleaned_values
+
+        if update:
+            changed_claims_count += 1
+            cleaned_claims.append(claim.model_copy(update=update))
+        else:
+            cleaned_claims.append(claim)
+
+    return _ClaimsCleanupResult(
+        claims=cleaned_claims,
+        changed_claims_count=changed_claims_count,
+        evidence_meta_prefix_cleaned_count=evidence_meta_prefix_cleaned_count,
+        homoglyph_cleaned_fields_count=homoglyph_cleaned_fields_count,
+        topics_truncated_count=topics_truncated_count,
+    )
+
+
+def _cleanup_text(value: str) -> tuple[str, bool]:
+    normalized = _clean_string(value)
+    cleaned = _replace_cyrillic_homoglyphs(normalized)
+    return cleaned, cleaned != normalized
+
+
+def _strip_evidence_meta_prefix(value: str) -> str:
+    cleaned = _EVIDENCE_META_PREFIX_RE.sub("", value).strip()
+    cleaned = re.sub(r"^\s*говорится\s*,?\s*(?:что\s*)?", "", cleaned, flags=re.IGNORECASE).strip()
+    return cleaned
+
+
+def _replace_cyrillic_homoglyphs(value: str) -> str:
+    def replace_token(match: re.Match[str]) -> str:
+        token = match.group(0)
+        if not _CYRILLIC_RE.search(token) or not _LATIN_HOMOGLYPH_RE.search(token):
+            return token
+        return token.translate(_LATIN_TO_CYRILLIC_HOMOGLYPHS)
+
+    return re.sub(r"[\w-]+", replace_token, value)
+
+
+def _renumber_claims(claims: list[StyleClaim], video_id: str) -> list[StyleClaim]:
+    return [
+        claim.model_copy(update={"claim_id": style_claim_id(video_id, index)})
+        for index, claim in enumerate(claims, start=1)
+    ]
+
+
+def _curate_claims_if_enabled(context: StageContext, claims: list[StyleClaim]) -> _CuratedClaimsResult:
+    curate_config = context.config.style_claims.curate
+    if not curate_config.enabled:
+        return _CuratedClaimsResult(
+            claims=_renumber_claims(claims, context.job.video_id),
+            raw_files=[],
+            input_tokens=0,
+            output_tokens=0,
+            reasoning_tokens=0,
+            total_tokens=0,
+            metrics=_disabled_curate_metrics(len(claims)),
+        )
+
+    prompt_text = _curate_prompt_path(context).read_text(encoding="utf-8")
+    prompt_sha = _sha256_text(prompt_text)
+    claims_payload = _curate_claims_payload(claims)
+    request_metadata = _curate_request_metadata(context, claims_payload, prompt_sha)
+    raw_path = context.paths.style_claims_raw_curate
+    analysis, cache_hit = _load_cached_curate_analysis(raw_path, request_metadata, context)
+    if analysis is None:
+        analysis = _run_claims_curate_request(
+            context=context,
+            claims_payload=claims_payload,
+            request_metadata=request_metadata,
+            system_prompt=prompt_text,
+            raw_path=raw_path,
+        )
+        cache_hit = False
+
+    application = _apply_curate_payload(claims, analysis.payload, context.job.video_id)
+    metrics = _curate_metrics(
+        context=context,
+        prompt_sha=prompt_sha,
+        claims_before=len(claims),
+        application=application,
+        analysis=analysis,
+        cache_hit=cache_hit,
+        raw_path=raw_path,
+    )
+    write_json_atomic(
+        context.paths.style_claims_curate_raw,
+        _curate_audit_payload(
+            context=context,
+            request_metadata=request_metadata,
+            raw_path=raw_path,
+            analysis=analysis,
+            application=application,
+            metrics=metrics,
+        ),
+    )
+    return _CuratedClaimsResult(
+        claims=application.claims,
+        raw_files=[raw_path],
+        input_tokens=analysis.usage["input_tokens"],
+        output_tokens=analysis.usage["output_tokens"],
+        reasoning_tokens=analysis.usage["reasoning_tokens"],
+        total_tokens=analysis.usage["total_tokens"],
+        metrics=metrics,
+    )
+
+
+def _load_cached_curate_analysis(
+    raw_path: Path,
+    request_metadata: dict[str, Any],
+    context: StageContext,
+) -> tuple[ClaimsCurateResult | None, bool]:
+    if not raw_path.exists():
+        return None, False
+    try:
+        analysis = load_cached_claims_curate_result(raw_path)
+    except Exception as error:
+        _log_claims_curate_cache(
+            context,
+            cache_path=raw_path,
+            cache_hit=False,
+            validation_errors=[f"{type(error).__name__}: {error}"],
+        )
+        return None, False
+    if analysis.raw_payload.get("request") != request_metadata:
+        _log_claims_curate_cache(
+            context,
+            cache_path=raw_path,
+            cache_hit=False,
+            validation_errors=["request metadata mismatch"],
+            analysis=analysis,
+        )
+        return None, False
+    _log_claims_curate_cache(context, cache_path=raw_path, cache_hit=True, validation_errors=[], analysis=analysis)
+    return analysis, True
+
+
+def _run_claims_curate_request(
+    *,
+    context: StageContext,
+    claims_payload: list[dict[str, Any]],
+    request_metadata: dict[str, Any],
+    system_prompt: str,
+    raw_path: Path,
+) -> ClaimsCurateResult:
+    event_extra = {
+        "claims_count": len(claims_payload),
+        "max_retries": context.config.style_claims.curate.max_retries,
+    }
+    emit_provider_event(
+        context,
+        PipelineEvent.PROVIDER_REQUEST_STARTED,
+        stage_name=Stage13ExtractStyleClaims.name,
+        ordinal=Stage13ExtractStyleClaims.ordinal,
+        operation=ProviderOperation.CLAIMS_CURATE,
+        diagnostics=ProviderCallDiagnostics(
+            provider=ProviderName.OPENAI,
+            model=context.config.style_claims.curate.model,
+            raw_output_path=str(raw_path),
+        ),
+        attempt=1,
+        message="claims curation request started",
+        extra=event_extra,
+    )
+    client = OpenAIClaimsCurateClient(
+        os.environ.get("OPENAI_API_KEY"),
+        model=context.config.style_claims.curate.model,
+        reasoning_effort=context.config.style_claims.curate.reasoning_effort,
+        on_retry=_claims_curate_retry_logger(context),
+    )
+    try:
+        analysis = client.curate_claims(
+            system_prompt=system_prompt,
+            claims_payload=claims_payload,
+            constraints_payload=_curate_constraints_payload(context),
+            request_metadata=request_metadata,
+            raw_output_path=raw_path,
+        )
+    except ProviderError as error:
+        emit_provider_event(
+            context,
+            PipelineEvent.PROVIDER_REQUEST_FAILED,
+            stage_name=Stage13ExtractStyleClaims.name,
+            ordinal=Stage13ExtractStyleClaims.ordinal,
+            operation=ProviderOperation.CLAIMS_CURATE,
+            diagnostics=ProviderCallDiagnostics(
+                provider=ProviderName.OPENAI,
+                model=context.config.style_claims.curate.model,
+                raw_output_path=str(raw_path),
+                request_id=request_id_from_error(error),
+            ),
+            attempt=1,
+            message="claims curation request failed",
+            extra={**provider_error_extra(error), **event_extra},
+        )
+        raise
+    emit_provider_event(
+        context,
+        PipelineEvent.PROVIDER_REQUEST_COMPLETED,
+        stage_name=Stage13ExtractStyleClaims.name,
+        ordinal=Stage13ExtractStyleClaims.ordinal,
+        operation=ProviderOperation.CLAIMS_CURATE,
+        diagnostics=analysis.diagnostics,
+        attempt=1,
+        message="claims curation request completed",
+        extra=event_extra,
+    )
+    return analysis
+
+
+def _apply_curate_payload(
+    claims: list[StyleClaim],
+    payload: dict[str, Any],
+    video_id: str,
+) -> _CurateApplication:
+    claim_by_id = {claim.claim_id: claim for claim in claims}
+    raw_decisions = payload.get("decisions") if isinstance(payload, dict) else None
+    if not isinstance(raw_decisions, list):
+        return _CurateApplication(
+            claims=_renumber_claims(claims, video_id),
+            decisions=[],
+            invalid_decisions=[
+                {
+                    "claim_id": "",
+                    "reason": "curation payload has no decisions array",
+                }
+            ],
+            missing_decision_ids=[claim.claim_id for claim in claims],
+            merged_claim_ids=[],
+            confidence_changes=[],
+            split_candidates=[],
+            rewrite_suggestions=[],
+            applies_to_notes=[],
+        )
+
+    decisions_by_id: dict[str, dict[str, Any]] = {}
+    normalized_decisions: list[dict[str, Any]] = []
+    invalid_decisions: list[dict[str, Any]] = []
+    for index, raw_decision in enumerate(raw_decisions, start=1):
+        decision, decision_errors = _normalize_curate_decision(raw_decision, claim_by_id, index=index)
+        if decision_errors:
+            invalid_decisions.extend(decision_errors)
+        if decision is None:
+            continue
+        claim_id = decision["claim_id"]
+        if claim_id in decisions_by_id:
+            invalid_decisions.append({"claim_id": claim_id, "reason": "duplicate decision"})
+            continue
+        decisions_by_id[claim_id] = decision
+        normalized_decisions.append(decision)
+
+    missing_decision_ids = [claim.claim_id for claim in claims if claim.claim_id not in decisions_by_id]
+    valid_merges: dict[str, str] = {}
+    for claim_id, decision in decisions_by_id.items():
+        if claim_id not in claim_by_id:
+            continue
+        merged_into = decision["merged_into"]
+        if decision["keep"] or not merged_into:
+            continue
+        source_claim = claim_by_id[claim_id]
+        target_claim = claim_by_id.get(merged_into)
+        target_decision = decisions_by_id.get(merged_into)
+        if target_claim is None:
+            invalid_decisions.append({"claim_id": claim_id, "reason": f"merged_into unknown claim_id={merged_into!r}"})
+            continue
+        if target_claim.claim_type != source_claim.claim_type:
+            invalid_decisions.append({"claim_id": claim_id, "reason": "merged_into claim_type mismatch"})
+            continue
+        if target_decision is not None and not target_decision["keep"]:
+            invalid_decisions.append({"claim_id": claim_id, "reason": "merged_into target is not kept"})
+            continue
+        valid_merges[claim_id] = merged_into
+
+    merged_targets: dict[str, StyleClaim] = {}
+    for source_id, target_id in valid_merges.items():
+        target = merged_targets.get(target_id) or claim_by_id[target_id]
+        merged_targets[target_id] = _merge_claims(target, claim_by_id[source_id])
+
+    final_claims: list[StyleClaim] = []
+    confidence_changes: list[dict[str, str]] = []
+    split_candidates: list[dict[str, Any]] = []
+    rewrite_suggestions: list[dict[str, str]] = []
+    applies_to_notes: list[dict[str, str]] = []
+    for claim in claims:
+        if claim.claim_id in valid_merges:
+            continue
+        decision = decisions_by_id.get(claim.claim_id)
+        updated_claim = merged_targets.get(claim.claim_id, claim)
+        if decision is not None:
+            revised_confidence = ConfidenceLevel(decision["confidence_revised"])
+            if revised_confidence != updated_claim.confidence:
+                confidence_changes.append(
+                    {
+                        "claim_id": claim.claim_id,
+                        "before": updated_claim.confidence.value,
+                        "after": revised_confidence.value,
+                    }
+                )
+                updated_claim = updated_claim.model_copy(update={"confidence": revised_confidence})
+            if decision["split_candidate"]:
+                split_candidates.append(
+                    {
+                        "claim_id": claim.claim_id,
+                        "split_suggestion": decision["split_suggestion"],
+                    }
+                )
+            if decision["rewrite_suggestion"]:
+                rewrite_suggestions.append(
+                    {
+                        "claim_id": claim.claim_id,
+                        "rewrite_suggestion": decision["rewrite_suggestion"],
+                    }
+                )
+            if decision["applies_to_note"]:
+                applies_to_notes.append(
+                    {
+                        "claim_id": claim.claim_id,
+                        "applies_to_note": decision["applies_to_note"],
+                    }
+                )
+        final_claims.append(updated_claim)
+
+    return _CurateApplication(
+        claims=_renumber_claims(final_claims, video_id),
+        decisions=normalized_decisions,
+        invalid_decisions=invalid_decisions,
+        missing_decision_ids=missing_decision_ids,
+        merged_claim_ids=list(valid_merges.keys()),
+        confidence_changes=confidence_changes,
+        split_candidates=split_candidates,
+        rewrite_suggestions=rewrite_suggestions,
+        applies_to_notes=applies_to_notes,
+    )
+
+
+def _normalize_curate_decision(
+    raw_decision: object,
+    claim_by_id: dict[str, StyleClaim],
+    *,
+    index: int,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    if not isinstance(raw_decision, dict):
+        return None, [{"claim_id": "", "reason": f"decision {index} is not an object"}]
+    claim_id = _clean_string(raw_decision.get("claim_id"))
+    errors: list[dict[str, Any]] = []
+    if claim_id not in claim_by_id:
+        errors.append({"claim_id": claim_id, "reason": f"decision {index} references unknown claim_id"})
+    keep = bool(raw_decision.get("keep"))
+    merged_into = _clean_string(raw_decision.get("merged_into"))
+    if merged_into == claim_id:
+        errors.append({"claim_id": claim_id, "reason": "merged_into points to itself"})
+        merged_into = ""
+    if keep and merged_into:
+        errors.append({"claim_id": claim_id, "reason": "kept decision includes merged_into"})
+        merged_into = ""
+    if not keep and not merged_into:
+        errors.append({"claim_id": claim_id, "reason": "dropped decision has empty merged_into"})
+    confidence_revised = _clean_string(raw_decision.get("confidence_revised"))
+    if confidence_revised not in _CONFIDENCE_LEVELS:
+        errors.append({"claim_id": claim_id, "reason": f"invalid confidence_revised={confidence_revised!r}"})
+        confidence_revised = claim_by_id[claim_id].confidence.value if claim_id in claim_by_id else ConfidenceLevel.MEDIUM.value
+    decision = {
+        "claim_id": claim_id,
+        "keep": keep,
+        "merged_into": merged_into,
+        "confidence_revised": confidence_revised,
+        "confidence_reason": _clean_string(raw_decision.get("confidence_reason")),
+        "split_candidate": bool(raw_decision.get("split_candidate")),
+        "split_suggestion": _clean_list(raw_decision.get("split_suggestion")),
+        "rewrite_suggestion": _clean_string(raw_decision.get("rewrite_suggestion")),
+        "applies_to_note": _clean_string(raw_decision.get("applies_to_note")),
+    }
+    return decision, errors
+
+
+def _curate_claims_payload(claims: list[StyleClaim]) -> list[dict[str, Any]]:
+    return [
+        {
+            "claim_id": claim.claim_id,
+            "subject": claim.subject,
+            "claim_type": claim.claim_type.value,
+            "claim": claim.claim,
+            "rationale": claim.rationale,
+            "conditions": claim.conditions,
+            "applies_to": claim.applies_to,
+            "avoid": claim.avoid,
+            "prefer": claim.prefer,
+            "evidence": claim.evidence,
+            "topics": claim.topics,
+            "confidence": claim.confidence.value,
+        }
+        for claim in claims
+    ]
+
+
+def _curate_request_metadata(
+    context: StageContext,
+    claims_payload: list[dict[str, Any]],
+    prompt_sha: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": _SCHEMA_VERSION,
+        "video_id": context.job.video_id,
+        "provider": context.config.style_claims.curate.provider,
+        "model": context.config.style_claims.curate.model,
+        "reasoning_effort": context.config.style_claims.curate.reasoning_effort,
+        "prompt_file": context.config.style_claims.curate.prompt_file,
+        "prompt_sha256": prompt_sha,
+        "max_retries": context.config.style_claims.curate.max_retries,
+        "claims_count": len(claims_payload),
+        "input_fingerprint": _fingerprint(claims_payload),
+    }
+
+
+def _curate_constraints_payload(context: StageContext) -> dict[str, Any]:
+    return {
+        "output_language": "ru",
+        "claim_ids_are_required": True,
+        "decisions_count": "exactly one decision per input claim",
+        "safe_auto_applied_fields": ["keep/merged_into for valid semantic duplicates", "confidence_revised"],
+        "audit_only_fields": ["split_suggestion", "rewrite_suggestion", "applies_to_note", "confidence_reason"],
+        "merge_policy": "merge only if same meaning and same claim_type; keep both when unsure",
+        "do_not_output": [
+            "new claims",
+            "rewritten canonical claim text",
+            "technical source refs, chunk ids, timeline ids, timestamps, or metadata",
+        ],
+    }
+
+
+def _disabled_curate_metrics(claims_count: int) -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "provider": None,
+        "model": None,
+        "reasoning_effort": None,
+        "prompt_file": None,
+        "prompt_sha256": None,
+        "max_retries": None,
+        "cache_hit": False,
+        "raw_file": None,
+        "claims_before_curate": claims_count,
+        "claims_after_curate": claims_count,
+        "curate_merged_count": 0,
+        "curate_confidence_changed_count": 0,
+        "curate_split_candidates_count": 0,
+        "curate_rewrite_suggestions_count": 0,
+        "curate_applies_to_notes_count": 0,
+        "curate_invalid_decisions_count": 0,
+        "curate_missing_decisions_count": 0,
+    }
+
+
+def _curate_metrics(
+    *,
+    context: StageContext,
+    prompt_sha: str,
+    claims_before: int,
+    application: _CurateApplication,
+    analysis: ClaimsCurateResult,
+    cache_hit: bool,
+    raw_path: Path,
+) -> dict[str, Any]:
+    return {
+        "enabled": True,
+        "provider": context.config.style_claims.curate.provider,
+        "model": context.config.style_claims.curate.model,
+        "reasoning_effort": context.config.style_claims.curate.reasoning_effort,
+        "prompt_file": context.config.style_claims.curate.prompt_file,
+        "prompt_sha256": prompt_sha,
+        "max_retries": context.config.style_claims.curate.max_retries,
+        "cache_hit": cache_hit,
+        "raw_file": relative_artifact_path(context.paths.job_dir, raw_path),
+        "claims_before_curate": claims_before,
+        "claims_after_curate": len(application.claims),
+        "curate_merged_count": len(application.merged_claim_ids),
+        "curate_confidence_changed_count": len(application.confidence_changes),
+        "curate_split_candidates_count": len(application.split_candidates),
+        "curate_rewrite_suggestions_count": len(application.rewrite_suggestions),
+        "curate_applies_to_notes_count": len(application.applies_to_notes),
+        "curate_invalid_decisions_count": len(application.invalid_decisions),
+        "curate_missing_decisions_count": len(application.missing_decision_ids),
+        "input_tokens": analysis.usage["input_tokens"],
+        "output_tokens": analysis.usage["output_tokens"],
+        "reasoning_tokens": analysis.usage["reasoning_tokens"],
+        "total_tokens": analysis.usage["total_tokens"],
+    }
+
+
+def _curate_audit_payload(
+    *,
+    context: StageContext,
+    request_metadata: dict[str, Any],
+    raw_path: Path,
+    analysis: ClaimsCurateResult,
+    application: _CurateApplication,
+    metrics: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": _SCHEMA_VERSION,
+        "video_id": context.job.video_id,
+        "stage": Stage13ExtractStyleClaims.name,
+        "artifact_role": "audit_only_not_for_import",
+        "request": request_metadata,
+        "raw_file": relative_artifact_path(context.paths.job_dir, raw_path),
+        "diagnostics": analysis.diagnostics.to_dict(),
+        "metrics": metrics,
+        "decisions": application.decisions,
+        "applied": {
+            "merged_claim_ids": application.merged_claim_ids,
+            "confidence_changes": application.confidence_changes,
+        },
+        "audit_only": {
+            "split_candidates": application.split_candidates,
+            "rewrite_suggestions": application.rewrite_suggestions,
+            "applies_to_notes": application.applies_to_notes,
+        },
+        "ignored": {
+            "invalid_decisions": application.invalid_decisions,
+            "missing_decision_ids": application.missing_decision_ids,
+        },
+    }
+
+
 def _claims_are_valid(
     claims: list[StyleClaim],
     chunks: list[Chunk],
@@ -668,14 +1340,37 @@ def _claims_are_valid(
 
 
 def _summary_matches_config(summary: dict[str, Any], context: StageContext) -> bool:
+    prompt_path = _prompt_path(context)
+    if not prompt_path.exists():
+        return False
+    prompt_sha = _sha256_text(prompt_path.read_text(encoding="utf-8"))
+    curate_config = context.config.style_claims.curate
+    if curate_config.enabled:
+        curate_prompt_path = _curate_prompt_path(context)
+        if not curate_prompt_path.exists():
+            return False
+        curate_prompt_sha: str | None = _sha256_text(curate_prompt_path.read_text(encoding="utf-8"))
+    else:
+        curate_prompt_sha = None
+    curate_summary = summary.get("curate") if isinstance(summary.get("curate"), dict) else {}
     return (
         summary.get("schema_version") == _SCHEMA_VERSION
         and summary.get("video_id") == context.job.video_id
         and summary.get("provider") == context.config.style_claims.provider
         and summary.get("model") == context.config.style_claims.model
         and summary.get("prompt_file") == context.config.style_claims.prompt_file
+        and summary.get("prompt_sha256") == prompt_sha
         and summary.get("max_claims_per_chunk") == context.config.style_claims.max_claims_per_chunk
         and summary.get("max_retries") == context.config.style_claims.max_retries
+        and curate_summary.get("enabled") == curate_config.enabled
+        and curate_summary.get("provider") == (curate_config.provider if curate_config.enabled else None)
+        and curate_summary.get("model") == (curate_config.model if curate_config.enabled else None)
+        and curate_summary.get("reasoning_effort") == (
+            curate_config.reasoning_effort if curate_config.enabled else None
+        )
+        and curate_summary.get("prompt_file") == (curate_config.prompt_file if curate_config.enabled else None)
+        and curate_summary.get("prompt_sha256") == curate_prompt_sha
+        and curate_summary.get("max_retries") == (curate_config.max_retries if curate_config.enabled else None)
     )
 
 
@@ -684,21 +1379,41 @@ def _summary_payload(
     context: StageContext,
     chunks: list[Chunk],
     raw_files: list[Path],
+    prompt_sha: str,
+    style_claims: list[StyleClaim],
     claims_before_dedupe: int,
+    claims_after_exact_dedupe: int,
     claims_after_dedupe: int,
+    cleanup_result: _ClaimsCleanupResult,
+    curate_metrics: dict[str, Any],
     legacy_raw_cache_removed_count: int,
 ) -> dict[str, Any]:
+    applies_to_counts: dict[str, int] = {}
+    for claim in style_claims:
+        for value in claim.applies_to:
+            applies_to_counts[value] = applies_to_counts.get(value, 0) + 1
     return {
         "schema_version": _SCHEMA_VERSION,
         "video_id": context.job.video_id,
         "provider": context.config.style_claims.provider,
         "model": context.config.style_claims.model,
         "prompt_file": context.config.style_claims.prompt_file,
+        "prompt_sha256": prompt_sha,
         "max_claims_per_chunk": context.config.style_claims.max_claims_per_chunk,
         "max_retries": context.config.style_claims.max_retries,
         "chunks_count": len(chunks),
         "claims_before_dedupe": claims_before_dedupe,
+        "claims_after_exact_dedupe": claims_after_exact_dedupe,
         "claims_after_dedupe": claims_after_dedupe,
+        "deterministic_cleanup": {
+            "changed_claims_count": cleanup_result.changed_claims_count,
+            "evidence_meta_prefix_cleaned_count": cleanup_result.evidence_meta_prefix_cleaned_count,
+            "homoglyph_cleaned_fields_count": cleanup_result.homoglyph_cleaned_fields_count,
+            "topics_truncated_count": cleanup_result.topics_truncated_count,
+        },
+        "applies_to_counts": dict(sorted(applies_to_counts.items())),
+        "applies_to_unique_count": len(applies_to_counts),
+        "curate": curate_metrics,
         "legacy_raw_cache_removed_count": legacy_raw_cache_removed_count,
         "raw_files_count": len(raw_files),
         "raw_files_sample": [relative_artifact_path(context.paths.job_dir, path) for path in raw_files[:20]],
@@ -1026,6 +1741,8 @@ def _style_claim_content_validation_errors(
             marker = _technical_marker(value, context.job.video_id)
             if marker:
                 errors.append(f"claim {index} field {field_name} contains technical marker {marker!r}")
+            if field_name == "evidence" and _strip_evidence_meta_prefix(value) != value:
+                errors.append(f"claim {index} evidence contains meta prefix")
 
     topic_keys = [_normalize_key(topic) for topic in claim.topics if topic.strip()]
     if topic_keys:
@@ -1169,6 +1886,36 @@ def _log_claim_cache(
     append_text(context.paths.stage_log(Stage13ExtractStyleClaims.name), "\n".join(lines), encoding="utf-8")
 
 
+def _log_claims_curate_cache(
+    context: StageContext,
+    *,
+    cache_path: Path,
+    cache_hit: bool,
+    validation_errors: list[str],
+    analysis: ClaimsCurateResult | None = None,
+) -> None:
+    diagnostics = analysis.diagnostics if analysis is not None else None
+    lines = [
+        "",
+        "[claims-curate-cache]",
+        f"run_id: {context.run_id or '-'}",
+        f"cache_hit: {cache_hit}",
+        f"cache_path: {cache_path}",
+        f"model: {diagnostics.model if diagnostics is not None and diagnostics.model else '-'}",
+        f"request_id: {diagnostics.request_id if diagnostics is not None and diagnostics.request_id else '-'}",
+        f"response_id: {diagnostics.response_id if diagnostics is not None and diagnostics.response_id else '-'}",
+        f"started_at: {diagnostics.started_at if diagnostics is not None and diagnostics.started_at else '-'}",
+        f"finished_at: {diagnostics.finished_at if diagnostics is not None and diagnostics.finished_at else '-'}",
+        f"duration_seconds: {_format_seconds(diagnostics.duration_seconds if diagnostics is not None else None)}",
+        f"validation_errors_count: {len(validation_errors)}",
+        "validation_errors:",
+        *[f"  - {error}" for error in validation_errors[:20]],
+        *([f"  - ... {len(validation_errors) - 20} more"] if len(validation_errors) > 20 else []),
+        "",
+    ]
+    append_text(context.paths.stage_log(Stage13ExtractStyleClaims.name), "\n".join(lines), encoding="utf-8")
+
+
 def _log_legacy_raw_cache_removal(context: StageContext, removed: list[tuple[Path, str]]) -> None:
     lines = [
         "",
@@ -1202,6 +1949,19 @@ def _claims_retry_logger(context: StageContext) -> OnRetry:
             delay_seconds=delay_seconds,
             error=error,
             context_lines=[f"run_id: {context.run_id or '-'}", "operation: claims_extract"],
+        )
+
+    return _log_retry
+
+
+def _claims_curate_retry_logger(context: StageContext) -> OnRetry:
+    def _log_retry(attempt: int, delay_seconds: float, error: BaseException) -> None:
+        log_openai_retry(
+            context.paths.stage_log(Stage13ExtractStyleClaims.name),
+            attempt=attempt,
+            delay_seconds=delay_seconds,
+            error=error,
+            context_lines=[f"run_id: {context.run_id or '-'}", "operation: claims_curate"],
         )
 
     return _log_retry
@@ -1308,6 +2068,10 @@ def _chunk_payload(chunk: Chunk, timeline_events: list[TimelineEvent]) -> dict[s
 
 def _prompt_path(context: StageContext) -> Path:
     return Path(__file__).resolve().parents[1] / "prompts" / context.config.style_claims.prompt_file
+
+
+def _curate_prompt_path(context: StageContext) -> Path:
+    return Path(__file__).resolve().parents[1] / "prompts" / context.config.style_claims.curate.prompt_file
 
 
 def _clean_string(value: object) -> str:

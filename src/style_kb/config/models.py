@@ -106,6 +106,17 @@ class ChunkingConfig(BaseModel):
     max_topics: int = Field(gt=0)
 
 
+class StyleClaimsCurateConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+    provider: str
+    model: str
+    prompt_file: str
+    reasoning_effort: str
+    max_retries: int = Field(gt=0)
+
+
 class StyleClaimsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -114,6 +125,7 @@ class StyleClaimsConfig(BaseModel):
     prompt_file: str
     max_claims_per_chunk: int = Field(ge=0)
     max_retries: int = Field(gt=0)
+    curate: StyleClaimsCurateConfig
 
 
 class ExportConfig(BaseModel):

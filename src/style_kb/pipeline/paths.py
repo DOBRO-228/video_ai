@@ -145,6 +145,9 @@ class JobPaths:
     def stt_speech_segments_raw(self) -> Path:
         return self.stt_dir / "speech_segments_raw.json"
 
+    def stt_speech_segments_raw_attempt(self, attempt: int) -> Path:
+        return self.stt_dir / f"speech_segments_raw_attempt_{attempt:02d}.json"
+
     @property
     def scenes_jsonl(self) -> Path:
         return self.scenes_dir / "scenes.jsonl"
@@ -206,6 +209,10 @@ class JobPaths:
         return self.claims_dir / "style_claims_raw.json"
 
     @property
+    def style_claims_curate_raw(self) -> Path:
+        return self.claims_dir / "style_claims_curate_raw.json"
+
+    @property
     def style_claims_errors(self) -> Path:
         return self.claims_dir / "style_claims_errors.json"
 
@@ -231,6 +238,9 @@ class JobPaths:
     def visual_raw_scene(self, scene_id: str) -> Path:
         return self.visual_raw_dir / f"{scene_id}.json"
 
+    def visual_raw_scene_attempt(self, scene_id: str, attempt: int) -> Path:
+        return self.visual_raw_dir / f"{scene_id}_attempt_{attempt:02d}.json"
+
     def frame_path(self, scene_index: int, image_index: int) -> Path:
         return self.frames_dir / f"scene_{scene_index:06d}_{image_index:02d}.jpg"
 
@@ -239,6 +249,10 @@ class JobPaths:
 
     def style_claims_raw_attempt(self, chunk_id: str, attempt: int) -> Path:
         return self.claims_raw_dir / f"{chunk_id}_attempt_{attempt:02d}.json"
+
+    @property
+    def style_claims_raw_curate(self) -> Path:
+        return self.claims_raw_dir / "curate.json"
 
     def chunk_plan_raw_attempt(self, window_index: int, attempt: int) -> Path:
         return self.chunks_raw_dir / f"chunk_plan_window_{window_index:03d}_attempt_{attempt:02d}.json"

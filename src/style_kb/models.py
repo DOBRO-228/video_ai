@@ -301,6 +301,7 @@ class QualityReport(StrictModel):
     durations: dict[str, float]
     coverage: dict[str, float]
     mismatches: dict[str, float]
+    metrics: dict[str, int] = Field(default_factory=dict)
     warnings: list[str]
     errors: list[str]
     artifacts: dict[str, str]

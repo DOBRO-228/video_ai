@@ -124,16 +124,24 @@ _ADVICE: dict[str, ErrorAdvice] = {
         retryable=True,
         resume_safe_after_fix=True,
         summary="OpenAI semantic segmentation failed after retries.",
-        actions=["Inspect segmenter raw output and stage log.", "Run style-kb resume JOB_ID."],
-        inspect=["jobs/JOB_ID/stt/speech_segments_raw.json", "jobs/JOB_ID/logs/07_build_speech_segments.log"],
+        actions=["Inspect segmenter raw attempt outputs and stage log.", "Run style-kb resume JOB_ID."],
+        inspect=[
+            "jobs/JOB_ID/stt/speech_segments_raw_attempt_*.json",
+            "jobs/JOB_ID/stt/speech_segments_raw.json",
+            "jobs/JOB_ID/logs/07_build_speech_segments.log",
+        ],
     ),
     "openai_segmenter_failed": ErrorAdvice(
         error_code="openai_segmenter_failed",
         retryable=True,
         resume_safe_after_fix=True,
         summary="OpenAI segmenter request failed.",
-        actions=["Inspect the stage log and raw provider artifact.", "Run style-kb resume JOB_ID."],
-        inspect=["jobs/JOB_ID/logs/07_build_speech_segments.log", "jobs/JOB_ID/stt/speech_segments_raw.json"],
+        actions=["Inspect the stage log and raw provider artifacts.", "Run style-kb resume JOB_ID."],
+        inspect=[
+            "jobs/JOB_ID/logs/07_build_speech_segments.log",
+            "jobs/JOB_ID/stt/speech_segments_raw_attempt_*.json",
+            "jobs/JOB_ID/stt/speech_segments_raw.json",
+        ],
     ),
     "openai_vision_failed": ErrorAdvice(
         error_code="openai_vision_failed",

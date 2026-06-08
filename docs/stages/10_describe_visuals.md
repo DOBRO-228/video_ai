@@ -10,7 +10,11 @@ The stage loads scenes, frame refs, and nearby speech segments. It first builds 
 
 Scene analysis runs through `OpenAIVisionClient.describe_scene()` with structured JSON output. Requests are parallelized with `vision.batch_size`. Each request receives only the selected still frames for that scene plus a structured transcript context JSON: `previous_context`, `current_scene_context`, and `next_context`. `current_scene_context` contains speech segments that overlap the scene; adjacent context is boundary orientation only and must not be treated as visual evidence. Raw scene responses are cached under `visual/raw/` and invalidated when prompt inputs or `presenter_profile.json` change.
 
-Scene responses are content-validated before materialization. If a recurring presenter's baseline markers leak into scene-specific fields such as `visual_summary`, `observations`, `items`, `style_topics`, or `notes`, the scene response is retried once with validation feedback. Technical presentation labels such as screen/slides/overlays/camera/shot/background labels are treated the same way, including in free-text scene fields. Cached raw scene responses with the same leakage are treated as invalid cache entries and regenerated. If the retry still leaks polluted content, the stage fails.
+Scene responses are content-validated before materialization. Technical presentation labels such as screen/slides/overlays/camera/shot/background labels are retried once with validation feedback, including in free-text scene fields. If the retry still leaks polluted technical content, the stage accepts the scene with a warning, records metrics, and continues the job.
+
+Each API scene attempt is saved under `visual/raw/{scene_id}_attempt_XX.json`. The accepted response is written to canonical `visual/raw/{scene_id}.json` for cache reuse. Cached raw scene responses with technical leakage are regenerated unless their canonical raw payload was explicitly marked as accepted with warning after retry.
+
+Recurring presenter baseline leakage is tracked as a non-blocking quality metric. If a recurring presenter's baseline markers appear in scene-specific fields such as `visual_summary`, `observations`, `items`, `style_topics`, or `notes`, the stage records counts in metrics and `logs/10_describe_visuals.log`, but does not retry, clean, or fail the scene.
 
 Before writing `VisualEvent`, the stage sanitizes visual lists so final artifacts keep only style-relevant labels. Presentation and video-format labels such as close/medium/general shots, educational format, visual presentation, camera angle, frame, screen text, slides, overlays, and background labels are removed from `items` and `style_topics`. Standalone color words are also dropped when they appear as labels without a style object. Colors are not a separate structured field; important color information should remain attached to concrete visual descriptions such as `visual_summary`, `observations`, or style-relevant topics.
 
@@ -28,20 +32,21 @@ Before writing `VisualEvent`, the stage sanitizes visual lists so final artifact
 - `visual/presenter_profile.json`
 - `visual/visual_events.jsonl`
 - `visual/raw/presenter_profile.raw.json` as diagnostic/cache provider output
-- `visual/raw/{scene_id}.json` as diagnostic/cache provider output
+- `visual/raw/{scene_id}.json` as accepted diagnostic/cache provider output
+- `visual/raw/{scene_id}_attempt_XX.json` as diagnostic provider output for each scene API attempt
 
 ## Skip Validation
 
-The stage can be skipped when `visual_events.jsonl` and `presenter_profile.json` exist, parse successfully, visual event count matches scene count, and final `VisualEvent` fields do not contain blocked baseline or technical presentation leakage.
+The stage can be skipped when `visual_events.jsonl` and `presenter_profile.json` exist, parse successfully, and visual event count matches scene count. Technical presentation leakage and baseline leakage do not block skip; they are reported through stage metrics and the quality report.
 
 ## Important Notes
 
 - Do not add face-recognition dependencies for MVP. Presenter recurrence is detected by OpenAI vision through bootstrap profile plus scene-level classification.
 - `presenter_context` is required on every `VisualEvent`.
-- Recurring presenter baseline should not pollute scene-specific summary/items/topics for any presenter relevance, including `primary_example`.
+- Recurring presenter baseline should not pollute scene-specific summary/items/topics for any presenter relevance, including `primary_example`, but this is a quality signal rather than a stage-failing condition.
 - `items` and `style_topics` must stay useful for menswear knowledge retrieval; technical presentation labels must not reach final timeline or chunk topics/entities.
 - `visual/raw/*` files are diagnostic/cache artifacts. They are retained for reuse and post-mortem analysis, but must not be imported into a future KB or read as style knowledge by agents.
-- Baseline leakage retries and failures must be logged in `logs/10_describe_visuals.log` with scene id, fields, and matched markers.
+- Baseline leakage summary metrics must be logged in `logs/10_describe_visuals.log`; technical presentation leakage retries and accepted warnings must be logged with scene id, fields, matched markers, and raw attempt paths.
 - Keep structured output schemas in sync with Pydantic models.
 
 ## Related Code

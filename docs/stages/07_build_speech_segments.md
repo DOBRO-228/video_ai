@@ -22,7 +22,8 @@ After LLM segmentation, consecutive short segments from the same speaker are mer
 ## Outputs
 
 - `stt/speech_segments.jsonl`
-- `stt/speech_segments_raw.json`
+- `stt/speech_segments_raw.json` for the accepted OpenAI segmentation response
+- `stt/speech_segments_raw_attempt_XX.json` for each OpenAI segmentation attempt
 
 ## Skip Validation
 
@@ -35,7 +36,8 @@ The stage can be skipped when raw segmentation output exists, all speech segment
 - Short speaker-labeled turns may be shorter than `min_segment_seconds`; speaker changes must not be merged just to satisfy a duration floor.
 - `SpeechSegment.speaker` and `SpeechSegment.speaker_role` should represent exactly one speaker turn, not a majority vote across multiple speakers.
 - Do not summarize or rewrite transcript text here.
-- `stt/speech_segments_raw.json` is retained for audit/debugging segmentation output. It is not KB input.
+- `stt/speech_segments_raw.json` is retained for audit/debugging the accepted segmentation output. It is not KB input.
+- Retry attempts write `stt/speech_segments_raw_attempt_XX.json` before semantic-boundary validation, so rejected LLM responses remain inspectable after a later attempt succeeds.
 
 ## Related Code
 

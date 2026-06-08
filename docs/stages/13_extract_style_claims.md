@@ -10,13 +10,18 @@ The stage sends one chunk at a time to OpenAI structured output using `style_cla
 
 Provider output is validated before it can become a cache hit or a final artifact. If a chunk response contains service metadata as style knowledge, technical identifiers in user-facing fields, invalid enums, missing required text, malformed JSON, or too many claims, the stage keeps the attempt raw output at `claims/raw/{chunk_id}_attempt_{attempt}.json`, logs the validation error, records it in `claims/style_claims_errors.json`, emits progress, and retries up to `style_claims.max_retries`. A first successful attempt is written to the canonical per-chunk raw cache only; an identical successful attempt file is removed to avoid duplicate raw artifacts.
 
-After all chunk responses are loaded, the stage performs deterministic exact deduplication by `(claim_type, subject, claim)`. Duplicate claims keep the earliest primary chunk and merge timeline/source/evidence/topic provenance.
+After all chunk responses are loaded, the stage performs deterministic cleanup of obvious presentation artifacts in user-facing fields, including evidence source prefixes such as `В chunk:`/`On-screen:` and Latin homoglyphs inside Cyrillic words. It does not enforce a closed `applies_to` taxonomy; the summary records observed `applies_to` counts so a stable vocabulary can be chosen later from real jobs.
+
+The stage then performs deterministic exact deduplication by `(claim_type, subject, claim)`. Duplicate claims keep the earliest primary chunk and merge timeline/source/evidence/topic provenance.
+
+When `style_claims.curate.enabled` is true, a single post-deduplication curation request is sent using `style_claims_curate_ru.txt` with the configured `style_claims.curate.reasoning_effort` value. The curator is decisions-only: it may mark safe semantic duplicates, revise confidence, and flag split/rewrite/`applies_to` notes for audit. It must not generate new claims or rewrite canonical claim text. Python applies only safe decisions: valid same-`claim_type` semantic merges and confidence revisions. Split suggestions, rewrite suggestions, confidence reasons, and `applies_to` notes remain audit-only.
 
 ## Inputs
 
 - `timeline/timeline_events.jsonl`
 - `chunks/chunks.jsonl`
 - `src/style_kb/prompts/style_claims_ru.txt`
+- `src/style_kb/prompts/style_claims_curate_ru.txt` when curation is enabled
 - `style_claims.*` config values
 - `OPENAI_API_KEY`
 
@@ -24,28 +29,33 @@ After all chunk responses are loaded, the stage performs deterministic exact ded
 
 - `claims/style_claims.jsonl`
 - `claims/style_claims_raw.json`
+- `claims/style_claims_curate_raw.json` when curation is enabled
 - `claims/raw/{chunk_id}.json`
+- `claims/raw/curate.json` when curation is enabled
 - `claims/raw/{chunk_id}_attempt_{attempt}.json` for invalid or regenerated API attempts
 - `claims/style_claims_errors.json` while invalid attempts or a final retry failure exist
 
 ## Skip Validation
 
-The stage can be skipped when `style_claims.jsonl` parses as `StyleClaim`, `style_claims_raw.json` matches the current provider/model/prompt/max-claims/max-retries config, claim ids are deterministic, each claim is grounded to known chunks/timeline events, no exact duplicate claims remain, and no user-facing claim field leaks service metadata or technical ids.
+The stage can be skipped when `style_claims.jsonl` parses as `StyleClaim`, `style_claims_raw.json` matches the current provider/model/prompt hash/max-claims/max-retries and curation config/reasoning effort/prompt hash, required curation audit artifacts exist when enabled, claim ids are deterministic, each claim is grounded to known chunks/timeline events, no exact duplicate claims remain, and no user-facing claim field leaks service metadata, technical ids, or evidence meta-prefixes.
 
 ## Important Notes
 
 - Empty claim output is allowed for non-educational chunks, but quality report warns when the whole video has no claims or most chunks have none.
 - Do not silently convert invalid provider output to zero claims. Invalid chunk responses must retry/regenerate with logs and diagnostic artifacts, then fail the stage if all attempts remain invalid.
-- Canonical per-chunk raw cache files use schema version 2. Older canonical raw cache files are deleted automatically at the start of stage 13; non-duplicate attempt files are left intact and new retries use the next available attempt number.
+- Canonical per-chunk raw cache files use schema version 3. Older canonical raw cache files are deleted automatically at the start of stage 13; non-duplicate attempt files are left intact and new retries use the next available attempt number.
 - `claims/raw/*` files are diagnostic/cache artifacts. They are retained for reuse and post-mortem analysis, but must not be imported into a future KB or read as style knowledge by agents.
 - `claims/style_claims_raw.json` records counts and small relative-path samples, not a full absolute-path inventory.
+- `claims/style_claims_curate_raw.json` is an audit artifact only. It records decisions, confidence reasons, split/rewrite suggestions, and ignored invalid decisions; it must not be imported as style knowledge.
 - Python attaches `chunk_id`, `timeline_event_ids`, `timestamp_url`, and `source_refs` to accepted claims. The model must not output those as claim content.
 - Claims must remain normalized Russian knowledge objects with timestamp/source grounding.
+- Curation intentionally does not auto-split or auto-rewrite canonical claims in the MVP. Those suggestions are collected for later analysis across multiple jobs.
 - Do not add CLI controls for claim extraction.
 
 ## Related Code
 
 - `src/style_kb/stages/stage_13_extract_style_claims.py`
 - `src/style_kb/clients/openai_claims.py`
+- `src/style_kb/clients/openai_claims_curate.py`
 - `src/style_kb/prompts/style_claims_ru.txt`
 - `src/style_kb/models.py::StyleClaim`
