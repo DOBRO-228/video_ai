@@ -218,6 +218,7 @@ class Stage13ExtractStyleClaims(Stage):
             context.paths.timeline_events_jsonl,
             context.paths.chunks_jsonl,
             _prompt_path(context),
+            _retry_advisor_prompt_path(context),
         ]
         if context.config.style_claims.curate.enabled:
             inputs.append(_curate_prompt_path(context))
@@ -251,10 +252,13 @@ class Stage13ExtractStyleClaims(Stage):
             context.paths.style_claims_errors.unlink()
 
         prompt_text = _prompt_path(context).read_text(encoding="utf-8")
+        retry_advisor_prompt_text = _retry_advisor_prompt_path(context).read_text(encoding="utf-8")
         prompt_sha = _sha256_text(prompt_text)
+        retry_advisor_prompt_sha = _sha256_text(retry_advisor_prompt_text)
         timeline_events = load_timeline_events(context.paths.timeline_events_jsonl)
         event_map = {event.event_id: event for event in timeline_events}
         client: OpenAIClaimsClient | None = None
+        advisor_client: OpenAIClaimsClient | None = None
         all_candidates: list[StyleClaim] = []
         canonical_raw_files: list[Path] = []
         raw_output_files: list[Path] = []
@@ -277,7 +281,13 @@ class Stage13ExtractStyleClaims(Stage):
                 )
             chunk_events = [event_map[event_id] for event_id in chunk.timeline_event_ids if event_id in event_map]
             chunk_payload = _chunk_payload(chunk, chunk_events)
-            request_metadata = _request_metadata(context, chunk, chunk_payload, prompt_sha)
+            request_metadata = _request_metadata(
+                context,
+                chunk,
+                chunk_payload,
+                prompt_sha,
+                retry_advisor_prompt_sha,
+            )
             raw_path = context.paths.style_claims_raw_chunk(chunk.chunk_id)
             chunk_result = _load_cached_chunk_result(raw_path, request_metadata, chunk, context)
             if chunk_result is None:
@@ -287,13 +297,21 @@ class Stage13ExtractStyleClaims(Stage):
                         model=context.config.style_claims.model,
                         on_retry=_claims_retry_logger(context),
                     )
+                if advisor_client is None:
+                    advisor_client = OpenAIClaimsClient(
+                        os.environ.get("OPENAI_API_KEY"),
+                        model=context.config.style_claims.retry_advisor_model,
+                        on_retry=_claims_retry_logger(context),
+                    )
                 chunk_result = _extract_chunk_claims_with_retries(
                     context=context,
                     client=client,
+                    advisor_client=advisor_client,
                     chunk=chunk,
                     chunk_payload=chunk_payload,
                     request_metadata=request_metadata,
                     system_prompt=prompt_text,
+                    retry_advisor_prompt_text=retry_advisor_prompt_text,
                     canonical_raw_path=raw_path,
                     claim_errors=claim_errors,
                 )
@@ -324,6 +342,7 @@ class Stage13ExtractStyleClaims(Stage):
             chunks=chunks,
             raw_files=canonical_raw_files,
             prompt_sha=prompt_sha,
+            retry_advisor_prompt_sha=retry_advisor_prompt_sha,
             style_claims=style_claims,
             claims_before_dedupe=len(all_candidates),
             claims_after_exact_dedupe=len(style_claims_after_exact_dedupe),
@@ -1344,6 +1363,10 @@ def _summary_matches_config(summary: dict[str, Any], context: StageContext) -> b
     if not prompt_path.exists():
         return False
     prompt_sha = _sha256_text(prompt_path.read_text(encoding="utf-8"))
+    retry_advisor_prompt_path = _retry_advisor_prompt_path(context)
+    if not retry_advisor_prompt_path.exists():
+        return False
+    retry_advisor_prompt_sha = _sha256_text(retry_advisor_prompt_path.read_text(encoding="utf-8"))
     curate_config = context.config.style_claims.curate
     if curate_config.enabled:
         curate_prompt_path = _curate_prompt_path(context)
@@ -1358,8 +1381,11 @@ def _summary_matches_config(summary: dict[str, Any], context: StageContext) -> b
         and summary.get("video_id") == context.job.video_id
         and summary.get("provider") == context.config.style_claims.provider
         and summary.get("model") == context.config.style_claims.model
+        and summary.get("retry_advisor_model") == context.config.style_claims.retry_advisor_model
         and summary.get("prompt_file") == context.config.style_claims.prompt_file
         and summary.get("prompt_sha256") == prompt_sha
+        and summary.get("retry_advisor_prompt_file") == context.config.style_claims.retry_advisor_prompt_file
+        and summary.get("retry_advisor_prompt_sha256") == retry_advisor_prompt_sha
         and summary.get("max_claims_per_chunk") == context.config.style_claims.max_claims_per_chunk
         and summary.get("max_retries") == context.config.style_claims.max_retries
         and curate_summary.get("enabled") == curate_config.enabled
@@ -1380,6 +1406,7 @@ def _summary_payload(
     chunks: list[Chunk],
     raw_files: list[Path],
     prompt_sha: str,
+    retry_advisor_prompt_sha: str,
     style_claims: list[StyleClaim],
     claims_before_dedupe: int,
     claims_after_exact_dedupe: int,
@@ -1397,8 +1424,11 @@ def _summary_payload(
         "video_id": context.job.video_id,
         "provider": context.config.style_claims.provider,
         "model": context.config.style_claims.model,
+        "retry_advisor_model": context.config.style_claims.retry_advisor_model,
         "prompt_file": context.config.style_claims.prompt_file,
         "prompt_sha256": prompt_sha,
+        "retry_advisor_prompt_file": context.config.style_claims.retry_advisor_prompt_file,
+        "retry_advisor_prompt_sha256": retry_advisor_prompt_sha,
         "max_claims_per_chunk": context.config.style_claims.max_claims_per_chunk,
         "max_retries": context.config.style_claims.max_retries,
         "chunks_count": len(chunks),
@@ -1502,15 +1532,19 @@ def _extract_chunk_claims_with_retries(
     *,
     context: StageContext,
     client: OpenAIClaimsClient,
+    advisor_client: OpenAIClaimsClient,
     chunk: Chunk,
     chunk_payload: dict[str, Any],
     request_metadata: dict[str, Any],
     system_prompt: str,
+    retry_advisor_prompt_text: str,
     canonical_raw_path: Path,
     claim_errors: list[dict[str, Any]],
 ) -> _ChunkClaimsResult:
     retry_feedback: list[str] = []
+    retry_advisor_instruction: str | None = None
     attempt_files: list[Path] = []
+    advisor_files: list[Path] = []
     max_retries = context.config.style_claims.max_retries
     first_raw_attempt = _next_claim_raw_attempt_number(context, chunk)
     for attempt in range(1, max_retries + 1):
@@ -1547,7 +1581,11 @@ def _extract_chunk_claims_with_retries(
             analysis = client.extract_claims(
                 system_prompt=system_prompt,
                 chunk_payload=chunk_payload,
-                constraints_payload=_constraints_payload(context, retry_feedback),
+                constraints_payload=_constraints_payload(
+                    context,
+                    retry_feedback,
+                    retry_advisor_instruction=retry_advisor_instruction,
+                ),
                 request_metadata=request_metadata,
                 raw_output_path=attempt_path,
                 max_claims_per_chunk=context.config.style_claims.max_claims_per_chunk,
@@ -1621,7 +1659,11 @@ def _extract_chunk_claims_with_retries(
             )
             return _ChunkClaimsResult(
                 claims=claims,
-                raw_files=[canonical_raw_path, *[path for path in attempt_files if path.exists()]],
+                raw_files=[
+                    canonical_raw_path,
+                    *[path for path in attempt_files if path.exists()],
+                    *[path for path in advisor_files if path.exists()],
+                ],
                 input_tokens=analysis.usage["input_tokens"],
                 output_tokens=analysis.usage["output_tokens"],
                 reasoning_tokens=analysis.usage["reasoning_tokens"],
@@ -1629,6 +1671,25 @@ def _extract_chunk_claims_with_retries(
                 cache_hit=False,
                 diagnostics=analysis.diagnostics.with_updates(raw_output_path=str(canonical_raw_path)),
             )
+
+        advisor_raw_output_path: Path | None = None
+        advisor_instruction: str | None = None
+        if attempt < max_retries:
+            advisor_raw_output_path = context.paths.style_claims_retry_advice_attempt(chunk.chunk_id, raw_attempt)
+            advisor_instruction = _build_claims_retry_advice(
+                context=context,
+                advisor_client=advisor_client,
+                system_prompt=retry_advisor_prompt_text,
+                chunk=chunk,
+                chunk_payload=chunk_payload,
+                analysis=analysis,
+                validation_errors=validation_errors,
+                structured_errors=structured_validation_errors,
+                raw_output_path=advisor_raw_output_path,
+            )
+            retry_advisor_instruction = advisor_instruction
+            if advisor_raw_output_path.exists():
+                advisor_files.append(advisor_raw_output_path)
 
         error_entry = _claim_error_entry(
             context,
@@ -1641,6 +1702,8 @@ def _extract_chunk_claims_with_retries(
             structured_errors=structured_validation_errors,
             raw_output_path=attempt_path,
             analysis=analysis,
+            retry_advisor_raw_output_path=advisor_raw_output_path,
+            retry_advisor_instruction=advisor_instruction,
         )
         claim_errors.append(error_entry)
         _write_claim_errors(context, claim_errors)
@@ -1673,7 +1736,7 @@ def _extract_chunk_claims_with_retries(
             f"{'retry' if attempt < max_retries else 'failed'} chunk={chunk.chunk_id} "
             f"attempt={attempt}/{max_retries} error_code={error_code}: {validation_errors[0]}",
         )
-        retry_feedback = validation_errors
+        retry_feedback = _claims_retry_feedback(validation_errors, advisor_instruction)
 
     raise ProviderError(
         f"OpenAI claims response for chunk {chunk.chunk_id} stayed invalid after {max_retries} attempts",
@@ -1764,6 +1827,8 @@ def _claim_error_entry(
     structured_errors: list[dict[str, Any]],
     raw_output_path: Path,
     analysis: ClaimsAnalysisResult | None = None,
+    retry_advisor_raw_output_path: Path | None = None,
+    retry_advisor_instruction: str | None = None,
 ) -> dict[str, Any]:
     return {
         "schema_version": _SCHEMA_VERSION,
@@ -1777,8 +1842,91 @@ def _claim_error_entry(
         "errors": validation_errors,
         "structured_errors": structured_errors,
         "raw_output": str(raw_output_path) if raw_output_path.exists() else None,
+        "retry_advisor_raw_output": (
+            str(retry_advisor_raw_output_path)
+            if retry_advisor_raw_output_path is not None and retry_advisor_raw_output_path.exists()
+            else None
+        ),
+        "retry_advisor_instruction": retry_advisor_instruction,
         "diagnostics": analysis.diagnostics.to_dict() if analysis is not None else None,
     }
+
+
+def _build_claims_retry_advice(
+    *,
+    context: StageContext,
+    advisor_client: OpenAIClaimsClient,
+    system_prompt: str,
+    chunk: Chunk,
+    chunk_payload: dict[str, Any],
+    analysis: ClaimsAnalysisResult | None,
+    validation_errors: list[str],
+    structured_errors: list[dict[str, Any]],
+    raw_output_path: Path,
+) -> str | None:
+    repair_payload = {
+        "video_id": context.job.video_id,
+        "chunk_id": chunk.chunk_id,
+        "main_model": context.config.style_claims.model,
+        "retry_advisor_model": context.config.style_claims.retry_advisor_model,
+        "constraints": {
+            "max_claims_per_chunk": context.config.style_claims.max_claims_per_chunk,
+            "claim_types": ClaimType.values(),
+            "confidence_levels": ConfidenceLevel.values(),
+            "forbidden_content": [
+                "chunk_id",
+                "event_id",
+                "timeline_event_ids",
+                "source_refs",
+                "timestamp_url",
+                "video_id",
+                "schema",
+                "metadata",
+                "provenance",
+                "grounding",
+            ],
+        },
+        "validation_errors": validation_errors[:30],
+        "structured_errors": structured_errors[:30],
+        "candidate_payload": analysis.payload if analysis is not None else None,
+        "chunk_payload": chunk_payload,
+    }
+    try:
+        advisor_payload = advisor_client.analyze_claim_errors(
+            system_prompt=system_prompt,
+            repair_payload=repair_payload,
+            raw_output_path=raw_output_path,
+        )
+    except ProviderError as error:
+        _log_claim_retry_advisor_failure(context, chunk=chunk, raw_output_path=raw_output_path, error=error)
+        return None
+
+    instruction = str(advisor_payload.get("repair_instruction") or "").strip()
+    if not instruction:
+        _log_claim_retry_advisor_failure(
+            context,
+            chunk=chunk,
+            raw_output_path=raw_output_path,
+            error=ProviderError(
+                "OpenAI claims retry advisor returned an empty repair instruction",
+                error_code="openai_claims_retry_advisor_empty_instruction",
+            ),
+        )
+        return None
+
+    _log_claim_retry_advisor_success(
+        context,
+        chunk=chunk,
+        raw_output_path=raw_output_path,
+        advisor_payload=advisor_payload,
+    )
+    return instruction
+
+
+def _claims_retry_feedback(validation_errors: list[str], advisor_instruction: str | None) -> list[str]:
+    if not advisor_instruction:
+        return validation_errors
+    return [*validation_errors, f"retry_advisor_instruction: {advisor_instruction}"]
 
 
 def _write_claim_errors(context: StageContext, errors: list[dict[str, Any]]) -> None:
@@ -1838,6 +1986,50 @@ def _log_claim_attempt(
             f" preview={entry.get('preview', '-')}"
             for entry in structured_errors[:5]
         ],
+        "",
+    ]
+    append_text(context.paths.stage_log(Stage13ExtractStyleClaims.name), "\n".join(lines), encoding="utf-8")
+
+
+def _log_claim_retry_advisor_success(
+    context: StageContext,
+    *,
+    chunk: Chunk,
+    raw_output_path: Path,
+    advisor_payload: dict[str, Any],
+) -> None:
+    lines = [
+        "",
+        "[claims-retry-advisor]",
+        f"run_id: {context.run_id or '-'}",
+        f"chunk_id: {chunk.chunk_id}",
+        f"raw_output_path: {raw_output_path}",
+        f"error_summary: {advisor_payload.get('error_summary') or ''}",
+        f"repair_instruction: {advisor_payload.get('repair_instruction') or ''}",
+    ]
+    hard_rules = advisor_payload.get("hard_rules")
+    if isinstance(hard_rules, list):
+        lines.append("hard_rules:")
+        lines.extend(f"  - {rule}" for rule in hard_rules[:10])
+    lines.append("")
+    append_text(context.paths.stage_log(Stage13ExtractStyleClaims.name), "\n".join(lines), encoding="utf-8")
+
+
+def _log_claim_retry_advisor_failure(
+    context: StageContext,
+    *,
+    chunk: Chunk,
+    raw_output_path: Path,
+    error: ProviderError,
+) -> None:
+    lines = [
+        "",
+        "[claims-retry-advisor-failed]",
+        f"run_id: {context.run_id or '-'}",
+        f"chunk_id: {chunk.chunk_id}",
+        f"raw_output_path: {raw_output_path}",
+        f"error_code: {error.error_code}",
+        f"error: {error}",
         "",
     ]
     append_text(context.paths.stage_log(Stage13ExtractStyleClaims.name), "\n".join(lines), encoding="utf-8")
@@ -1993,6 +2185,7 @@ def _request_metadata(
     chunk: Chunk,
     chunk_payload: dict[str, Any],
     prompt_sha: str,
+    retry_advisor_prompt_sha: str,
 ) -> dict[str, Any]:
     return {
         "schema_version": _SCHEMA_VERSION,
@@ -2000,18 +2193,27 @@ def _request_metadata(
         "chunk_id": chunk.chunk_id,
         "provider": context.config.style_claims.provider,
         "model": context.config.style_claims.model,
+        "retry_advisor_model": context.config.style_claims.retry_advisor_model,
         "prompt_file": context.config.style_claims.prompt_file,
         "prompt_sha256": prompt_sha,
+        "retry_advisor_prompt_file": context.config.style_claims.retry_advisor_prompt_file,
+        "retry_advisor_prompt_sha256": retry_advisor_prompt_sha,
         "max_claims_per_chunk": context.config.style_claims.max_claims_per_chunk,
         "max_retries": context.config.style_claims.max_retries,
         "input_fingerprint": _fingerprint(chunk_payload),
     }
 
 
-def _constraints_payload(context: StageContext, retry_feedback: list[str] | None = None) -> dict[str, Any]:
+def _constraints_payload(
+    context: StageContext,
+    retry_feedback: list[str] | None = None,
+    *,
+    retry_advisor_instruction: str | None = None,
+) -> dict[str, Any]:
     payload = {
         "output_language": "ru",
         "max_claims_per_chunk": context.config.style_claims.max_claims_per_chunk,
+        "retry_advisor_model": context.config.style_claims.retry_advisor_model,
         "claim_types": ClaimType.values(),
         "grounding_is_added_by_python": [
             "chunk_id",
@@ -2029,6 +2231,8 @@ def _constraints_payload(context: StageContext, retry_feedback: list[str] | None
     }
     if retry_feedback:
         payload["retry_feedback"] = retry_feedback
+    if retry_advisor_instruction:
+        payload["retry_advisor_instruction"] = retry_advisor_instruction
     return payload
 
 
@@ -2068,6 +2272,10 @@ def _chunk_payload(chunk: Chunk, timeline_events: list[TimelineEvent]) -> dict[s
 
 def _prompt_path(context: StageContext) -> Path:
     return Path(__file__).resolve().parents[1] / "prompts" / context.config.style_claims.prompt_file
+
+
+def _retry_advisor_prompt_path(context: StageContext) -> Path:
+    return Path(__file__).resolve().parents[1] / "prompts" / context.config.style_claims.retry_advisor_prompt_file
 
 
 def _curate_prompt_path(context: StageContext) -> Path:

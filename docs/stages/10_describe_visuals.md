@@ -8,7 +8,9 @@ Describe visual content for every scene and produce structured `VisualEvent` obj
 
 The stage loads scenes, frame refs, and nearby speech segments. It first builds or reuses a presenter profile from representative frames when `vision.presenter_bootstrap_enabled=true`. The scene prompt is then composed from `visual_menswear_ru.txt` plus the serialized presenter profile.
 
-Scene analysis runs through `OpenAIVisionClient.describe_scene()` with structured JSON output. Requests are parallelized with `vision.batch_size`. Each request receives only the selected still frames for that scene plus a structured transcript context JSON: `previous_context`, `current_scene_context`, and `next_context`. `current_scene_context` contains speech segments that overlap the scene; adjacent context is boundary orientation only and must not be treated as visual evidence. Raw scene responses are cached under `visual/raw/` and invalidated when prompt inputs or `presenter_profile.json` change.
+Scene analysis runs through the configured vision provider client with structured JSON output. The current default is `vision.provider=openai`, `vision.model=gpt-5-nano`, and `vision.detail=high`. Gemini remains implemented and can be enabled in `default.yaml` when billing is available. There is no automatic provider fallback. A provider/API error fails the stage and the job should be resumed after fixing the environment or provider issue.
+
+Requests are parallelized with `vision.batch_size`. Each request receives only the selected still frames for that scene plus a structured transcript context JSON: `previous_context`, `current_scene_context`, and `next_context`. `current_scene_context` contains speech segments that overlap the scene; adjacent context is boundary orientation only and must not be treated as visual evidence. Raw scene responses are cached under `visual/raw/` and invalidated when prompt inputs, `presenter_profile.json`, provider, model, media/detail settings, thinking level, or output schema change.
 
 Scene responses are content-validated before materialization. Technical presentation labels such as screen/slides/overlays/camera/shot/background labels are retried once with validation feedback, including in free-text scene fields. If the retry still leaks polluted technical content, the stage accepts the scene with a warning, records metrics, and continues the job.
 
@@ -25,7 +27,8 @@ Before writing `VisualEvent`, the stage sanitizes visual lists so final artifact
 - `stt/speech_segments.jsonl`
 - `src/style_kb/prompts/visual_menswear_ru.txt`
 - `src/style_kb/prompts/presenter_profile_ru.txt`
-- `OPENAI_API_KEY`
+- `GEMINI_API_KEY` when `vision.provider=gemini`
+- `OPENAI_API_KEY` when `vision.provider=openai`
 
 ## Outputs
 
@@ -41,7 +44,7 @@ The stage can be skipped when `visual_events.jsonl` and `presenter_profile.json`
 
 ## Important Notes
 
-- Do not add face-recognition dependencies for MVP. Presenter recurrence is detected by OpenAI vision through bootstrap profile plus scene-level classification.
+- Do not add face-recognition dependencies for MVP. Presenter recurrence is detected by the configured vision provider through bootstrap profile plus scene-level classification.
 - `presenter_context` is required on every `VisualEvent`.
 - Recurring presenter baseline should not pollute scene-specific summary/items/topics for any presenter relevance, including `primary_example`, but this is a quality signal rather than a stage-failing condition.
 - `items` and `style_topics` must stay useful for menswear knowledge retrieval; technical presentation labels must not reach final timeline or chunk topics/entities.
@@ -53,6 +56,7 @@ The stage can be skipped when `visual_events.jsonl` and `presenter_profile.json`
 
 - `src/style_kb/stages/stage_10_describe_visuals.py`
 - `src/style_kb/clients/openai_vision.py`
+- `src/style_kb/clients/gemini_vision.py`
 - `src/style_kb/prompts/visual_menswear_ru.txt`
 - `src/style_kb/prompts/presenter_profile_ru.txt`
 - `src/style_kb/models.py::VisualEvent`

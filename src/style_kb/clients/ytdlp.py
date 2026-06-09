@@ -140,10 +140,7 @@ def download_video_proxy(
     with tempfile.TemporaryDirectory(dir=destination.parent) as temp_dir_name:
         temp_dir = Path(temp_dir_name)
         template = temp_dir / "video.%(ext)s"
-        format_selector = (
-            f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]"
-            f"/best[height<={height}][ext=mp4]/best[height<={height}]"
-        )
+        format_selector = _video_proxy_format_selector(height)
         args = _base_args(cookies_from_browser) + [
             "-f",
             format_selector,
@@ -169,6 +166,21 @@ def download_video_proxy(
         if not candidates:
             raise FileNotFoundError(f"yt-dlp produced no video file in {temp_dir}")
         candidates[0].replace(destination)
+
+
+def _video_proxy_format_selector(height: int) -> str:
+    h264_mp4_filter = f"[height<={height}][ext=mp4][vcodec^=avc1]"
+    generic_mp4_filter = f"[height<={height}][ext=mp4]"
+    generic_filter = f"[height<={height}]"
+    return (
+        f"bestvideo{h264_mp4_filter}+bestaudio[ext=m4a]"
+        f"/bestvideo{h264_mp4_filter}"
+        f"/best{h264_mp4_filter}"
+        f"/bestvideo{generic_mp4_filter}+bestaudio[ext=m4a]"
+        f"/bestvideo{generic_mp4_filter}"
+        f"/best{generic_mp4_filter}"
+        f"/best{generic_filter}"
+    )
 
 
 def ensure_ytdlp_ready(

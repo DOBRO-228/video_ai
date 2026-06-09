@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import json
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -10,95 +9,13 @@ from openai import OpenAI
 
 from style_kb.clients._retry import OnRetry, RetryPolicy, call_with_retry
 from style_kb.clients.provider_diagnostics import (
-    ProviderCallDiagnostics,
     cached_openai_diagnostics,
     openai_response_diagnostics,
     start_operation,
 )
+from style_kb.clients.vision import PRESENTER_PROFILE_SCHEMA, VISUAL_RESPONSE_SCHEMA, VisionAnalysisResult
 from style_kb.errors import MissingApiKeyError, ProviderError
-from style_kb.models import ConfidenceLevel, PresenterRelevance, PresenterRole
 from style_kb.utils.files import read_json, write_json_atomic
-
-PRESENTER_CONTEXT_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "present": {"type": "boolean"},
-        "role": {"type": "string", "enum": PresenterRole.values()},
-        "is_recurring": {"type": "boolean"},
-        "relevance": {"type": "string", "enum": PresenterRelevance.values()},
-        "baseline_summary": {"type": "string"},
-        "scene_deltas": {"type": "array", "items": {"type": "string"}},
-        "narrative_brief": {"type": "string"},
-        "confidence": {"type": "string", "enum": ConfidenceLevel.values()},
-    },
-    "required": [
-        "present",
-        "role",
-        "is_recurring",
-        "relevance",
-        "baseline_summary",
-        "scene_deltas",
-        "narrative_brief",
-        "confidence",
-    ],
-}
-
-VISUAL_RESPONSE_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "visual_summary": {"type": "string"},
-        "observations": {"type": "array", "items": {"type": "string"}},
-        "interpretations": {"type": "array", "items": {"type": "string"}},
-        "on_screen_text": {"type": "array", "items": {"type": "string"}},
-        "items": {"type": "array", "items": {"type": "string"}},
-        "style_topics": {"type": "array", "items": {"type": "string"}},
-        "confidence": {"type": "string", "enum": ConfidenceLevel.values()},
-        "notes": {"type": "string"},
-        "presenter_context": PRESENTER_CONTEXT_SCHEMA,
-    },
-    "required": [
-        "visual_summary",
-        "observations",
-        "interpretations",
-        "on_screen_text",
-        "items",
-        "style_topics",
-        "confidence",
-        "notes",
-        "presenter_context",
-    ],
-}
-
-PRESENTER_PROFILE_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "has_primary_presenter": {"type": "boolean"},
-        "confidence": {"type": "string", "enum": ConfidenceLevel.values()},
-        "baseline_summary": {"type": "string"},
-        "recurring_visual_markers": {"type": "array", "items": {"type": "string"}},
-        "notes": {"type": "string"},
-    },
-    "required": [
-        "has_primary_presenter",
-        "confidence",
-        "baseline_summary",
-        "recurring_visual_markers",
-        "notes",
-    ],
-}
-
-
-@dataclass(slots=True)
-class VisionAnalysisResult:
-    payload: dict[str, Any]
-    raw_payload: dict[str, Any]
-    usage: dict[str, int]
-    model: str | None
-    remote_duration_seconds: float | None
-    diagnostics: ProviderCallDiagnostics
 
 
 class OpenAIVisionClient:
@@ -126,9 +43,11 @@ class OpenAIVisionClient:
         system_prompt: str,
         transcript_context: dict[str, Any],
         image_paths: list[Path],
-        detail: str,
+        detail: str | None,
         raw_output_path: Path,
     ) -> VisionAnalysisResult:
+        if not detail:
+            raise ProviderError("OpenAI vision detail is required", error_code="openai_vision_detail_missing")
         transcript_context_json = json.dumps(transcript_context, ensure_ascii=False, indent=2, sort_keys=True)
         content: list[dict[str, Any]] = [
             {
@@ -157,9 +76,11 @@ class OpenAIVisionClient:
         *,
         system_prompt: str,
         image_paths: list[Path],
-        detail: str,
+        detail: str | None,
         raw_output_path: Path,
     ) -> VisionAnalysisResult:
+        if not detail:
+            raise ProviderError("OpenAI vision detail is required", error_code="openai_vision_detail_missing")
         content: list[dict[str, Any]] = [{"type": "input_text", "text": system_prompt.strip()}]
         content.extend(_image_content(image_paths, detail=detail))
         return self._create_structured_response(

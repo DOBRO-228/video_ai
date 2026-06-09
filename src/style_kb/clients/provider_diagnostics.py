@@ -10,6 +10,7 @@ from typing import Any
 
 class ProviderName(StrEnum):
     OPENAI = "openai"
+    GEMINI = "gemini"
     SONIOX = "soniox"
 
 
@@ -126,6 +127,42 @@ def cached_openai_diagnostics(
     )
 
 
+def gemini_response_diagnostics(
+    response: Any,
+    raw_payload: dict[str, Any],
+    *,
+    timer: OperationTimer,
+    raw_output_path: Path,
+    model: str | None,
+) -> ProviderCallDiagnostics:
+    finished_at, duration_seconds = finish_operation(timer)
+    return ProviderCallDiagnostics(
+        provider=ProviderName.GEMINI,
+        model=_string_or_none(raw_payload.get("model_version") or raw_payload.get("modelVersion")) or model,
+        raw_output_path=str(raw_output_path),
+        request_id=_string_or_none(getattr(response, "_request_id", None)),
+        response_id=_string_or_none(raw_payload.get("response_id") or raw_payload.get("responseId")),
+        started_at=timer.started_at,
+        finished_at=finished_at,
+        duration_seconds=round(duration_seconds, 6),
+    )
+
+
+def cached_gemini_diagnostics(
+    raw_payload: dict[str, Any],
+    *,
+    model: str | None,
+    usage: dict[str, int],
+) -> ProviderCallDiagnostics:
+    diagnostics = raw_payload.get("_style_kb_diagnostics")
+    return ProviderCallDiagnostics.from_mapping(
+        diagnostics if isinstance(diagnostics, dict) else {},
+        provider=ProviderName.GEMINI,
+        model=model,
+        usage=usage,
+    )
+
+
 def request_id_from_error(error: BaseException) -> str | None:
     for current in _exception_chain(error):
         request_id = _string_or_none(getattr(current, "request_id", None) or getattr(current, "_request_id", None))
@@ -135,7 +172,14 @@ def request_id_from_error(error: BaseException) -> str | None:
         headers = getattr(response, "headers", None)
         if not headers:
             continue
-        for name in ("x-request-id", "request-id", "openai-request-id", "x-stainless-request-id"):
+        for name in (
+            "x-request-id",
+            "request-id",
+            "openai-request-id",
+            "x-stainless-request-id",
+            "x-goog-request-id",
+            "x-google-request-id",
+        ):
             header_value = _header_value(headers, name)
             if header_value is not None:
                 return header_value

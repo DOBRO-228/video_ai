@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import hashlib
 from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -12,7 +13,9 @@ from time import perf_counter
 
 from style_kb.clients._retry import OnRetry
 from style_kb.clients.provider_diagnostics import ProviderCallDiagnostics, ProviderName
-from style_kb.clients.openai_vision import OpenAIVisionClient, VisionAnalysisResult, load_cached_visual_result
+from style_kb.clients.gemini_vision import GeminiVisionClient, load_cached_gemini_visual_result
+from style_kb.clients.openai_vision import OpenAIVisionClient, load_cached_visual_result as load_cached_openai_visual_result
+from style_kb.clients.vision import PRESENTER_PROFILE_SCHEMA, VISUAL_RESPONSE_SCHEMA, VisionAnalysisResult
 from style_kb.diagnostics import PipelineEvent
 from style_kb.errors import StageExecutionError
 from style_kb.models import (
@@ -49,6 +52,7 @@ from style_kb.utils.time import build_timestamp_url
 _SCENE_CONTENT_MAX_ATTEMPTS = 2
 _CONTENT_VALIDATION_METADATA_KEY = "_style_kb_content_validation"
 _CONTENT_VALIDATION_ACCEPTED_WITH_WARNING = "accepted_with_warning"
+_REQUEST_METADATA_KEY = "_style_kb_request"
 _BASELINE_LEAKAGE_MARKER_THRESHOLD = 1
 _BASELINE_LEAKAGE_FIELDS = (
     "visual_summary",
@@ -321,7 +325,6 @@ class Stage10DescribeVisuals(Stage):
 
         if pending_tasks:
             max_workers = max(1, context.config.vision.batch_size)
-            api_key = os.environ.get("OPENAI_API_KEY")
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_map = {
                     executor.submit(
@@ -329,9 +332,6 @@ class Stage10DescribeVisuals(Stage):
                         context=context,
                         task=task,
                         system_prompt=scene_prompt,
-                        detail=context.config.vision.detail,
-                        api_key=api_key,
-                        model=context.config.vision.model,
                         on_retry=_scene_retry_logger(context, task),
                     ): task
                     for task in pending_tasks
@@ -441,16 +441,17 @@ def _load_or_build_presenter_profile(
         raise StageExecutionError("presenter bootstrap has no representative images", error_code="presenter_bootstrap_no_images")
 
     newest_input = _newest_input_mtime([prompt_path, context.paths.frame_refs_jsonl, context.paths.scenes_jsonl, *image_paths])
+    request_metadata = _presenter_request_metadata(context)
     if context.paths.visual_presenter_profile.exists() and context.paths.visual_raw_presenter_profile.exists():
         cached = read_model(context.paths.visual_presenter_profile, PresenterProfile)
-        if context.paths.visual_presenter_profile.stat().st_mtime >= newest_input:
+        if (
+            context.paths.visual_presenter_profile.stat().st_mtime >= newest_input
+            and _raw_request_metadata_matches(context.paths.visual_raw_presenter_profile, request_metadata)
+        ):
             return cached
 
-    client = OpenAIVisionClient(
-        os.environ.get("OPENAI_API_KEY"),
-        model=context.config.vision.model,
-        on_retry=_presenter_retry_logger(context),
-    )
+    provider = _vision_provider(context)
+    client = _build_vision_client(context, on_retry=_presenter_retry_logger(context))
     emit_provider_event(
         context,
         PipelineEvent.PROVIDER_REQUEST_STARTED,
@@ -458,7 +459,7 @@ def _load_or_build_presenter_profile(
         ordinal=Stage10DescribeVisuals.ordinal,
         operation=ProviderOperation.VISION_PRESENTER_PROFILE,
         diagnostics=ProviderCallDiagnostics(
-            provider=ProviderName.OPENAI,
+            provider=provider,
             model=context.config.vision.model,
             raw_output_path=str(context.paths.visual_raw_presenter_profile),
         ),
@@ -480,7 +481,7 @@ def _load_or_build_presenter_profile(
             ordinal=Stage10DescribeVisuals.ordinal,
             operation=ProviderOperation.VISION_PRESENTER_PROFILE,
             diagnostics=ProviderCallDiagnostics(
-                provider=ProviderName.OPENAI,
+                provider=provider,
                 model=context.config.vision.model,
                 raw_output_path=str(context.paths.visual_raw_presenter_profile),
                 request_id=request_id_from_error(error),
@@ -500,6 +501,7 @@ def _load_or_build_presenter_profile(
         extra={"images_count": len(image_paths)},
     )
     profile = PresenterProfile.model_validate(analysis.payload)
+    _write_raw_request_metadata(context.paths.visual_raw_presenter_profile, request_metadata)
     write_model(context.paths.visual_presenter_profile, profile)
     _log_presenter_profile(context, profile=profile, analysis=analysis, image_paths=image_paths)
     return profile
@@ -686,6 +688,109 @@ def _newest_input_mtime(paths: list[Path]) -> float:
     return max(existing) if existing else 0.0
 
 
+def _vision_provider(context: StageContext) -> ProviderName:
+    try:
+        provider = ProviderName(context.config.vision.provider)
+    except ValueError as error:
+        raise StageExecutionError(
+            f"Unsupported vision provider: {context.config.vision.provider}",
+            error_code="unsupported_vision_provider",
+        ) from error
+    if provider not in {ProviderName.OPENAI, ProviderName.GEMINI}:
+        raise StageExecutionError(
+            f"Unsupported vision provider: {provider.value}",
+            error_code="unsupported_vision_provider",
+        )
+    return provider
+
+
+def _build_vision_client(context: StageContext, *, on_retry: OnRetry | None = None):
+    provider = _vision_provider(context)
+    if provider == ProviderName.OPENAI:
+        return OpenAIVisionClient(
+            os.environ.get("OPENAI_API_KEY"),
+            model=context.config.vision.model,
+            on_retry=on_retry,
+        )
+    if provider == ProviderName.GEMINI:
+        return GeminiVisionClient(
+            os.environ.get("GEMINI_API_KEY"),
+            model=context.config.vision.model,
+            media_resolution=context.config.vision.media_resolution,
+            thinking_level=context.config.vision.thinking_level,
+            on_retry=on_retry,
+        )
+    raise AssertionError(f"unhandled vision provider: {provider.value}")
+
+
+def _load_cached_visual_result(context: StageContext, raw_output_path: Path) -> VisionAnalysisResult:
+    provider = _vision_provider(context)
+    if provider == ProviderName.OPENAI:
+        return load_cached_openai_visual_result(raw_output_path)
+    if provider == ProviderName.GEMINI:
+        return load_cached_gemini_visual_result(raw_output_path)
+    raise AssertionError(f"unhandled vision provider: {provider.value}")
+
+
+def _presenter_request_metadata(context: StageContext) -> dict[str, object]:
+    return {
+        **_vision_settings_metadata(context),
+        "operation": ProviderOperation.VISION_PRESENTER_PROFILE.value,
+        "prompt_sha256": _file_sha256(_presenter_prompt_path(context)),
+        "schema_sha256": _json_sha256(PRESENTER_PROFILE_SCHEMA),
+        "presenter_bootstrap_scene_limit": context.config.vision.presenter_bootstrap_scene_limit,
+        "presenter_bootstrap_max_images": context.config.vision.presenter_bootstrap_max_images,
+    }
+
+
+def _scene_request_metadata(context: StageContext) -> dict[str, object]:
+    return {
+        **_vision_settings_metadata(context),
+        "operation": ProviderOperation.VISION_SCENE.value,
+        "prompt_sha256": _file_sha256(_prompt_path(context)),
+        "presenter_profile_sha256": _file_sha256(context.paths.visual_presenter_profile),
+        "schema_sha256": _json_sha256(VISUAL_RESPONSE_SCHEMA),
+        "include_nearby_transcript": context.config.vision.include_nearby_transcript,
+        "transcript_context_before_seconds": context.config.vision.transcript_context_before_seconds,
+        "transcript_context_after_seconds": context.config.vision.transcript_context_after_seconds,
+    }
+
+
+def _vision_settings_metadata(context: StageContext) -> dict[str, object]:
+    return {
+        "provider": context.config.vision.provider,
+        "model": context.config.vision.model,
+        "detail": context.config.vision.detail,
+        "media_resolution": context.config.vision.media_resolution,
+        "thinking_level": context.config.vision.thinking_level,
+    }
+
+
+def _raw_request_metadata_matches(raw_output_path: Path, expected: dict[str, object]) -> bool:
+    try:
+        raw_payload = read_json(raw_output_path)
+    except Exception:
+        return False
+    return raw_payload.get(_REQUEST_METADATA_KEY) == expected
+
+
+def _write_raw_request_metadata(raw_output_path: Path, request_metadata: dict[str, object]) -> None:
+    payload = read_json(raw_output_path)
+    payload[_REQUEST_METADATA_KEY] = request_metadata
+    write_json_atomic(raw_output_path, payload)
+
+
+def _file_sha256(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _json_sha256(value: object) -> str:
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _load_cached_result(
     context: StageContext,
     task: _SceneTask,
@@ -695,7 +800,9 @@ def _load_cached_result(
         return None
     if task.raw_output_path.stat().st_mtime < newest_input_mtime:
         return None
-    analysis = load_cached_visual_result(task.raw_output_path)
+    if not _raw_request_metadata_matches(task.raw_output_path, _scene_request_metadata(context)):
+        return None
+    analysis = _load_cached_visual_result(context, task.raw_output_path)
     if not isinstance(analysis.payload.get("presenter_context"), dict):
         return None
     PresenterContext.model_validate(analysis.payload["presenter_context"])
@@ -729,6 +836,7 @@ def _write_scene_canonical_raw(
     *,
     attempt_raw_path: Path,
     canonical_raw_path: Path,
+    request_metadata: dict[str, object],
     attempt: int,
     max_attempts: int,
     leakage: _VisualContentLeakage | None,
@@ -744,6 +852,7 @@ def _write_scene_canonical_raw(
         "attempt_raw_output_path": str(attempt_raw_path),
         "technical_leakage": _content_validation_metadata(leakage),
     }
+    payload[_REQUEST_METADATA_KEY] = request_metadata
     write_json_atomic(canonical_raw_path, payload)
 
 
@@ -764,13 +873,12 @@ def _request_scene_analysis(
     context: StageContext,
     task: _SceneTask,
     system_prompt: str,
-    detail: str,
-    api_key: str | None,
-    model: str,
     on_retry: OnRetry | None = None,
 ) -> _SceneResult:
     started_at = perf_counter()
-    client = OpenAIVisionClient(api_key, model=model, on_retry=on_retry)
+    provider = _vision_provider(context)
+    client = _build_vision_client(context, on_retry=on_retry)
+    request_metadata = _scene_request_metadata(context)
     leakage: _VisualContentLeakage | None = None
     raw_attempt_paths: list[Path] = []
     for attempt in range(1, _SCENE_CONTENT_MAX_ATTEMPTS + 1):
@@ -791,8 +899,8 @@ def _request_scene_analysis(
             ordinal=Stage10DescribeVisuals.ordinal,
             operation=ProviderOperation.VISION_SCENE,
             diagnostics=ProviderCallDiagnostics(
-                provider=ProviderName.OPENAI,
-                model=model,
+                provider=provider,
+                model=context.config.vision.model,
                 raw_output_path=str(raw_attempt_path),
             ),
             attempt=attempt,
@@ -804,7 +912,7 @@ def _request_scene_analysis(
                 system_prompt=_scene_prompt_for_attempt(system_prompt, leakage),
                 transcript_context=task.transcript_context,
                 image_paths=task.image_paths,
-                detail=detail,
+                detail=context.config.vision.detail,
                 raw_output_path=raw_attempt_path,
             )
         except Exception as error:
@@ -815,8 +923,8 @@ def _request_scene_analysis(
                 ordinal=Stage10DescribeVisuals.ordinal,
                 operation=ProviderOperation.VISION_SCENE,
                 diagnostics=ProviderCallDiagnostics(
-                    provider=ProviderName.OPENAI,
-                    model=model,
+                    provider=provider,
+                    model=context.config.vision.model,
                     raw_output_path=str(raw_attempt_path),
                     request_id=request_id_from_error(error),
                 ),
@@ -841,6 +949,7 @@ def _request_scene_analysis(
             _write_scene_canonical_raw(
                 attempt_raw_path=raw_attempt_path,
                 canonical_raw_path=task.raw_output_path,
+                request_metadata=request_metadata,
                 attempt=attempt,
                 max_attempts=_SCENE_CONTENT_MAX_ATTEMPTS,
                 leakage=None,
@@ -874,6 +983,7 @@ def _request_scene_analysis(
         _write_scene_canonical_raw(
             attempt_raw_path=raw_attempt_path,
             canonical_raw_path=task.raw_output_path,
+            request_metadata=request_metadata,
             attempt=attempt,
             max_attempts=_SCENE_CONTENT_MAX_ATTEMPTS,
             leakage=leakage,
@@ -888,8 +998,8 @@ def _request_scene_analysis(
         )
 
     raise StageExecutionError(
-        "OpenAI vision response did not produce a usable scene analysis",
-        error_code="openai_vision_scene_analysis_missing",
+        "Vision provider response did not produce a usable scene analysis",
+        error_code="vision_scene_analysis_missing",
     )
 
 

@@ -255,9 +255,12 @@ class ChunkPlan(StrictModel):
     video_id: str
     provider: str
     model: str
+    retry_advisor_model: str
     mode: str
     prompt_file: str
     prompt_sha256: str
+    retry_advisor_prompt_file: str
+    retry_advisor_prompt_sha256: str
     max_words: int
     max_speech_segments_per_chunk: int
     question_answer_merge_seconds: int

@@ -58,7 +58,9 @@ class VisionConfig(BaseModel):
 
     provider: str
     model: str
-    detail: str
+    detail: str | None = None
+    media_resolution: str | None = None
+    thinking_level: str | None = None
     batch_size: int = Field(gt=0)
     presenter_bootstrap_enabled: bool
     presenter_bootstrap_prompt_file: str
@@ -77,6 +79,8 @@ class SpeechSegmentationConfig(BaseModel):
 
     provider: str
     model: str
+    retry_advisor_model: str
+    retry_advisor_prompt_file: str
     prompt_file: str
     max_segment_seconds: float = Field(gt=0)
     min_segment_seconds: float = Field(gt=0)
@@ -90,6 +94,8 @@ class ChunkingConfig(BaseModel):
     mode: str
     provider: str
     model: str
+    retry_advisor_model: str
+    retry_advisor_prompt_file: str
     prompt_file: str
     max_words: int = Field(gt=0)
     max_speech_segments_per_chunk: int = Field(gt=0)
@@ -122,6 +128,8 @@ class StyleClaimsConfig(BaseModel):
 
     provider: str
     model: str
+    retry_advisor_model: str
+    retry_advisor_prompt_file: str
     prompt_file: str
     max_claims_per_chunk: int = Field(ge=0)
     max_retries: int = Field(gt=0)

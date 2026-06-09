@@ -5,6 +5,8 @@ import hashlib
 import mimetypes
 import re
 import sqlite3
+import threading
+from copy import deepcopy
 from collections import Counter, deque
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14,7 +16,9 @@ from urllib.parse import unquote, urlparse
 
 from style_kb.config import load_default_config
 from style_kb.dashboard.assets import APP_JS, INDEX_HTML, STYLES_CSS
+from style_kb.models import ClaimType, ConfidenceLevel, StyleClaim
 from style_kb.pipeline.paths import JobPaths
+from style_kb.utils.files import write_jsonl_atomic
 
 
 HOST = "127.0.0.1"
@@ -40,6 +44,25 @@ _TECHNICAL_VISUAL_PATTERNS = (
     r"\b(?:фон\w*|background|интерьер\w*|книжн\w*\s+полк\w*|полк\w*|стол\w*|камин\w*)\b",
     r"\b(?:микрофон\w*|петличк\w*|lapel\s+mic|microphone)\b",
 )
+_CLAIM_EDITABLE_FIELDS = (
+    "claim_type",
+    "subject",
+    "claim",
+    "rationale",
+    "conditions",
+    "applies_to",
+    "avoid",
+    "prefer",
+    "evidence",
+    "topics",
+    "confidence",
+)
+_CLAIM_LIST_FIELDS = {"conditions", "applies_to", "avoid", "prefer", "evidence", "topics"}
+_CLAIM_REQUIRED_TEXT_FIELDS = {"subject", "claim", "rationale"}
+_CLAIM_TYPE_VALUES = set(ClaimType.values())
+_CLAIM_CONFIDENCE_VALUES = set(ConfidenceLevel.values())
+_CLAIM_EDIT_LOCKS_LOCK = threading.Lock()
+_CLAIM_EDIT_LOCKS: dict[Path, threading.Lock] = {}
 
 
 def main() -> None:
@@ -106,6 +129,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except Exception as error:
             self._send_json({"error": "internal_error", "message": str(error)}, status=500)
 
+    def do_PATCH(self) -> None:
+        parsed = urlparse(self.path)
+        try:
+            match = re.fullmatch(r"/api/jobs/([^/]+)/claims/([^/]+)", parsed.path)
+            if not match:
+                self._send_json({"error": "not_found", "path": parsed.path}, status=404)
+                return
+            job_id = unquote(match.group(1))
+            claim_id = unquote(match.group(2))
+            self._send_json(update_claim(self.output_root, job_id, claim_id, self._read_json_body()))
+        except DashboardError as error:
+            self._send_json({"error": error.code, "message": error.message}, status=error.status)
+        except Exception as error:
+            self._send_json({"error": "internal_error", "message": str(error)}, status=500)
+
     def log_message(self, format: str, *args: object) -> None:
         return
 
@@ -126,6 +164,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _read_json_body(self) -> Any:
+        raw_length = self.headers.get("Content-Length") or "0"
+        try:
+            length = int(raw_length)
+        except ValueError as error:
+            raise DashboardError("bad_content_length", "invalid Content-Length", status=400) from error
+        if length <= 0:
+            raise DashboardError("empty_request_body", "request body is empty", status=400)
+        if length > 512 * 1024:
+            raise DashboardError("request_too_large", "request body is too large", status=413)
+        raw_body = self.rfile.read(length)
+        try:
+            return json.loads(raw_body.decode("utf-8"))
+        except json.JSONDecodeError as error:
+            raise DashboardError("bad_json", "request body must be valid JSON", status=400) from error
 
     def _send_media(self, raw_path: str) -> None:
         parts = raw_path.split("/", 1)
@@ -185,7 +239,10 @@ def job_payload(output_root: Path, job_id: str) -> dict[str, Any]:
     speaker_diarization = read_json(paths.stt_speaker_diarization)
     timeline_events = read_jsonl(paths.timeline_events_jsonl)
     chunks = read_jsonl(paths.chunks_jsonl)
-    style_claims = read_jsonl(paths.style_claims_jsonl)
+    style_claims_original = read_jsonl(paths.style_claims_jsonl)
+    claim_edits = read_jsonl(claim_edits_path(paths))
+    style_claims = apply_claim_edits(style_claims_original, claim_edits)
+    style_claims_current = read_jsonl(current_claims_path(paths))
     visual_events = read_jsonl(paths.visual_events_jsonl)
     frame_refs = read_jsonl(paths.frame_refs_jsonl)
     pipeline_events = tail_jsonl(paths.pipeline_events_jsonl, max_items=1200)
@@ -205,7 +262,11 @@ def job_payload(output_root: Path, job_id: str) -> dict[str, Any]:
         "timeline_events": timeline_events,
         "chunks": chunks,
         "style_claims": style_claims,
+        "style_claims_original": style_claims_original,
+        "style_claims_current": style_claims_current,
         "style_claims_selected": selected_claims,
+        "claim_edits": claim_edits,
+        "claim_edit_history": build_claim_edit_history(claim_edits),
         "visual_events": visual_events,
         "frame_refs": frame_refs,
         "pipeline_events": pipeline_events,
@@ -340,7 +401,9 @@ def artifact_statuses(paths: JobPaths) -> list[dict[str, Any]]:
         "chunk_plan": paths.chunk_plan,
         "chunk_plan_warnings": paths.chunk_plan_warnings,
         "style_claims": paths.style_claims_jsonl,
+        "style_claims_current": current_claims_path(paths),
         "style_claims_selected": paths.claims_dir / "style_claims_selected.json",
+        "style_claims_manual_edits": claim_edits_path(paths),
         "style_claims_errors": paths.style_claims_errors,
         "quality_report": paths.quality_report,
         "partial_quality_report": paths.partial_quality_report,
@@ -371,6 +434,229 @@ def file_status(key: str, path: Path, *, base_dir: Path) -> dict[str, Any]:
         "size_bytes": path.stat().st_size if exists else None,
         "mtime": iso_mtime(path) if exists else None,
     }
+
+
+def claim_edits_path(paths: JobPaths) -> Path:
+    return paths.claims_dir / "style_claims_manual_edits.jsonl"
+
+
+def current_claims_path(paths: JobPaths) -> Path:
+    return paths.claims_dir / "style_claims_current.jsonl"
+
+
+def update_claim(output_root: Path, job_id: str, claim_id: str, updates: Any) -> dict[str, Any]:
+    if not job_id or "/" in job_id or "\\" in job_id:
+        raise DashboardError("bad_job_id", "job id contains unsupported characters", status=400)
+    if not claim_id or "/" in claim_id or "\\" in claim_id:
+        raise DashboardError("bad_claim_id", "claim id contains unsupported characters", status=400)
+    if not isinstance(updates, dict):
+        raise DashboardError("bad_claim_update", "claim update must be a JSON object", status=400)
+
+    paths = JobPaths(output_root, job_id)
+    if not paths.job_dir.exists():
+        raise DashboardError("job_not_found", f"job not found: {job_id}", status=404)
+
+    original_claims = read_jsonl(paths.style_claims_jsonl)
+    original_by_id = {claim.get("claim_id"): claim for claim in original_claims if claim.get("claim_id")}
+    original_claim = original_by_id.get(claim_id)
+    if not original_claim:
+        raise DashboardError("claim_not_found", f"claim not found: {claim_id}", status=404)
+
+    edits_path = claim_edits_path(paths)
+    with claim_edit_lock(edits_path):
+        claim_edits = read_jsonl(edits_path)
+        next_claim_edits = claim_edits
+        effective_by_id = {
+            claim.get("claim_id"): strip_claim_dashboard_fields(claim)
+            for claim in apply_claim_edits(original_claims, claim_edits)
+            if claim.get("claim_id")
+        }
+        previous_claim = effective_by_id.get(claim_id) or deepcopy(original_claim)
+        updated_claim = build_updated_claim(previous_claim, updates)
+        changes = claim_field_changes(previous_claim, updated_claim)
+        if changes:
+            edited_at = datetime.now(tz=UTC).isoformat(timespec="microseconds")
+            edit_record = {
+                "schema_version": 1,
+                "edit_id": claim_edit_id(job_id, claim_id, edited_at, updated_claim),
+                "action": "update",
+                "actor": "dashboard",
+                "job_id": job_id,
+                "claim_id": claim_id,
+                "edited_at": edited_at,
+                "original_artifact": "claims/style_claims.jsonl",
+                "original_claim": strip_claim_dashboard_fields(original_claim),
+                "previous_claim": strip_claim_dashboard_fields(previous_claim),
+                "updated_claim": strip_claim_dashboard_fields(updated_claim),
+                "changed_fields": list(changes.keys()),
+                "field_changes": changes,
+            }
+            next_claim_edits = [*claim_edits, edit_record]
+            write_jsonl_atomic(edits_path, next_claim_edits)
+        if next_claim_edits:
+            write_current_claims(paths, original_claims, next_claim_edits)
+
+    return job_payload(output_root, job_id)
+
+
+def claim_edit_lock(path: Path) -> threading.Lock:
+    normalized = path.resolve(strict=False)
+    with _CLAIM_EDIT_LOCKS_LOCK:
+        lock = _CLAIM_EDIT_LOCKS.get(normalized)
+        if lock is None:
+            lock = threading.Lock()
+            _CLAIM_EDIT_LOCKS[normalized] = lock
+        return lock
+
+
+def build_updated_claim(previous_claim: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
+    unknown_fields = sorted(set(updates) - set(_CLAIM_EDITABLE_FIELDS))
+    if unknown_fields:
+        raise DashboardError(
+            "unsupported_claim_fields",
+            f"unsupported editable fields: {', '.join(unknown_fields)}",
+            status=400,
+        )
+
+    updated_claim = strip_claim_dashboard_fields(previous_claim)
+    for field in _CLAIM_EDITABLE_FIELDS:
+        if field not in updates:
+            continue
+        if field in _CLAIM_LIST_FIELDS:
+            updated_claim[field] = normalize_string_list(updates[field], field)
+        else:
+            updated_claim[field] = normalize_string_field(updates[field], field)
+
+    claim_type = updated_claim.get("claim_type")
+    if claim_type not in _CLAIM_TYPE_VALUES:
+        raise DashboardError("bad_claim_type", f"claim_type must be one of: {', '.join(sorted(_CLAIM_TYPE_VALUES))}", status=400)
+    confidence = updated_claim.get("confidence")
+    if confidence not in _CLAIM_CONFIDENCE_VALUES:
+        raise DashboardError(
+            "bad_claim_confidence",
+            f"confidence must be one of: {', '.join(sorted(_CLAIM_CONFIDENCE_VALUES))}",
+            status=400,
+        )
+    for field in _CLAIM_REQUIRED_TEXT_FIELDS:
+        if not str(updated_claim.get(field) or "").strip():
+            raise DashboardError("empty_claim_field", f"{field} cannot be empty", status=400)
+
+    try:
+        StyleClaim.model_validate(updated_claim)
+    except Exception as error:
+        raise DashboardError("invalid_claim", str(error), status=400) from error
+    return updated_claim
+
+
+def normalize_string_field(value: Any, field: str) -> str:
+    if not isinstance(value, str):
+        raise DashboardError("bad_claim_field", f"{field} must be a string", status=400)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def normalize_string_list(value: Any, field: str) -> list[str]:
+    if isinstance(value, str):
+        raw_items = value.splitlines()
+    elif isinstance(value, list):
+        raw_items = value
+    else:
+        raise DashboardError("bad_claim_field", f"{field} must be a list of strings", status=400)
+
+    items: list[str] = []
+    seen: set[str] = set()
+    for raw_item in raw_items:
+        if not isinstance(raw_item, str):
+            raise DashboardError("bad_claim_field", f"{field} must contain only strings", status=400)
+        item = re.sub(r"\s+", " ", raw_item).strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        items.append(item)
+    return items
+
+
+def claim_field_changes(previous_claim: dict[str, Any], updated_claim: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    changes: dict[str, dict[str, Any]] = {}
+    for field in _CLAIM_EDITABLE_FIELDS:
+        before = previous_claim.get(field)
+        after = updated_claim.get(field)
+        if before != after:
+            changes[field] = {"before": before, "after": after}
+    return changes
+
+
+def claim_edit_id(job_id: str, claim_id: str, edited_at: str, updated_claim: dict[str, Any]) -> str:
+    fingerprint = json.dumps(
+        {"job_id": job_id, "claim_id": claim_id, "edited_at": edited_at, "updated_claim": updated_claim},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return f"manual_claim_edit_{short_hash(fingerprint)}"
+
+
+def write_current_claims(paths: JobPaths, original_claims: list[dict[str, Any]], claim_edits: list[dict[str, Any]]) -> None:
+    current_claims = current_claim_rows(original_claims, claim_edits)
+    write_jsonl_atomic(current_claims_path(paths), current_claims)
+
+
+def current_claim_rows(original_claims: list[dict[str, Any]], claim_edits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    current_claims = [strip_claim_dashboard_fields(claim) for claim in apply_claim_edits(original_claims, claim_edits)]
+    for claim in current_claims:
+        StyleClaim.model_validate(claim)
+    return current_claims
+
+
+def apply_claim_edits(original_claims: list[dict[str, Any]], claim_edits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    claims_by_id = {claim.get("claim_id"): strip_claim_dashboard_fields(claim) for claim in original_claims if claim.get("claim_id")}
+    history_by_id = build_claim_edit_history(claim_edits)
+    for edit in claim_edits:
+        if edit.get("action") != "update":
+            continue
+        claim_id = edit.get("claim_id")
+        updated_claim = edit.get("updated_claim")
+        if claim_id not in claims_by_id or not isinstance(updated_claim, dict):
+            continue
+        candidate = strip_claim_dashboard_fields(updated_claim)
+        try:
+            StyleClaim.model_validate(candidate)
+        except Exception:
+            continue
+        claims_by_id[claim_id] = candidate
+
+    effective_claims: list[dict[str, Any]] = []
+    for original_claim in original_claims:
+        claim_id = original_claim.get("claim_id")
+        claim = deepcopy(claims_by_id.get(claim_id) or strip_claim_dashboard_fields(original_claim))
+        history = history_by_id.get(claim_id) or []
+        if history:
+            latest = history[-1]
+            claim["manual_edit"] = {
+                "edited": True,
+                "edit_id": latest.get("edit_id"),
+                "edited_at": latest.get("edited_at"),
+                "edits_count": len(history),
+                "changed_fields": latest.get("changed_fields") or [],
+            }
+            claim["llm_claim"] = strip_claim_dashboard_fields(original_claim)
+        effective_claims.append(claim)
+    return effective_claims
+
+
+def build_claim_edit_history(claim_edits: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    history: dict[str, list[dict[str, Any]]] = {}
+    for edit in claim_edits:
+        claim_id = edit.get("claim_id")
+        if not claim_id:
+            continue
+        history.setdefault(claim_id, []).append(edit)
+    return history
+
+
+def strip_claim_dashboard_fields(claim: dict[str, Any]) -> dict[str, Any]:
+    cleaned = deepcopy(claim)
+    cleaned.pop("manual_edit", None)
+    cleaned.pop("llm_claim", None)
+    return cleaned
 
 
 def build_quality_issues(payload: dict[str, Any]) -> list[dict[str, Any]]:

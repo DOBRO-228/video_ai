@@ -6,7 +6,7 @@ Download the visual proxy video used for scene detection and keyframe extraction
 
 ## How It Works
 
-The stage calls the `yt-dlp` video proxy wrapper using configured height and format. By default this is a 720p MP4 proxy. It then runs `ffprobe` and stores the result for duration and FPS consumers.
+The stage calls the `yt-dlp` video proxy wrapper using configured height and format. By default this is a 720p MP4 proxy. MP4/H.264 is preferred for decoder compatibility, with fallback to any MP4 proxy when H.264 is unavailable. It then runs `ffprobe` and stores the result for duration and FPS consumers.
 
 ## Inputs
 
@@ -28,11 +28,10 @@ The stage can be skipped when the video and ffprobe JSON exist and the probed du
 
 - Downstream visual stages depend on this proxy, not on the original full-quality video.
 - Cleanup may remove proxy video and probe output after successful quality reporting when `project.keep_media=false`.
-- Avoid changing proxy quality defaults without considering OpenAI vision cost and PySceneDetect runtime.
+- Avoid changing proxy quality defaults without considering vision provider cost and PySceneDetect runtime.
 
 ## Related Code
 
 - `src/style_kb/stages/stage_03_download_video_proxy.py`
 - `src/style_kb/clients/ytdlp.py`
 - `src/style_kb/clients/media.py`
-

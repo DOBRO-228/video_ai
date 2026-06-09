@@ -10,6 +10,8 @@ The stage sends one chunk at a time to OpenAI structured output using `style_cla
 
 Provider output is validated before it can become a cache hit or a final artifact. If a chunk response contains service metadata as style knowledge, technical identifiers in user-facing fields, invalid enums, missing required text, malformed JSON, or too many claims, the stage keeps the attempt raw output at `claims/raw/{chunk_id}_attempt_{attempt}.json`, logs the validation error, records it in `claims/style_claims_errors.json`, emits progress, and retries up to `style_claims.max_retries`. A first successful attempt is written to the canonical per-chunk raw cache only; an identical successful attempt file is removed to avoid duplicate raw artifacts.
 
+When a per-chunk extraction attempt fails validation and another retry remains, the stage sends the candidate response, chunk payload, constraints, and structured validation errors to the retry-advisor model configured in `style_claims.retry_advisor_model`. The advisor returns only repair instructions, not replacement claims. Those instructions are added to the next retry prompt for the main extraction model. Final acceptance remains deterministic.
+
 After all chunk responses are loaded, the stage performs deterministic cleanup of obvious presentation artifacts in user-facing fields, including evidence source prefixes such as `В chunk:`/`On-screen:` and Latin homoglyphs inside Cyrillic words. It does not enforce a closed `applies_to` taxonomy; the summary records observed `applies_to` counts so a stable vocabulary can be chosen later from real jobs.
 
 The stage then performs deterministic exact deduplication by `(claim_type, subject, claim)`. Duplicate claims keep the earliest primary chunk and merge timeline/source/evidence/topic provenance.
@@ -21,6 +23,7 @@ When `style_claims.curate.enabled` is true, a single post-deduplication curation
 - `timeline/timeline_events.jsonl`
 - `chunks/chunks.jsonl`
 - `src/style_kb/prompts/style_claims_ru.txt`
+- `src/style_kb/prompts/style_claims_retry_advisor_ru.txt`
 - `src/style_kb/prompts/style_claims_curate_ru.txt` when curation is enabled
 - `style_claims.*` config values
 - `OPENAI_API_KEY`
@@ -33,6 +36,7 @@ When `style_claims.curate.enabled` is true, a single post-deduplication curation
 - `claims/raw/{chunk_id}.json`
 - `claims/raw/curate.json` when curation is enabled
 - `claims/raw/{chunk_id}_attempt_{attempt}.json` for invalid or regenerated API attempts
+- `claims/raw/{chunk_id}_retry_advice_attempt_{attempt}.json` for retry-advisor calls after failed attempts
 - `claims/style_claims_errors.json` while invalid attempts or a final retry failure exist
 
 ## Skip Validation
@@ -48,6 +52,7 @@ The stage can be skipped when `style_claims.jsonl` parses as `StyleClaim`, `styl
 - `claims/style_claims_raw.json` records counts and small relative-path samples, not a full absolute-path inventory.
 - `claims/style_claims_curate_raw.json` is an audit artifact only. It records decisions, confidence reasons, split/rewrite suggestions, and ignored invalid decisions; it must not be imported as style knowledge.
 - Python attaches `chunk_id`, `timeline_event_ids`, `timestamp_url`, and `source_refs` to accepted claims. The model must not output those as claim content.
+- Retry-advisor outputs are diagnostic prompt guidance only. They are not claims and must not be imported into the KB.
 - Claims must remain normalized Russian knowledge objects with timestamp/source grounding.
 - Curation intentionally does not auto-split or auto-rewrite canonical claims in the MVP. Those suggestions are collected for later analysis across multiple jobs.
 - Do not add CLI controls for claim extraction.

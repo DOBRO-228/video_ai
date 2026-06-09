@@ -540,6 +540,11 @@ tr:last-child td {
   color: var(--muted);
 }
 
+.status.manual-edit {
+  background: var(--indigo-weak);
+  color: var(--indigo);
+}
+
 .chip {
   background: var(--soft);
   color: var(--muted);
@@ -566,6 +571,45 @@ tr:last-child td {
 .chip.gold {
   background: var(--gold-weak);
   color: var(--gold);
+}
+
+.item-issues {
+  display: grid;
+  gap: 6px;
+  margin: 8px 0;
+}
+
+.item-issue {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--gold);
+  border-radius: 8px;
+  background: var(--gold-weak);
+  color: var(--text);
+  padding: 7px 9px;
+  text-align: left;
+}
+
+.item-issue.error {
+  border-left-color: var(--danger);
+  background: var(--danger-weak);
+}
+
+.item-issue-title {
+  display: block;
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
+.item-issue-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 11px;
 }
 
 .card-list {
@@ -600,6 +644,15 @@ tr:last-child td {
   align-items: flex-start;
   margin-bottom: 8px;
   min-width: 0;
+}
+
+.card-actions,
+.form-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .card-title {
@@ -785,6 +838,102 @@ tr:last-child td {
   gap: 10px;
 }
 
+.claim-form {
+  display: grid;
+  gap: 10px;
+}
+
+.field {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.field-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.info-tip {
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--indigo);
+  font-size: 11px;
+  font-weight: 900;
+  line-height: 1;
+}
+
+.info-tip:focus {
+  outline: 2px solid var(--teal);
+  outline-offset: 1px;
+}
+
+.info-bubble {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 8px);
+  z-index: 10;
+  width: min(280px, calc(100vw - 32px));
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: #0b0f11;
+  color: var(--text);
+  padding: 8px 9px;
+  box-shadow: var(--shadow);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.35;
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+
+.split > .field:last-child .info-bubble {
+  right: 0;
+  left: auto;
+}
+
+.info-tip:hover .info-bubble,
+.info-tip:focus .info-bubble {
+  opacity: 1;
+}
+
+.textarea {
+  min-height: 92px;
+  resize: vertical;
+}
+
+.diff-list {
+  display: grid;
+  gap: 8px;
+}
+
+.diff-row {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px;
+  background: var(--surface);
+}
+
+.diff-row strong {
+  display: block;
+  margin-bottom: 5px;
+}
+
 details {
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -843,10 +992,13 @@ pre {
 @media (max-width: 1280px) {
   .layout {
     grid-template-columns: 280px minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) minmax(260px, 42vh);
   }
 
   .inspector {
-    display: none;
+    display: flex;
+    grid-column: 1 / -1;
+    border-top: 1px solid var(--line);
   }
 
   .metrics-grid {
@@ -871,7 +1023,8 @@ pre {
   }
 
   .sidebar,
-  .workspace {
+  .workspace,
+  .inspector {
     overflow: visible;
     width: 100%;
     max-width: 100vw;
@@ -879,6 +1032,12 @@ pre {
 
   .workspace {
     display: block;
+  }
+
+  .inspector {
+    display: flex;
+    min-height: 320px;
+    border-top: 1px solid var(--line);
   }
 
   .job-list {
@@ -915,6 +1074,11 @@ pre {
     max-width: 100%;
   }
 
+  .split > .field:last-child .info-bubble {
+    right: auto;
+    left: 0;
+  }
+
   .metrics-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     width: 100%;
@@ -935,6 +1099,7 @@ const state = {
   selectedJobId: null,
   tab: 'overview',
   selection: null,
+  editingClaimId: null,
   filters: {
     timelineQuery: '',
     claimQuery: '',
@@ -946,6 +1111,23 @@ const state = {
     logEvent: 'all'
   },
   index: {}
+};
+
+const CLAIM_TYPES = ['rule', 'recommendation', 'warning', 'definition', 'example', 'exception'];
+const CLAIM_CONFIDENCES = ['low', 'medium', 'high'];
+const CLAIM_LIST_FIELDS = ['conditions', 'applies_to', 'avoid', 'prefer', 'evidence', 'topics'];
+const CLAIM_FIELD_HELP = {
+  claim_type: 'Тип знания: правило, рекомендация, предупреждение и т.д. Влияет на фильтры, группировку и приоритет анализа.',
+  confidence: 'Надёжность Claim. Влияет на фильтрацию и на то, насколько уверенно использовать это знание дальше.',
+  subject: 'Главный объект Claim: вещь, приём, цвет, силуэт. Влияет на поиск и быстрый обзор карточек.',
+  claim: 'Каноническая формулировка знания. Это основной текст, который будет использоваться как ручная версия Claim.',
+  rationale: 'Почему Claim считается верным или полезным. Влияет на объяснимость и ручную проверку качества.',
+  conditions: 'Когда Claim применим. Влияет на контекст использования и помогает не обобщать правило слишком широко.',
+  applies_to: 'К каким объектам относится Claim. Влияет на поиск по предметам, темам и связям.',
+  avoid: 'Чего стоит избегать. Влияет на рекомендации, предупреждения и негативные фильтры.',
+  prefer: 'Что стоит предпочесть. Влияет на рекомендации и позитивные варианты применения.',
+  evidence: 'Факты из видео, на которых основан Claim. Влияет на аудит, доверие и проверку источника.',
+  topics: 'Темы для навигации и группировки. Влияет на фильтры, облако тем и поиск.'
 };
 
 const els = {};
@@ -970,6 +1152,7 @@ document.addEventListener('DOMContentLoaded', () => {
   els.content.addEventListener('input', onContentInput);
   els.content.addEventListener('change', onContentChange);
   els.inspector.addEventListener('click', onContentClick);
+  els.inspector.addEventListener('submit', onInspectorSubmit);
 
   loadSummary();
 });
@@ -1023,10 +1206,19 @@ function buildIndex(job) {
   const framesByScene = new Map();
   const claimsByEvent = new Map();
   const claimsByChunk = new Map();
+  const originalClaimsById = new Map();
+  const claimEditsByClaim = new Map();
   const issuesById = new Map();
+  const issuesByEvent = new Map();
+  const issuesByChunk = new Map();
+  const issuesByClaim = new Map();
+  const issuesByVisual = new Map();
+  const issuesByScene = new Map();
 
   for (const event of job.timeline_events || []) eventsById.set(event.event_id, event);
   for (const chunk of job.chunks || []) chunksById.set(chunk.chunk_id, chunk);
+  for (const claim of job.style_claims_original || []) originalClaimsById.set(claim.claim_id, claim);
+  for (const edit of job.claim_edits || []) addMapList(claimEditsByClaim, edit.claim_id, edit);
   for (const claim of job.style_claims || []) {
     claimsById.set(claim.claim_id, claim);
     addMapList(claimsByChunk, claim.chunk_id, claim);
@@ -1037,9 +1229,43 @@ function buildIndex(job) {
     visualsByScene.set(visual.scene_id, visual);
     for (const frame of visual.frames || []) addMapList(framesByScene, frame.scene_id, frame);
   }
-  for (const issue of job.quality_issues || []) issuesById.set(issue.issue_id, issue);
+  for (const issue of job.quality_issues || []) {
+    issuesById.set(issue.issue_id, issue);
+    for (const location of issue.locations || []) {
+      if (location.visual_event_id) addIssueRef(issuesByVisual, location.visual_event_id, issue, location);
+      if (location.scene_id) addIssueRef(issuesByScene, location.scene_id, issue, location);
+      if (location.chunk_id) addIssueRef(issuesByChunk, location.chunk_id, issue, location);
+      for (const eventId of location.timeline_event_ids || []) addIssueRef(issuesByEvent, eventId, issue, location);
+      if (location.kind === 'stage' && location.object_id) addIssueRef(issuesById, `stage:${location.object_id}`, issue, location);
+    }
+  }
+  for (const event of job.timeline_events || []) {
+    for (const ref of issuesByScene.get(event.scene_id) || []) addIssueRef(issuesByEvent, event.event_id, ref.issue, ref.location);
+  }
+  for (const claim of job.style_claims || []) {
+    for (const ref of issuesByChunk.get(claim.chunk_id) || []) addIssueRef(issuesByClaim, claim.claim_id, ref.issue, ref.location);
+    for (const eventId of claim.timeline_event_ids || []) {
+      for (const ref of issuesByEvent.get(eventId) || []) addIssueRef(issuesByClaim, claim.claim_id, ref.issue, ref.location);
+    }
+  }
 
-  return { eventsById, chunksById, claimsById, visualsByScene, framesByScene, claimsByEvent, claimsByChunk, issuesById };
+  return {
+    eventsById,
+    chunksById,
+    claimsById,
+    visualsByScene,
+    framesByScene,
+    claimsByEvent,
+    claimsByChunk,
+    originalClaimsById,
+    claimEditsByClaim,
+    issuesById,
+    issuesByEvent,
+    issuesByChunk,
+    issuesByClaim,
+    issuesByVisual,
+    issuesByScene
+  };
 }
 
 function addMapList(map, key, value) {
@@ -1047,6 +1273,14 @@ function addMapList(map, key, value) {
   if (!map.has(key)) map.set(key, []);
   const list = map.get(key);
   if (!list.some((item) => item.path && value.path && item.path === value.path)) list.push(value);
+}
+
+function addIssueRef(map, key, issue, location) {
+  if (!key) return;
+  if (!map.has(key)) map.set(key, []);
+  const refs = map.get(key);
+  const refKey = `${issue.issue_id}:${location.location_id || location.object_id || location.field || ''}`;
+  if (!refs.some((ref) => ref.refKey === refKey)) refs.push({ refKey, issue, location });
 }
 
 function renderJobList() {
@@ -1099,6 +1333,7 @@ function onTabClick(event) {
   if (!button) return;
   state.tab = button.dataset.tab;
   state.selection = null;
+  state.editingClaimId = null;
   renderTabs();
   renderTab();
   renderInspector();
@@ -1327,6 +1562,7 @@ function timelineCard(event) {
   const frames = state.index.framesByScene.get(event.scene_id) || [];
   const claims = state.index.claimsByEvent.get(event.event_id) || [];
   const visual = state.index.visualsByScene.get(event.scene_id);
+  const issueRefs = state.index.issuesByEvent.get(event.event_id) || [];
   return `
     <article class="card" data-inspect-kind="event" data-inspect-id="${attr(event.event_id)}">
       <div class="card-head">
@@ -1336,6 +1572,7 @@ function timelineCard(event) {
         </div>
         <a class="button button-small" href="${attr(event.timestamp_url || '#')}" target="_blank" rel="noreferrer">YouTube</a>
       </div>
+      ${itemIssuesBlock(issueRefs)}
       ${chips(event.topics, 'teal')}
       ${event.on_screen_text?.length ? `<div>${chips(event.on_screen_text, 'gold')}</div>` : ''}
       <div class="split">
@@ -1349,6 +1586,8 @@ function timelineCard(event) {
 
 function claimCard(claim) {
   const frames = framesForEventIds(claim.timeline_event_ids || []);
+  const issueRefs = state.index.issuesByClaim.get(claim.claim_id) || [];
+  const manualEdit = claim.manual_edit?.edited;
   return `
     <article class="card" data-inspect-kind="claim" data-inspect-id="${attr(claim.claim_id)}">
       <div class="card-head">
@@ -1356,8 +1595,14 @@ function claimCard(claim) {
           <h3 class="card-title">${escapeHtml(claim.subject || claim.claim_type || 'claim')}</h3>
           <p class="card-subtitle">${formatRange(claim.start, claim.end)} · ${escapeHtml(claim.claim_id || '')}</p>
         </div>
-        <div>${statusPill(claim.claim_type, 'status unknown')} ${statusPill(claim.confidence)}</div>
+        <div class="card-actions">
+          ${manualEdit ? statusPill('manual edit') : ''}
+          ${statusPill(claim.claim_type, 'status unknown')}
+          ${statusPill(claim.confidence)}
+          <button class="button button-small" type="button" data-action="edit-claim" data-claim-id="${attr(claim.claim_id)}">Править Claim</button>
+        </div>
       </div>
+      ${itemIssuesBlock(issueRefs)}
       <div class="text-block">${escapeHtml(claim.claim || '')}</div>
       ${chips(claim.topics, 'teal')}
       ${claim.prefer?.length ? `<p class="tiny"><strong>Prefer:</strong> ${escapeHtml(claim.prefer.join(', '))}</p>` : ''}
@@ -1371,6 +1616,7 @@ function claimCard(claim) {
 function chunkCard(chunk) {
   const claims = state.index.claimsByChunk.get(chunk.chunk_id) || [];
   const frames = framesForEventIds(chunk.timeline_event_ids || []);
+  const issueRefs = state.index.issuesByChunk.get(chunk.chunk_id) || [];
   return `
     <article class="card" data-inspect-kind="chunk" data-inspect-id="${attr(chunk.chunk_id)}">
       <div class="card-head">
@@ -1380,6 +1626,7 @@ function chunkCard(chunk) {
         </div>
         <a class="button button-small" href="${attr(chunk.timestamp_url || '#')}" target="_blank" rel="noreferrer">YouTube</a>
       </div>
+      ${itemIssuesBlock(issueRefs)}
       ${chips(chunk.topics, 'teal')}
       ${chunk.entities?.length ? chips(chunk.entities, 'rust') : ''}
       <p class="tiny muted">${escapeHtml(chunk.boundary_reason || '')}</p>
@@ -1391,6 +1638,10 @@ function chunkCard(chunk) {
 
 function visualCard(visual) {
   const frames = state.index.framesByScene.get(visual.scene_id) || visual.frames || [];
+  const issueRefs = mergeIssueRefs(
+    state.index.issuesByVisual.get(visual.visual_event_id) || [],
+    state.index.issuesByScene.get(visual.scene_id) || []
+  );
   return `
     <article class="card" data-inspect-kind="visual" data-inspect-id="${attr(visual.visual_event_id)}">
       <div class="card-head">
@@ -1400,6 +1651,7 @@ function visualCard(visual) {
         </div>
         ${statusPill(visual.confidence)}
       </div>
+      ${itemIssuesBlock(issueRefs)}
       ${visual.style_topics?.length ? chips(visual.style_topics, 'teal') : ''}
       ${visual.on_screen_text?.length ? chips(visual.on_screen_text, 'gold') : ''}
       <div class="text-block">${escapeHtml(truncate([
@@ -1427,6 +1679,70 @@ function logCard(event, index) {
       ${event.data?.warnings ? `<p class="tiny muted">${escapeHtml(event.data.warnings.join(' · '))}</p>` : ''}
     </article>
   `;
+}
+
+function itemIssuesBlock(issueRefs) {
+  const grouped = groupIssueRefs(issueRefs);
+  if (!grouped.length) return '';
+  return `
+    <div class="item-issues">
+      ${grouped.slice(0, 3).map((item) => itemIssueButton(item)).join('')}
+      ${grouped.length > 3 ? `<span class="tiny muted">+${num(grouped.length - 3)} more issue groups</span>` : ''}
+    </div>
+  `;
+}
+
+function itemIssueButton(item) {
+  const first = item.locations[0] || {};
+  const fields = [...new Set(item.locations.map((location) => location.field).filter(Boolean))].slice(0, 3);
+  return `
+    <button class="item-issue ${item.issue.severity === 'error' ? 'error' : ''}" type="button" data-inspect-kind="issue" data-inspect-id="${attr(item.issue.issue_id)}">
+      <span class="item-issue-title">${escapeHtml(item.issue.title || item.issue.issue_id)}</span>
+      <span class="item-issue-meta">
+        ${statusPill(item.issue.severity || 'warning')}
+        <span>${num(item.locations.length)} locations here</span>
+        ${fields.length ? `<span>${escapeHtml(fields.join(', '))}</span>` : ''}
+      </span>
+      ${first.marker ? `<span class="tiny muted">${escapeHtml(truncate(first.marker, 160))}</span>` : ''}
+    </button>
+  `;
+}
+
+function groupIssueRefs(issueRefs) {
+  const byIssue = new Map();
+  for (const ref of issueRefs || []) {
+    if (!ref?.issue?.issue_id) continue;
+    if (!byIssue.has(ref.issue.issue_id)) byIssue.set(ref.issue.issue_id, { issue: ref.issue, locations: [], locationKeys: new Set() });
+    const group = byIssue.get(ref.issue.issue_id);
+    const key = ref.location?.location_id || `${ref.location?.object_id || ''}:${ref.location?.field || ''}:${ref.location?.marker || ''}`;
+    if (!group.locationKeys.has(key)) {
+      group.locationKeys.add(key);
+      group.locations.push(ref.location || {});
+    }
+  }
+  return [...byIssue.values()]
+    .map((group) => ({ issue: group.issue, locations: group.locations }))
+    .sort((a, b) => severityRank(b.issue.severity) - severityRank(a.issue.severity) || b.locations.length - a.locations.length);
+}
+
+function mergeIssueRefs(...lists) {
+  const refs = [];
+  const seen = new Set();
+  for (const list of lists) {
+    for (const ref of list || []) {
+      const key = ref.refKey || `${ref.issue?.issue_id}:${ref.location?.location_id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      refs.push(ref);
+    }
+  }
+  return refs;
+}
+
+function severityRank(severity) {
+  if (severity === 'error') return 3;
+  if (severity === 'warning') return 2;
+  return 1;
 }
 
 function coverageBlock(coverage) {
@@ -1542,11 +1858,84 @@ function rerenderAndFocus(key) {
 }
 
 function onContentClick(event) {
+  const action = event.target.closest('[data-action]');
+  if (action) {
+    handleActionClick(action);
+    event.preventDefault();
+    event.stopPropagation();
+    return;
+  }
   const inspect = event.target.closest('[data-inspect-kind]');
   if (!inspect) return;
   if (event.target.closest('a')) return;
   state.selection = { kind: inspect.dataset.inspectKind, id: inspect.dataset.inspectId };
+  if (state.selection.kind === 'claim' && state.tab === 'claims') {
+    state.editingClaimId = state.selection.id;
+  } else if (state.selection.kind !== 'claim') {
+    state.editingClaimId = null;
+  }
   renderInspector();
+}
+
+function handleActionClick(action) {
+  if (action.dataset.action === 'edit-claim') {
+    state.selection = { kind: 'claim', id: action.dataset.claimId };
+    state.editingClaimId = action.dataset.claimId;
+    renderInspector();
+    return;
+  }
+  if (action.dataset.action === 'cancel-claim-edit') {
+    state.editingClaimId = null;
+    renderInspector();
+  }
+}
+
+async function onInspectorSubmit(event) {
+  const form = event.target.closest('[data-claim-edit-form]');
+  if (!form) return;
+  event.preventDefault();
+  const claimId = form.dataset.claimId;
+  try {
+    const response = await fetch(`/api/jobs/${encodeURIComponent(state.selectedJobId)}/claims/${encodeURIComponent(claimId)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(claimFormPayload(form))
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.message || payload.error || `claim update failed: ${response.status}`);
+    state.job = payload;
+    state.index = buildIndex(state.job);
+    state.selection = { kind: 'claim', id: claimId };
+    state.editingClaimId = null;
+    renderJobHeader();
+    renderTab();
+    renderInspector();
+    showToast('Claim сохранён в журнал ручных правок');
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+function claimFormPayload(form) {
+  const data = new FormData(form);
+  const payload = {
+    claim_type: String(data.get('claim_type') || ''),
+    confidence: String(data.get('confidence') || ''),
+    subject: String(data.get('subject') || ''),
+    claim: String(data.get('claim') || ''),
+    rationale: String(data.get('rationale') || '')
+  };
+  for (const field of CLAIM_LIST_FIELDS) {
+    payload[field] = splitMultiline(data.get(field));
+  }
+  return payload;
+}
+
+function splitMultiline(value) {
+  return String(value || '')
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 function renderInspector() {
@@ -1639,13 +2028,7 @@ function summaryForInspector(kind, item) {
     `;
   }
   if (kind === 'claim') {
-    return `
-      ${statusPill(item.claim_type, 'status unknown')} ${statusPill(item.confidence)}
-      ${chips(item.topics, 'teal')}
-      <p class="text-block">${escapeHtml(item.claim || '')}</p>
-      <p><strong>Rationale:</strong> ${escapeHtml(item.rationale || '')}</p>
-      ${item.evidence?.length ? `<h3>Evidence</h3><ul>${item.evidence.map((text) => `<li>${escapeHtml(text)}</li>`).join('')}</ul>` : ''}
-    `;
+    return claimInspectorSummary(item);
   }
   if (kind === 'chunk') {
     return `
@@ -1680,6 +2063,144 @@ function summaryForInspector(kind, item) {
     return `<p class="text-block">${escapeHtml(item.message || '')}</p>`;
   }
   return '';
+}
+
+function claimInspectorSummary(item) {
+  const original = state.index.originalClaimsById.get(item.claim_id) || item.llm_claim || item;
+  const history = state.index.claimEditsByClaim.get(item.claim_id) || [];
+  const isEditing = state.editingClaimId === item.claim_id;
+  return `
+    <div class="card-actions">
+      ${item.manual_edit?.edited ? statusPill('manual edit') : ''}
+      ${statusPill(item.claim_type, 'status unknown')}
+      ${statusPill(item.confidence)}
+      ${isEditing ? '' : `<button class="button button-small" type="button" data-action="edit-claim" data-claim-id="${attr(item.claim_id)}">Править Claim</button>`}
+    </div>
+    ${isEditing ? claimEditForm(item) : claimReadSummary(item, original, history)}
+  `;
+}
+
+function claimReadSummary(item, original, history) {
+  return `
+    ${chips(item.topics, 'teal')}
+    <p class="text-block">${escapeHtml(item.claim || '')}</p>
+    <p><strong>Rationale:</strong> ${escapeHtml(item.rationale || '')}</p>
+    ${item.conditions?.length ? `<p class="tiny"><strong>Conditions:</strong> ${escapeHtml(item.conditions.join(', '))}</p>` : ''}
+    ${item.applies_to?.length ? `<p class="tiny"><strong>Applies to:</strong> ${escapeHtml(item.applies_to.join(', '))}</p>` : ''}
+    ${item.prefer?.length ? `<p class="tiny"><strong>Prefer:</strong> ${escapeHtml(item.prefer.join(', '))}</p>` : ''}
+    ${item.avoid?.length ? `<p class="tiny"><strong>Avoid:</strong> ${escapeHtml(item.avoid.join(', '))}</p>` : ''}
+    ${item.evidence?.length ? `<h3>Evidence</h3><ul>${item.evidence.map((text) => `<li>${escapeHtml(text)}</li>`).join('')}</ul>` : ''}
+    ${history.length ? editHistoryBlock(history) : empty('Ручных правок пока нет')}
+    ${rawDetails('Исходный LLM Claim', original)}
+  `;
+}
+
+function claimEditForm(claim) {
+  return `
+    <form class="claim-form" data-claim-edit-form data-claim-id="${attr(claim.claim_id)}">
+      <div class="split">
+        ${selectField('claim_type', 'Type', claim.claim_type, CLAIM_TYPES)}
+        ${selectField('confidence', 'Confidence', claim.confidence, CLAIM_CONFIDENCES)}
+      </div>
+      ${textField('subject', 'Subject', claim.subject || '')}
+      ${textareaField('claim', 'Claim', claim.claim || '', 5)}
+      ${textareaField('rationale', 'Rationale', claim.rationale || '', 4)}
+      <div class="split">
+        ${textareaField('conditions', 'Conditions', joinLines(claim.conditions), 4)}
+        ${textareaField('applies_to', 'Applies to', joinLines(claim.applies_to), 4)}
+      </div>
+      <div class="split">
+        ${textareaField('prefer', 'Prefer', joinLines(claim.prefer), 4)}
+        ${textareaField('avoid', 'Avoid', joinLines(claim.avoid), 4)}
+      </div>
+      ${textareaField('evidence', 'Evidence', joinLines(claim.evidence), 5)}
+      ${textareaField('topics', 'Topics', joinLines(claim.topics), 4)}
+      <div class="form-actions">
+        <button class="button button-small" type="button" data-action="cancel-claim-edit">Отмена</button>
+        <button class="button button-small" type="submit">Сохранить</button>
+      </div>
+    </form>
+  `;
+}
+
+function selectField(name, label, value, options) {
+  return `
+    <label class="field">${fieldLabel(name, label)}
+      <select class="select" name="${attr(name)}">
+        ${options.map((option) => `<option value="${attr(option)}" ${option === value ? 'selected' : ''}>${escapeHtml(option)}</option>`).join('')}
+      </select>
+    </label>
+  `;
+}
+
+function textField(name, label, value) {
+  return `
+    <label class="field">${fieldLabel(name, label)}
+      <input class="input" name="${attr(name)}" value="${attr(value)}">
+    </label>
+  `;
+}
+
+function textareaField(name, label, value, rows) {
+  return `
+    <label class="field">${fieldLabel(name, label)}
+      <textarea class="input textarea" name="${attr(name)}" rows="${attr(rows)}">${escapeHtml(value)}</textarea>
+    </label>
+  `;
+}
+
+function fieldLabel(name, label) {
+  const help = CLAIM_FIELD_HELP[name];
+  return `
+    <span class="field-label">
+      <span>${escapeHtml(label)}</span>
+      ${help ? `<span class="info-tip" tabindex="0" aria-label="${attr(help)}">I<span class="info-bubble" role="tooltip">${escapeHtml(help)}</span></span>` : ''}
+    </span>
+  `;
+}
+
+function joinLines(items) {
+  return (items || []).join('\n');
+}
+
+function editHistoryBlock(history) {
+  const ordered = [...history].reverse();
+  return `
+    <h3>Manual edit history</h3>
+    <div class="card-list">
+      ${ordered.map((edit) => `
+        <div class="card">
+          <strong>${escapeHtml(formatDateTime(edit.edited_at))}</strong>
+          <div class="tiny muted">${escapeHtml(edit.edit_id || '')}</div>
+          ${fieldDiffBlock(edit.field_changes || {})}
+          ${rawDetails('Audit record', edit)}
+        </div>
+      `).join('')}
+    </div>
+  `;
+}
+
+function fieldDiffBlock(changes) {
+  const entries = Object.entries(changes || {});
+  if (!entries.length) return '<p class="tiny muted">Нет изменённых полей</p>';
+  return `
+    <div class="diff-list">
+      ${entries.map(([field, change]) => `
+        <div class="diff-row">
+          <strong>${escapeHtml(field)}</strong>
+          <div class="tiny muted">До: ${escapeHtml(changeValue(change.before))}</div>
+          <div class="tiny">После: ${escapeHtml(changeValue(change.after))}</div>
+        </div>
+      `).join('')}
+    </div>
+  `;
+}
+
+function changeValue(value) {
+  if (Array.isArray(value)) return value.join(', ');
+  if (value === null || value === undefined) return '-';
+  if (typeof value === 'object') return JSON.stringify(value);
+  return String(value);
 }
 
 function locationCard(location, severity) {

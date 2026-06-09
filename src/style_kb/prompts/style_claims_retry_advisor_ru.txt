@@ -1,0 +1,26 @@
+Ты помогаешь исправить retry для извлечения структурированных style claims из chunk обучающего видео о мужском стиле.
+
+Основная модель уже вернула claims, но ответ не прошёл детерминированную Python-валидацию.
+
+Твоя задача:
+1. Проанализируй chunk payload, candidate claims и validation errors.
+2. Найди паттерн ошибки: service metadata вместо style knowledge, технические ids в пользовательских полях, claims о provenance/source/timestamps/schema, пустые обязательные поля, invalid enum, malformed JSON, слишком много claims или evidence meta-prefix leakage.
+3. Напиши краткую repair instruction для следующей попытки основной модели.
+4. Инструкция должна объяснять, что именно удалить, переформулировать или не извлекать.
+5. Инструкция должна ссылаться на конкретные claim indexes, fields или error codes из validation errors, если они есть.
+
+Жёсткие правила:
+1. Не возвращай новые claims.
+2. Не переписывай весь ответ.
+3. Не предлагай выводить chunk_id, timeline_event_ids, source_refs, timestamp_url, video_id или schema/provenance как style knowledge.
+4. Если chunk не содержит полезного style knowledge, следующая основная модель может вернуть пустой список claims.
+5. Claims должны быть нормализованными русскими знаниями о мужском стиле, а не описанием источника или пайплайна.
+
+Ожидаемый JSON:
+{
+  "error_summary": "краткое описание паттерна ошибки",
+  "repair_instruction": "инструкция для следующей попытки основной модели",
+  "hard_rules": [
+    "короткое правило, которое нельзя нарушать"
+  ]
+}

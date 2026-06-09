@@ -21,6 +21,20 @@ from style_kb.utils.files import read_json, write_json_atomic
 CLAIM_TYPES = ClaimType.values()
 CONFIDENCE_LEVELS = ConfidenceLevel.values()
 
+CLAIMS_RETRY_ADVISOR_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "error_summary": {"type": "string"},
+        "repair_instruction": {"type": "string"},
+        "hard_rules": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+    },
+    "required": ["error_summary", "repair_instruction", "hard_rules"],
+}
+
 
 @dataclass(slots=True)
 class ClaimsAnalysisResult:
@@ -101,6 +115,70 @@ class OpenAIClaimsClient:
         cached_payload = {"request": request_metadata, "diagnostics": diagnostics.to_dict(), "response": raw_payload}
         write_json_atomic(raw_output_path, cached_payload)
         return _result_from_cached_payload(cached_payload, fallback_output_text=response.output_text)
+
+    def analyze_claim_errors(
+        self,
+        *,
+        system_prompt: str,
+        repair_payload: dict[str, Any],
+        raw_output_path: Path,
+    ) -> dict[str, Any]:
+        request_text = "\n\n".join(
+            [
+                system_prompt.strip(),
+                "Данные для анализа:",
+                json.dumps(repair_payload, ensure_ascii=False, indent=2, sort_keys=True),
+            ]
+        )
+        timer = start_operation()
+        try:
+            response = call_with_retry(
+                lambda: self.client.responses.create(
+                    model=self.model,
+                    input=[{"role": "user", "content": [{"type": "input_text", "text": request_text}]}],
+                    text={
+                        "format": {
+                            "type": "json_schema",
+                            "name": "menswear_style_claims_retry_advice",
+                            "strict": True,
+                            "schema": CLAIMS_RETRY_ADVISOR_RESPONSE_SCHEMA,
+                        }
+                    },
+                ),
+                policy=self.retry_policy,
+                on_retry=self.on_retry,
+            )
+        except Exception as error:  # pragma: no cover - SDK exception surface depends on installed version
+            raise ProviderError(
+                "OpenAI claims retry advisor failed",
+                error_code="openai_claims_retry_advisor_failed",
+                details=str(error),
+            ) from error
+
+        raw_payload = response.model_dump(mode="json")
+        diagnostics = openai_response_diagnostics(
+            response,
+            raw_payload,
+            timer=timer,
+            raw_output_path=raw_output_path,
+        )
+        raw_payload["_style_kb_diagnostics"] = diagnostics.to_dict()
+        write_json_atomic(
+            raw_output_path,
+            {
+                "request": repair_payload,
+                "diagnostics": diagnostics.to_dict(),
+                "response": raw_payload,
+            },
+        )
+        try:
+            return json.loads(response.output_text)
+        except json.JSONDecodeError as error:
+            raise ProviderError(
+                "OpenAI claims retry advisor response is not valid JSON",
+                error_code="openai_claims_retry_advisor_json_parse_failed",
+                details=str(error),
+            ) from error
 
 
 def load_cached_claims_result(raw_output_path: Path) -> ClaimsAnalysisResult:

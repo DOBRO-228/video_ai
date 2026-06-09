@@ -9,6 +9,7 @@ description = "CLI-first multimodal knowledge base ingestion for YouTube videos.
 readme = "README.md"
 requires-python = "==3.14.5"
 dependencies = [
+  "google-genai>=1.53.0",
   "Jinja2>=3.1.6",
   "openai>=1.100.0",
   "pydantic>=2.11.0",

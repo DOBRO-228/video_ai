@@ -30,6 +30,20 @@ SEGMENT_RESPONSE_SCHEMA: dict[str, Any] = {
     "required": ["segments"],
 }
 
+SEGMENT_RETRY_ADVISOR_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "error_summary": {"type": "string"},
+        "repair_instruction": {"type": "string"},
+        "hard_rules": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+    },
+    "required": ["error_summary", "repair_instruction", "hard_rules"],
+}
+
 
 class OpenAISegmenterClient:
     def __init__(
@@ -99,5 +113,61 @@ class OpenAISegmenterClient:
             raise ProviderError(
                 "OpenAI speech segmentation response is not valid JSON",
                 error_code="openai_segmenter_json_parse_failed",
+                details=str(error),
+            ) from error
+
+    def analyze_segmentation_errors(
+        self,
+        *,
+        system_prompt: str,
+        repair_payload: dict[str, Any],
+        raw_output_path: Path,
+    ) -> dict[str, Any]:
+        request_text = "\n\n".join(
+            [
+                system_prompt.strip(),
+                "Данные для анализа:",
+                json.dumps(repair_payload, ensure_ascii=False, indent=2, sort_keys=True),
+            ]
+        )
+        try:
+            response = call_with_retry(
+                lambda: self.client.responses.create(
+                    model=self.model,
+                    input=[{"role": "user", "content": [{"type": "input_text", "text": request_text}]}],
+                    text={
+                        "format": {
+                            "type": "json_schema",
+                            "name": "semantic_speech_retry_advice",
+                            "strict": True,
+                            "schema": SEGMENT_RETRY_ADVISOR_RESPONSE_SCHEMA,
+                        }
+                    },
+                ),
+                policy=self.retry_policy,
+                on_retry=self.on_retry,
+            )
+        except Exception as error:  # pragma: no cover - SDK exception surface depends on installed version
+            raise ProviderError(
+                "OpenAI speech segmentation retry advisor failed",
+                error_code="openai_segmenter_retry_advisor_failed",
+                details=str(error),
+            ) from error
+
+        raw_payload = response.model_dump(mode="json")
+        write_json_atomic(
+            raw_output_path,
+            {
+                "request": repair_payload,
+                "response": raw_payload,
+            },
+        )
+
+        try:
+            return json.loads(response.output_text)
+        except json.JSONDecodeError as error:
+            raise ProviderError(
+                "OpenAI speech segmentation retry advisor response is not valid JSON",
+                error_code="openai_segmenter_retry_advisor_json_parse_failed",
                 details=str(error),
             ) from error

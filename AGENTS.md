@@ -70,6 +70,7 @@ Speech diarization uses raw Soniox speaker ids plus repository-level roles:
 API keys are loaded from `.env` into environment variables:
 
 - `SONIOX_API_KEY`
+- `GEMINI_API_KEY`
 - `OPENAI_API_KEY`
 
 Do not move API keys into YAML config. Do not print full API keys in logs or console.

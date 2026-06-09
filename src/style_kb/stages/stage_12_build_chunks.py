@@ -110,6 +110,7 @@ class Stage12BuildChunks(Stage):
             context.paths.stt_speech_segments,
             context.paths.timeline_events_jsonl,
             _prompt_path(context),
+            _retry_advisor_prompt_path(context),
         ]
 
     def output_files(self, context: StageContext) -> list:
@@ -228,13 +229,17 @@ def _build_chunk_plan(
     video_info: VideoInfo,
 ) -> _ValidatedChunkPlan:
     prompt_text = _prompt_path(context).read_text(encoding="utf-8")
+    retry_advisor_prompt_text = _retry_advisor_prompt_path(context).read_text(encoding="utf-8")
     prompt_sha = _sha256_text(prompt_text)
+    retry_advisor_prompt_sha = _sha256_text(retry_advisor_prompt_text)
     windows = _planner_windows(speech_segments, context)
     stale_raw_removed_count = _remove_stale_chunk_plan_raw_files(context, windows_count=len(windows))
     window_results = _plan_windows(
         context=context,
         system_prompt=prompt_text,
+        retry_advisor_prompt_text=retry_advisor_prompt_text,
         prompt_sha=prompt_sha,
+        retry_advisor_prompt_sha=retry_advisor_prompt_sha,
         windows=windows,
         timeline_events=timeline_events,
     )
@@ -251,9 +256,12 @@ def _build_chunk_plan(
         video_id=context.job.video_id,
         provider=context.config.chunking.provider,
         model=context.config.chunking.model,
+        retry_advisor_model=context.config.chunking.retry_advisor_model,
         mode=context.config.chunking.mode,
         prompt_file=context.config.chunking.prompt_file,
         prompt_sha256=prompt_sha,
+        retry_advisor_prompt_file=context.config.chunking.retry_advisor_prompt_file,
+        retry_advisor_prompt_sha256=retry_advisor_prompt_sha,
         max_words=context.config.chunking.max_words,
         max_speech_segments_per_chunk=context.config.chunking.max_speech_segments_per_chunk,
         question_answer_merge_seconds=context.config.chunking.question_answer_merge_seconds,
@@ -317,7 +325,9 @@ def _plan_windows(
     *,
     context: StageContext,
     system_prompt: str,
+    retry_advisor_prompt_text: str,
     prompt_sha: str,
+    retry_advisor_prompt_sha: str,
     windows: list[_PlannerWindow],
     timeline_events: list[TimelineEvent],
 ) -> list[_WindowPlanResult]:
@@ -336,7 +346,9 @@ def _plan_windows(
                 context=context,
                 api_key=api_key,
                 system_prompt=system_prompt,
+                retry_advisor_prompt_text=retry_advisor_prompt_text,
                 prompt_sha=prompt_sha,
+                retry_advisor_prompt_sha=retry_advisor_prompt_sha,
                 window=window,
                 timeline_events=timeline_events,
             ): window
@@ -422,7 +434,7 @@ def _plan_windows(
 def _remove_stale_chunk_plan_raw_files(context: StageContext, *, windows_count: int) -> int:
     if not context.paths.chunks_raw_dir.exists():
         return 0
-    pattern = re.compile(r"^chunk_plan_window_(\d{3})_(?:cache|attempt_\d{2})\.json$")
+    pattern = re.compile(r"^chunk_plan_window_(\d{3})_(?:cache|attempt_\d{2}|retry_advice_attempt_\d{2})\.json$")
     removed_paths: list[Path] = []
     for path in sorted(context.paths.chunks_raw_dir.glob("chunk_plan_window_*.json")):
         match = pattern.match(path.name)
@@ -440,12 +452,20 @@ def _plan_window_with_cache(
     context: StageContext,
     api_key: str | None,
     system_prompt: str,
+    retry_advisor_prompt_text: str,
     prompt_sha: str,
+    retry_advisor_prompt_sha: str,
     window: _PlannerWindow,
     timeline_events: list[TimelineEvent],
 ) -> _WindowPlanResult:
     planner_payload = _planner_payload(window, timeline_events)
-    request_metadata = _window_request_metadata(context, window, planner_payload, prompt_sha)
+    request_metadata = _window_request_metadata(
+        context,
+        window,
+        planner_payload,
+        prompt_sha,
+        retry_advisor_prompt_sha,
+    )
     cached_result = _load_cached_window_result(context, window, request_metadata)
     if cached_result is not None:
         return cached_result
@@ -458,7 +478,9 @@ def _plan_window_with_cache(
     return _plan_window_with_retries(
         context=context,
         client=client,
+        api_key=api_key,
         system_prompt=system_prompt,
+        retry_advisor_prompt_text=retry_advisor_prompt_text,
         prompt_sha=prompt_sha,
         window=window,
         planner_payload=planner_payload,
@@ -470,16 +492,30 @@ def _plan_window_with_retries(
     *,
     context: StageContext,
     client: OpenAIChunkPlannerClient,
+    api_key: str | None,
     system_prompt: str,
+    retry_advisor_prompt_text: str,
     prompt_sha: str,
     window: _PlannerWindow,
     planner_payload: dict[str, Any],
     request_metadata: dict[str, Any],
 ) -> _WindowPlanResult:
     feedback: list[str] = []
+    retry_advisor_instruction: str | None = None
     errors: list[dict[str, Any]] = []
+    advisor_client = OpenAIChunkPlannerClient(
+        api_key,
+        model=context.config.chunking.retry_advisor_model,
+        on_retry=_chunk_retry_logger(context),
+    )
     for attempt in range(1, context.config.chunking.max_retries + 1):
-        constraints_payload = _constraints_payload(context, window, prompt_sha, feedback)
+        constraints_payload = _constraints_payload(
+            context,
+            window,
+            prompt_sha,
+            feedback,
+            retry_advisor_instruction=retry_advisor_instruction,
+        )
         items: list[ChunkPlanItem] = []
         result: ChunkPlanAnalysisResult | None = None
         raw_output_path = context.paths.chunk_plan_raw_attempt(window.window_index, attempt)
@@ -596,6 +632,22 @@ def _plan_window_with_retries(
                 diagnostics=result.diagnostics,
             )
         diagnostics = result.diagnostics if result is not None else None
+        advisor_raw_output_path: Path | None = None
+        advisor_instruction: str | None = None
+        if attempt < context.config.chunking.max_retries:
+            advisor_raw_output_path = context.paths.chunk_plan_retry_advice_attempt(window.window_index, attempt)
+            advisor_instruction = _build_chunk_plan_retry_advice(
+                context=context,
+                advisor_client=advisor_client,
+                system_prompt=retry_advisor_prompt_text,
+                window=window,
+                planner_payload=planner_payload,
+                candidate_items=items,
+                validation_errors=validation_errors,
+                structured_errors=structured_validation_errors,
+                raw_output_path=advisor_raw_output_path,
+            )
+            retry_advisor_instruction = advisor_instruction
         errors.append(
             {
                 "window_index": window.window_index,
@@ -603,6 +655,8 @@ def _plan_window_with_retries(
                 "errors": validation_errors,
                 "structured_errors": structured_validation_errors,
                 "raw_output": str(raw_output_path),
+                "retry_advisor_raw_output": str(advisor_raw_output_path) if advisor_raw_output_path is not None else None,
+                "retry_advisor_instruction": advisor_instruction,
                 "diagnostics": diagnostics.to_dict() if diagnostics is not None else None,
             }
         )
@@ -627,7 +681,7 @@ def _plan_window_with_retries(
             attempt=attempt,
             extra={"window_index": window.window_index},
         )
-        feedback = validation_errors
+        feedback = _chunk_retry_feedback(validation_errors, advisor_instruction)
 
     raise _WindowPlanError(
         f"OpenAI chunk planner returned an invalid plan for window {window.window_index}",
@@ -740,6 +794,94 @@ def _write_window_cache(
     )
 
 
+def _build_chunk_plan_retry_advice(
+    *,
+    context: StageContext,
+    advisor_client: OpenAIChunkPlannerClient,
+    system_prompt: str,
+    window: _PlannerWindow,
+    planner_payload: dict[str, Any],
+    candidate_items: list[ChunkPlanItem],
+    validation_errors: list[str],
+    structured_errors: list[dict[str, Any]],
+    raw_output_path: Path,
+) -> str | None:
+    repair_payload = {
+        "video_id": context.job.video_id,
+        "window_index": window.window_index,
+        "main_model": context.config.chunking.model,
+        "retry_advisor_model": context.config.chunking.retry_advisor_model,
+        "constraints": {
+            "max_words": context.config.chunking.max_words,
+            "max_speech_segments_per_chunk": context.config.chunking.max_speech_segments_per_chunk,
+            "question_answer_merge_seconds": context.config.chunking.question_answer_merge_seconds,
+            "title_max_chars": context.config.chunking.title_max_chars,
+            "boundary_reason_max_chars": context.config.chunking.boundary_reason_max_chars,
+            "notes_max_chars": context.config.chunking.notes_max_chars,
+            "topic_max_chars": context.config.chunking.topic_max_chars,
+            "max_topics": context.config.chunking.max_topics,
+            "planning_segment_ids": [segment.segment_id for segment in window.core_segments],
+            "context_segment_ids_not_for_output": [
+                segment.segment_id for segment in [*window.context_before, *window.context_after]
+            ],
+        },
+        "validation_errors": validation_errors[:30],
+        "structured_errors": structured_errors[:30],
+        "candidate_chunks": [
+            _chunk_plan_item_payload(item, index=index)
+            for index, item in enumerate(candidate_items, start=1)
+        ],
+        "planner_input": planner_payload,
+    }
+    try:
+        advisor_payload = advisor_client.analyze_plan_errors(
+            system_prompt=system_prompt,
+            repair_payload=repair_payload,
+            raw_output_path=raw_output_path,
+        )
+    except ProviderError as error:
+        _log_chunk_plan_retry_advisor_failure(context, window=window, raw_output_path=raw_output_path, error=error)
+        return None
+
+    instruction = str(advisor_payload.get("repair_instruction") or "").strip()
+    if not instruction:
+        _log_chunk_plan_retry_advisor_failure(
+            context,
+            window=window,
+            raw_output_path=raw_output_path,
+            error=ProviderError(
+                "OpenAI chunk planner retry advisor returned an empty repair instruction",
+                error_code="openai_chunk_planner_retry_advisor_empty_instruction",
+            ),
+        )
+        return None
+
+    _log_chunk_plan_retry_advisor_success(
+        context,
+        window=window,
+        raw_output_path=raw_output_path,
+        advisor_payload=advisor_payload,
+    )
+    return instruction
+
+
+def _chunk_plan_item_payload(item: ChunkPlanItem, *, index: int) -> dict[str, Any]:
+    return {
+        "chunk_index": index,
+        "speech_segment_ids": item.speech_segment_ids,
+        "title": item.title,
+        "boundary_reason": item.boundary_reason,
+        "topics": item.topics,
+        "notes": item.notes,
+    }
+
+
+def _chunk_retry_feedback(validation_errors: list[str], advisor_instruction: str | None) -> list[str]:
+    if not advisor_instruction:
+        return validation_errors
+    return [*validation_errors, f"retry_advisor_instruction: {advisor_instruction}"]
+
+
 def _cache_metadata_mismatch_errors(cached_metadata: object, expected_metadata: dict[str, Any]) -> list[str]:
     if not isinstance(cached_metadata, dict):
         return [f"cache metadata has invalid shape: {type(cached_metadata).__name__}"]
@@ -762,15 +904,19 @@ def _window_request_metadata(
     window: _PlannerWindow,
     planner_payload: dict[str, Any],
     prompt_sha: str,
+    retry_advisor_prompt_sha: str,
 ) -> dict[str, Any]:
     return {
         "schema_version": _PLAN_SCHEMA_VERSION,
         "video_id": context.job.video_id,
         "provider": context.config.chunking.provider,
         "model": context.config.chunking.model,
+        "retry_advisor_model": context.config.chunking.retry_advisor_model,
         "mode": context.config.chunking.mode,
         "prompt_file": context.config.chunking.prompt_file,
         "prompt_sha256": prompt_sha,
+        "retry_advisor_prompt_file": context.config.chunking.retry_advisor_prompt_file,
+        "retry_advisor_prompt_sha256": retry_advisor_prompt_sha,
         "window_index": window.window_index,
         "planning_segment_ids": [segment.segment_id for segment in window.core_segments],
         "context_before_segment_ids": [segment.segment_id for segment in window.context_before],
@@ -999,9 +1145,12 @@ def _plan_validation_errors(
         "video_id": plan.video_id,
         "provider": plan.provider,
         "model": plan.model,
+        "retry_advisor_model": plan.retry_advisor_model,
         "mode": plan.mode,
         "prompt_file": plan.prompt_file,
         "prompt_sha256": plan.prompt_sha256,
+        "retry_advisor_prompt_file": plan.retry_advisor_prompt_file,
+        "retry_advisor_prompt_sha256": plan.retry_advisor_prompt_sha256,
         "max_words": plan.max_words,
         "max_speech_segments_per_chunk": plan.max_speech_segments_per_chunk,
         "question_answer_merge_seconds": plan.question_answer_merge_seconds,
@@ -1231,13 +1380,16 @@ def _constraints_payload(
     window: _PlannerWindow,
     prompt_sha: str,
     feedback: list[str],
+    *,
+    retry_advisor_instruction: str | None = None,
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "schema_version": _PLAN_SCHEMA_VERSION,
         "video_id": context.job.video_id,
         "mode": context.config.chunking.mode,
         "provider": context.config.chunking.provider,
         "model": context.config.chunking.model,
+        "retry_advisor_model": context.config.chunking.retry_advisor_model,
         "prompt_file": context.config.chunking.prompt_file,
         "prompt_sha256": prompt_sha,
         "planning_segment_ids": [segment.segment_id for segment in window.core_segments],
@@ -1263,17 +1415,24 @@ def _constraints_payload(
         "max_topics": context.config.chunking.max_topics,
         "retry_feedback": feedback,
     }
+    if retry_advisor_instruction:
+        payload["retry_advisor_instruction"] = retry_advisor_instruction
+    return payload
 
 
 def _plan_metadata(context: StageContext) -> dict[str, Any]:
     prompt_text = _prompt_path(context).read_text(encoding="utf-8")
+    retry_advisor_prompt_text = _retry_advisor_prompt_path(context).read_text(encoding="utf-8")
     return {
         "video_id": context.job.video_id,
         "provider": context.config.chunking.provider,
         "model": context.config.chunking.model,
+        "retry_advisor_model": context.config.chunking.retry_advisor_model,
         "mode": context.config.chunking.mode,
         "prompt_file": context.config.chunking.prompt_file,
         "prompt_sha256": _sha256_text(prompt_text),
+        "retry_advisor_prompt_file": context.config.chunking.retry_advisor_prompt_file,
+        "retry_advisor_prompt_sha256": _sha256_text(retry_advisor_prompt_text),
         "max_words": context.config.chunking.max_words,
         "max_speech_segments_per_chunk": context.config.chunking.max_speech_segments_per_chunk,
         "question_answer_merge_seconds": context.config.chunking.question_answer_merge_seconds,
@@ -1957,6 +2116,50 @@ def _log_plan_attempt(
     append_text(context.paths.stage_log(Stage12BuildChunks.name), "\n".join(lines), encoding="utf-8")
 
 
+def _log_chunk_plan_retry_advisor_success(
+    context: StageContext,
+    *,
+    window: _PlannerWindow,
+    raw_output_path: Path,
+    advisor_payload: dict[str, Any],
+) -> None:
+    lines = [
+        "",
+        "[chunk-plan-retry-advisor]",
+        f"run_id: {context.run_id or '-'}",
+        f"window_index: {window.window_index}",
+        f"raw_output_path: {raw_output_path}",
+        f"error_summary: {advisor_payload.get('error_summary') or ''}",
+        f"repair_instruction: {advisor_payload.get('repair_instruction') or ''}",
+    ]
+    hard_rules = advisor_payload.get("hard_rules")
+    if isinstance(hard_rules, list):
+        lines.append("hard_rules:")
+        lines.extend(f"  - {rule}" for rule in hard_rules[:10])
+    lines.append("")
+    append_text(context.paths.stage_log(Stage12BuildChunks.name), "\n".join(lines), encoding="utf-8")
+
+
+def _log_chunk_plan_retry_advisor_failure(
+    context: StageContext,
+    *,
+    window: _PlannerWindow,
+    raw_output_path: Path,
+    error: ProviderError,
+) -> None:
+    lines = [
+        "",
+        "[chunk-plan-retry-advisor-failed]",
+        f"run_id: {context.run_id or '-'}",
+        f"window_index: {window.window_index}",
+        f"raw_output_path: {raw_output_path}",
+        f"error_code: {error.error_code}",
+        f"error: {error}",
+        "",
+    ]
+    append_text(context.paths.stage_log(Stage12BuildChunks.name), "\n".join(lines), encoding="utf-8")
+
+
 def _log_window_cache(
     context: StageContext,
     *,
@@ -2021,6 +2224,10 @@ def _format_seconds(value: float | None) -> str:
 
 def _prompt_path(context: StageContext) -> Path:
     return Path(__file__).resolve().parents[1] / "prompts" / context.config.chunking.prompt_file
+
+
+def _retry_advisor_prompt_path(context: StageContext) -> Path:
+    return Path(__file__).resolve().parents[1] / "prompts" / context.config.chunking.retry_advisor_prompt_file
 
 
 def _compact_string(value: object) -> str:
