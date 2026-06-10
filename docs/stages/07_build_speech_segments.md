@@ -20,6 +20,13 @@ After LLM segmentation, consecutive short segments from the same speaker are mer
 
 Stage metrics include `semantic_retry_events_count`, `retry_advisor_used_count`, and `semantic_retry_resolved_count` for monitoring retry noise without adding deterministic boundary shifting.
 
+The semantic prompt is hardened for observed failure patterns:
+
+- dense ranges around 40-48 seconds with 90+ words and 6+ sentences should be split before validation;
+- boundaries must not split a recognized word or word form across units;
+- a colon that introduces a quoted question/example should stay with the quoted content until that mini-construction ends;
+- retry-advisor output must be a direct repair instruction for the next main-model attempt, not a replacement plan and not general advice.
+
 ## Inputs
 
 - `stt/speech_tokens.jsonl`
@@ -49,6 +56,7 @@ The stage can be skipped when raw segmentation output exists, all speech segment
 - `stt/speech_segments_raw.json` is retained for audit/debugging the accepted segmentation output. It is not KB input.
 - Retry attempts write `stt/speech_segments_raw_attempt_XX.json` before semantic-boundary validation, so rejected LLM responses remain inspectable after a later attempt succeeds.
 - Retry-advisor attempts are diagnostic prompt guidance only. They do not produce KB artifacts and must not be treated as accepted segmentation.
+- Do not weaken deterministic validation to reduce retry noise. Improve prompt examples and retry instructions first; add deterministic boundary repair only after a measured pattern justifies the risk.
 
 ## Related Code
 

@@ -30,8 +30,12 @@ Read the stage document before editing the corresponding `src/style_kb/stages/st
 
 - `job_id == video_id` in the MVP.
 - Stage skip requires both `validate_outputs(context)` and `outputs_are_current(context)`.
+- Stages with durable reports should validate report schema/config/input identity before skip, not only artifact existence.
 - JSON/JSONL/Markdown writes should use existing atomic write helpers.
 - Output objects that represent knowledge must preserve timestamp/source grounding.
+- Diagnostic/quarantine fields such as stage 10 `presentation_context` and raw provider outputs must not become KB style evidence.
 - Configuration comes from `src/style_kb/config/default.yaml`, not CLI flags.
 - API keys come from `.env`/environment variables, not YAML.
 - Avoid fallback behavior unless it is already explicit in a stage document.
+- Stage 08/09 changes must be measured by scene count, frame count, frame cap behavior, extraction elapsed time, duplicate frames skipped, stage 10 provider requests, and materialized visual event count.
+- Do not add embeddings, vector stores, CLIP/open-clip/torch, or other heavy ML dependencies for MVP visual frame selection.
