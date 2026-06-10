@@ -8,6 +8,8 @@ Download the audio track used for speech-to-text.
 
 The stage calls the `yt-dlp` audio wrapper with audio format and quality from config. It then runs `ffprobe` and stores the media probe payload so later stages can validate duration and detect audio/video mismatches.
 
+When configured, `download.remote_components` is passed to yt-dlp as `--remote-components` and logged in subprocess diagnostics.
+
 ## Inputs
 
 - `metadata/video_info.json`
@@ -35,4 +37,3 @@ The stage can be skipped when both files exist and `audio.ffprobe.json` reports 
 - `src/style_kb/stages/stage_02_download_audio.py`
 - `src/style_kb/clients/ytdlp.py`
 - `src/style_kb/clients/media.py`
-

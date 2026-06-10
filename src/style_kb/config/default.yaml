@@ -10,6 +10,7 @@ download:
   audio_format: mp3
   audio_quality: "0"
   cookies_from_browser: null
+  remote_components: ejs:github
 
 stt:
   provider: soniox
@@ -94,7 +95,7 @@ vision:
   provider: openai
   model: gpt-5-nano
   detail: high
-  batch_size: 12
+  batch_size: 6
   presenter_bootstrap_enabled: true
   presenter_bootstrap_prompt_file: presenter_profile_ru.txt
   presenter_bootstrap_scene_limit: 12

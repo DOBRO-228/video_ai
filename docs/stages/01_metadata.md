@@ -8,6 +8,8 @@ Create the canonical video metadata artifacts for the job. This stage establishe
 
 The stage calls the `yt-dlp` wrapper `fetch_metadata()` with the job URL and optional `download.cookies_from_browser` from config. It writes the raw `yt-dlp` payload, then normalizes the subset needed by the pipeline into `VideoInfo`.
 
+When configured, `download.remote_components` is passed to yt-dlp as `--remote-components` and logged in subprocess diagnostics.
+
 It also updates the SQLite job row with `title` and `channel`.
 
 ## Inputs

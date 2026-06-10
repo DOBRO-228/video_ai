@@ -10,11 +10,11 @@ The stage uses an OpenAI structured-output chunk planner. The model receives com
 
 - semantic `SpeechSegment` objects as the primary units;
 - overlapping `TimelineEvent` ids;
-- compact visual hints such as visual summary, on-screen text, topics, items, and presenter relevance.
+- compact scrubbed visual hints such as style evidence text, visual summary, on-screen text, topics, items, and presenter relevance.
 
 The model returns only a chunk plan: contiguous `speech_segment_ids`, a short title, boundary reason, topics, and notes. Python then validates the plan and materializes final `Chunk` objects deterministically.
 
-The LLM is not allowed to generate final chunk text. Final `speech_text`, `dialogue_text`, `visual_text`, `combined_text`, `timeline_event_ids`, timestamps, and `source_refs` are built by code.
+The LLM is not allowed to generate final chunk text. Final `speech_text`, `dialogue_text`, `visual_text`, `combined_text`, `timeline_event_ids`, timestamps, and `source_refs` are built by code. During materialization, presentation/video-format wording is filtered from `visual_text`, `presenter_brief`, `topics`, `entities`, and the visual portion of `combined_text`; remaining contamination is a validation failure.
 
 When a planner attempt fails Python validation, the stage records structured errors and sends the failed candidate plan, planner input, constraints, and errors to the retry-advisor model configured in `chunking.retry_advisor_model`. The advisor returns only repair instructions, not replacement chunks. Those instructions are added to the next retry prompt for the main planner model. Final acceptance remains deterministic.
 
@@ -56,6 +56,7 @@ The stage can be skipped only when `chunk_plan.json` matches current config/prom
 - Skip validation materializes expected chunks once and compares that deterministic result with `chunks.jsonl`.
 - Chunk time ranges are based on speech segment ranges, not full visual scene boundaries.
 - Visual evidence is attached by overlap, or by nearby distance within `visual_attach_seconds` when needed.
+- Planner input and final chunks must use only scrubbed style evidence. Diagnostic fields such as stage 10 `presentation_context` and raw scene outputs are never planner evidence.
 - Offscreen questions should stay with nearby host answers when they form one QA exchange.
 - A QA split that cannot be merged without exceeding hard chunk limits is allowed only with a warning in `chunk_plan_warnings.json`, chunk plan notes, stage log, and console progress.
 - `title`, `channel`, and canonical video URL come from `metadata/video_info.json`, not from a best-effort timeline fallback.

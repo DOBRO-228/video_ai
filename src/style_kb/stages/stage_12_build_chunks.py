@@ -46,6 +46,7 @@ from style_kb.stages.common import (
     youtube_source_ref,
 )
 from style_kb.stages.diagnostics import validation_preview
+from style_kb.stages.stage_10_describe_visuals import visual_field_noise_markers
 from style_kb.utils.collections import stable_unique
 from style_kb.utils.files import append_text, read_json, write_json_atomic
 from style_kb.utils.ids import chunk_id
@@ -197,6 +198,7 @@ class Stage12BuildChunks(Stage):
                 "chunk_plan_parallel_requests": context.config.chunking.planner_parallel_requests,
                 "chunk_plan_warnings_count": len(validated_plan.warnings),
                 "chunk_plan_stale_raw_removed_count": validated_plan.stale_raw_removed_count,
+                "chunk_presentation_final_chunks_count": _chunk_contamination_chunks_count(validated_plan.chunks),
             },
         )
 
@@ -1230,8 +1232,12 @@ def _validate_plan_and_materialize(
         return errors, []
     try:
         chunks = _materialize_chunks(plan, speech_segments, timeline_events, context, video_info)
+        chunks = [_sanitize_chunk_for_kb(chunk) for chunk in chunks]
     except Exception as error:
         return [f"chunk materialization failed: {type(error).__name__}: {error}"], []
+    contamination_errors = _chunk_contamination_errors(chunks)
+    if contamination_errors:
+        return contamination_errors, []
     return [], chunks
 
 
@@ -1256,17 +1262,28 @@ def _materialize_chunks(
             )
         speech_text = " ".join(segment.text for segment in item_segments if segment.text).strip()
         dialogue_text = _dialogue_text_from_segments(item_segments)
-        presenter_brief = _presenter_brief(chunk_events)
+        presenter_brief = _safe_chunk_text(_presenter_brief(chunk_events))
         visual_text = compact_join(
             [
-                " ".join(event.visual_summary for event in chunk_events if event.visual_summary).strip(),
-                "\n".join(text for event in chunk_events for text in event.on_screen_text).strip(),
+                " ".join(_safe_chunk_text(event.visual_summary) for event in chunk_events if event.visual_summary).strip(),
+                "\n".join(
+                    _safe_chunk_text(text)
+                    for event in chunk_events
+                    for text in event.on_screen_text
+                    if _safe_chunk_text(text)
+                ).strip(),
+                "; ".join(
+                    _safe_chunk_text(value)
+                    for event in chunk_events
+                    for value in [*event.items, *event.topics]
+                    if _safe_chunk_text(value)
+                ).strip(),
             ]
         )
         combined_text = compact_join([dialogue_text or speech_text, presenter_brief, visual_text])
-        topics = stable_unique([*item.topics, *(topic for event in chunk_events for topic in event.topics)])
-        entities = stable_unique(item_name for event in chunk_events for item_name in event.items)
-        on_screen_text = stable_unique(text for event in chunk_events for text in event.on_screen_text)
+        topics = stable_unique(_safe_chunk_text(topic) for topic in [*item.topics, *(topic for event in chunk_events for topic in event.topics)] if _safe_chunk_text(topic))
+        entities = stable_unique(_safe_chunk_text(item_name) for event in chunk_events for item_name in event.items if _safe_chunk_text(item_name))
+        on_screen_text = stable_unique(_safe_chunk_text(text) for event in chunk_events for text in event.on_screen_text if _safe_chunk_text(text))
         speaker_roles = stable_unique(segment.speaker_role for segment in item_segments if segment.speaker_role)
         modality = []
         if speech_text:
@@ -1301,6 +1318,86 @@ def _materialize_chunks(
             )
         )
     return chunks
+
+
+def _sanitize_chunk_for_kb(chunk: Chunk) -> Chunk:
+    presenter_brief = _safe_chunk_text(chunk.presenter_brief)
+    visual_text = _safe_chunk_text(chunk.visual_text)
+    topics = stable_unique(_safe_chunk_text(topic) for topic in chunk.topics if _safe_chunk_text(topic))
+    entities = stable_unique(_safe_chunk_text(entity) for entity in chunk.entities if _safe_chunk_text(entity))
+    on_screen_text = stable_unique(_safe_chunk_text(text) for text in chunk.on_screen_text if _safe_chunk_text(text))
+    combined_text = compact_join([chunk.dialogue_text or chunk.speech_text, presenter_brief, visual_text])
+    return chunk.model_copy(
+        update={
+            "presenter_brief": presenter_brief,
+            "visual_text": visual_text,
+            "combined_text": combined_text,
+            "on_screen_text": on_screen_text,
+            "topics": topics,
+            "entities": entities,
+        }
+    )
+
+
+def _chunk_contamination_errors(chunks: list[Chunk]) -> list[str]:
+    errors: list[str] = []
+    for chunk in chunks:
+        fields = {
+            "visual_text": visual_field_noise_markers(chunk.visual_text),
+            "presenter_brief": visual_field_noise_markers(chunk.presenter_brief),
+            "topics": visual_field_noise_markers(chunk.topics),
+            "entities": visual_field_noise_markers(chunk.entities),
+            "combined_text": visual_field_noise_markers(_combined_visual_component(chunk)),
+        }
+        fields = {field: markers for field, markers in fields.items() if markers}
+        if not fields:
+            continue
+        for field, markers in fields.items():
+            errors.append(
+                f"chunk {chunk.chunk_id} field {field} contains presentation/technical markers: {markers[:5]}"
+            )
+    return errors
+
+
+def _chunk_contamination_chunks_count(chunks: list[Chunk]) -> int:
+    return sum(
+        1
+        for chunk in chunks
+        if any(
+            visual_field_noise_markers(value)
+            for value in [
+                chunk.visual_text,
+                chunk.presenter_brief,
+                chunk.topics,
+                chunk.entities,
+                _combined_visual_component(chunk),
+            ]
+        )
+    )
+
+
+def _safe_chunk_text(value: object) -> str:
+    text = _compact_string(value)
+    if not text:
+        return ""
+    if visual_field_noise_markers(text):
+        return ""
+    return text
+
+
+def _timeline_event_style_evidence_text(event: TimelineEvent) -> str:
+    return compact_join(
+        [
+            _safe_chunk_text(event.visual_summary),
+            "; ".join(_safe_chunk_text(item) for item in event.items if _safe_chunk_text(item)),
+            "; ".join(_safe_chunk_text(topic) for topic in event.topics if _safe_chunk_text(topic)),
+            "; ".join(_safe_chunk_text(text) for text in event.on_screen_text if _safe_chunk_text(text)),
+        ]
+    )
+
+
+def _combined_visual_component(chunk: Chunk) -> str:
+    return compact_join([chunk.presenter_brief, chunk.visual_text])
 
 
 def _planner_windows(segments: list[SpeechSegment], context: StageContext) -> list[_PlannerWindow]:
@@ -1364,10 +1461,11 @@ def _segment_payload(segment: SpeechSegment, timeline_events: list[TimelineEvent
                 "event_id": event.event_id,
                 "start": event.start,
                 "end": event.end,
-                "visual_summary": event.visual_summary,
-                "on_screen_text": event.on_screen_text,
-                "topics": event.topics,
-                "items": event.items,
+                "style_evidence_text": _timeline_event_style_evidence_text(event),
+                "visual_summary": _safe_chunk_text(event.visual_summary),
+                "on_screen_text": [_safe_chunk_text(text) for text in event.on_screen_text if _safe_chunk_text(text)],
+                "topics": [_safe_chunk_text(topic) for topic in event.topics if _safe_chunk_text(topic)],
+                "items": [_safe_chunk_text(item) for item in event.items if _safe_chunk_text(item)],
                 "presenter_relevance": event.presenter_context.relevance,
             }
             for event in overlapping_events

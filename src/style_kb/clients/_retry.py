@@ -30,6 +30,10 @@ class RetryPolicy:
         offset = delay * self.jitter * (2 * random.random() - 1)
         return max(0.0, delay + offset)
 
+    def delay_for_retry_after(self, retry_after_seconds: float) -> float:
+        delay = max(0.0, min(retry_after_seconds, self.retry_after_cap_seconds))
+        return min(self.retry_after_cap_seconds, delay + delay * self.jitter * random.random())
+
 
 OnRetry = Callable[[int, float, BaseException], None]
 
@@ -50,7 +54,7 @@ def call_with_retry(
                 break
             server_hint = _retry_after_seconds(error)
             if server_hint is not None:
-                delay = max(0.0, min(server_hint, policy.retry_after_cap_seconds))
+                delay = policy.delay_for_retry_after(server_hint)
             else:
                 delay = policy.delay_for_attempt(attempt)
             if on_retry is not None:

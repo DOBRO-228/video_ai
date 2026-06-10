@@ -24,7 +24,7 @@ from style_kb.pipeline.paths import JobPaths
 from style_kb.state.db import initialize_database
 from style_kb.state.repository import StateRepository
 from style_kb.utils.env import load_dotenv
-from style_kb.utils.files import append_text
+from style_kb.utils.files import append_text, read_json, write_json_atomic
 from style_kb.utils.json import pretty_json
 from style_kb.utils.youtube import extract_video_id
 
@@ -113,6 +113,7 @@ class PipelineRunner:
             pipeline_logger = self._pipeline_logger(paths)
             self._emit_run_started(pipeline_logger, job)
             self._emit_completed_job_reuse_decisions(pipeline_logger, job=job, paths=paths)
+            self._resolve_failure_report_safely(paths=paths, job=job)
             pipeline_logger.emit(
                 PipelineEvent.JOB_COMPLETED,
                 job_id=job.job_id,
@@ -440,6 +441,7 @@ class PipelineRunner:
         final_job = self.repository.get_job(job.job_id)
         if final_job is None:
             raise StyleKbError(f"job not found after completion: {job.job_id}")
+        self._resolve_failure_report_safely(paths=paths, job=final_job)
         pipeline_logger.emit(
             PipelineEvent.JOB_COMPLETED,
             job_id=final_job.job_id,
@@ -788,6 +790,43 @@ class PipelineRunner:
     def _write_partial_quality_report_safely(*, paths: JobPaths, job: Job, failed_stage: str | None) -> None:
         try:
             write_partial_quality_report(paths, job=job, failed_stage=failed_stage)
+        except Exception:
+            return
+
+    def _resolve_failure_report_safely(self, *, paths: JobPaths, job: Job) -> None:
+        if not paths.failure_report.exists():
+            return
+        try:
+            payload = read_json(paths.failure_report)
+            resolved_at = datetime.now(tz=UTC).isoformat()
+            history_payload = {
+                **(payload if isinstance(payload, dict) else {"payload": payload}),
+                "status": "resolved",
+                "resolution": {
+                    "resolved_at": resolved_at,
+                    "resolved_by_run_id": self._current_run_id(),
+                    "resolved_job_status": job.status.value,
+                    "job_finished_at": job.finished_at.isoformat() if job.finished_at else None,
+                },
+            }
+            history_path = paths.failure_history_report(self._current_run_id())
+            write_json_atomic(history_path, history_payload)
+            paths.failure_report.unlink()
+            append_text(
+                paths.pipeline_human_log,
+                "\n".join(
+                    [
+                        "",
+                        "[failure-report-resolved]",
+                        f"run_id: {self._current_run_id()}",
+                        f"job_id: {job.job_id}",
+                        f"resolved_at: {resolved_at}",
+                        f"history_path: {history_path}",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
         except Exception:
             return
 

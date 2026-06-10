@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import re
-
 from style_kb.errors import StageExecutionError
 from style_kb.models import (
     Chunk,
@@ -27,19 +25,11 @@ from style_kb.stages.common import (
 from style_kb.stages.stage_10_describe_visuals import (
     baseline_leakage_metrics_for_events,
     empty_baseline_leakage_metrics,
+    presentation_noise_markers,
     technical_leakage_metrics_for_events,
 )
 from style_kb.utils.collections import stable_unique
 from style_kb.utils.pydantic_io import read_model, write_model
-
-_PRESENTATION_NOISE_PATTERNS = (
-    r"\b(?:появлен\w*|появил\w*|появля\w*)\b",
-    r"\b(?:справа|слева|сверху|снизу)\b",
-    r"\b(?:прав\w+|лев\w+|верхн\w+|нижн\w+)\s+(?:сторон\w+|част\w+|угл\w+)\b",
-    r"\b(?:дополнительн\w+|альтернативн\w+)\s+образ\w*\b",
-    r"\bдемонстрируем\w*\s+как\s+отдельн\w+\s+элемент\w*\b",
-)
-
 
 class Stage16QualityReport(Stage):
     name = "16_quality_report"
@@ -263,7 +253,7 @@ def _chunk_presentation_noise_metrics(chunks: list[Chunk]) -> dict[str, int]:
             "presenter_brief": _presentation_noise_markers(chunk.presenter_brief),
             "topics": _presentation_noise_markers(chunk.topics),
             "entities": _presentation_noise_markers(chunk.entities),
-            "combined_text": _presentation_noise_markers(chunk.combined_text),
+            "combined_text": _presentation_noise_markers(_chunk_combined_visual_component(chunk)),
         }
         fields = {field: markers for field, markers in fields.items() if markers}
         if not fields:
@@ -331,20 +321,8 @@ def _empty_chunk_presentation_noise_metrics() -> dict[str, int]:
 
 
 def _presentation_noise_markers(value: object) -> list[str]:
-    values = value if isinstance(value, list) else [value]
-    markers: list[str] = []
-    for item in values:
-        raw_text = re.sub(r"\s+", " ", str(item or "")).strip()
-        if not raw_text:
-            continue
-        normalized = _normalize_quality_text(raw_text)
-        if any(re.search(pattern, normalized, flags=re.UNICODE) for pattern in _PRESENTATION_NOISE_PATTERNS):
-            markers.append(raw_text)
-    return stable_unique(markers)
+    return presentation_noise_markers(value)
 
 
-def _normalize_quality_text(value: str) -> str:
-    text = value.casefold().replace("ё", "е")
-    text = re.sub(r"[-‐‑‒–—]+", " ", text)
-    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
-    return re.sub(r"\s+", " ", text, flags=re.UNICODE).strip()
+def _chunk_combined_visual_component(chunk: Chunk) -> str:
+    return "\n".join(part for part in [chunk.presenter_brief, chunk.visual_text] if part.strip())

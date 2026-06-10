@@ -85,6 +85,15 @@ _TECHNICAL_VISUAL_PATTERNS = (
     r"\b(?:фон\w*|background|интерьер\w*|книжн\w*\s+полк\w*|полк\w*|стол\w*|камин\w*)\b",
     r"\b(?:микрофон\w*|петличк\w*|lapel\s+mic|microphone)\b",
 )
+_PRESENTATION_NOISE_PATTERNS = (
+    r"\b(?:появлен\w*|появил\w*|появля\w*)\b",
+    r"\b(?:справа|слева|сверху|снизу)\b",
+    r"\b(?:прав\w+|лев\w+|верхн\w+|нижн\w+)\s+(?:сторон\w+|част\w+|угл\w+)\b",
+    r"\b(?:дополнительн\w+|альтернативн\w+)\s+образ\w*\b",
+    r"\bдемонстрируем\w*\s+как\s+отдельн\w+\s+элемент\w*\b",
+    r"\b(?:в\s+кадр\w*|на\s+кадр\w*)\b",
+    r"\b(?:леж\w*|расположен\w*|размещен\w*|размещён\w*)\s+(?:справа|слева|сверху|снизу)\b",
+)
 _BARE_COLOR_LABELS = frozenset(
     {
         "белый",
@@ -195,6 +204,12 @@ class _SceneResult:
 
 
 @dataclass(slots=True)
+class _VisualEventBuildResult:
+    event: VisualEvent
+    safety_metrics: dict[str, int]
+
+
+@dataclass(slots=True)
 class _VisualContentLeakage:
     reason: str
     error_code: str
@@ -232,6 +247,21 @@ def empty_technical_leakage_metrics() -> dict[str, int]:
         "technical_leakage_items_count": 0,
         "technical_leakage_style_topics_count": 0,
         "technical_leakage_notes_count": 0,
+    }
+
+
+def empty_visual_safety_metrics() -> dict[str, int]:
+    return {
+        "technical_leakage_raw_scenes_count": 0,
+        "technical_leakage_sinked_scenes_count": 0,
+        "technical_leakage_scrubbed_scenes_count": 0,
+        "technical_leakage_repaired_scenes_count": 0,
+        "technical_leakage_final_scenes_count": 0,
+        "presentation_noise_final_scenes_count": 0,
+        "unsafe_repair_rejected_count": 0,
+        "presentation_context_entries_count": 0,
+        "presentation_context_model_entries_count": 0,
+        "presentation_context_scrubbed_entries_count": 0,
     }
 
 
@@ -300,6 +330,7 @@ class Stage10DescribeVisuals(Stage):
         total_output_tokens = 0
         total_reasoning_tokens = 0
         total_tokens = 0
+        visual_safety_metrics = empty_visual_safety_metrics()
         completed = 0
         pending_tasks: list[_SceneTask] = []
 
@@ -313,7 +344,9 @@ class Stage10DescribeVisuals(Stage):
                 pending_tasks.append(task)
                 continue
             output_files.extend(cached_result.raw_output_paths)
-            visual_events[task.order] = _build_visual_event(context, task, cached_result.analysis)
+            built_event = _build_visual_event(context, task, cached_result.analysis)
+            visual_events[task.order] = built_event.event
+            _merge_visual_safety_metrics(visual_safety_metrics, built_event.safety_metrics)
             completed += 1
             cached_count += 1
             total_input_tokens += cached_result.analysis.usage["input_tokens"]
@@ -371,7 +404,9 @@ class Stage10DescribeVisuals(Stage):
                             raise error
                         result = future.result()
                         output_files.extend(result.raw_output_paths)
-                        visual_events[task.order] = _build_visual_event(context, task, result.analysis)
+                        built_event = _build_visual_event(context, task, result.analysis)
+                        visual_events[task.order] = built_event.event
+                        _merge_visual_safety_metrics(visual_safety_metrics, built_event.safety_metrics)
                         completed += 1
                         api_count += 1
                         total_input_tokens += result.analysis.usage["input_tokens"]
@@ -388,6 +423,7 @@ class Stage10DescribeVisuals(Stage):
         technical_leakage_metrics = technical_leakage_metrics_for_events(ordered_visual_events)
         _log_baseline_leakage_summary(context, baseline_leakage_metrics)
         _log_technical_leakage_summary(context, technical_leakage_metrics)
+        _log_visual_safety_summary(context, visual_safety_metrics)
         return StageResult(
             output_files=_dedupe_paths(output_files),
             metrics={
@@ -405,6 +441,7 @@ class Stage10DescribeVisuals(Stage):
                 "presenter_primary_example_scenes_count": presenter_counts[PresenterRelevance.PRIMARY_EXAMPLE.value],
                 **baseline_leakage_metrics,
                 **technical_leakage_metrics,
+                **visual_safety_metrics,
             },
         )
 
@@ -1003,11 +1040,12 @@ def _request_scene_analysis(
     )
 
 
-def _build_visual_event(context: StageContext, task: _SceneTask, analysis: VisionAnalysisResult) -> VisualEvent:
-    payload = analysis.payload
+def _build_visual_event(context: StageContext, task: _SceneTask, analysis: VisionAnalysisResult) -> _VisualEventBuildResult:
+    raw_payload = analysis.payload
+    payload, safety_metrics = _sanitize_visual_payload_for_kb(raw_payload)
     scene = task.scene
     presenter_context = PresenterContext.model_validate(payload.get("presenter_context"))
-    return VisualEvent(
+    event = VisualEvent(
         visual_event_id=visual_event_id(context.job.video_id, scene.start, scene.end),
         video_id=context.job.video_id,
         scene_id=scene.scene_id,
@@ -1016,6 +1054,7 @@ def _build_visual_event(context: StageContext, task: _SceneTask, analysis: Visio
         timestamp_url=build_timestamp_url(context.job.video_id, scene.start),
         frames=task.frames,
         presenter_context=presenter_context,
+        presentation_context=stable_unique(payload.get("presentation_context") or []),
         visual_summary=str(payload.get("visual_summary") or ""),
         observations=stable_unique(payload.get("observations") or []),
         interpretations=stable_unique(payload.get("interpretations") or []),
@@ -1026,6 +1065,95 @@ def _build_visual_event(context: StageContext, task: _SceneTask, analysis: Visio
         notes=str(payload.get("notes") or ""),
         source_refs=[youtube_source_ref(context.job.video_id, scene.start, scene.end, modality="visual")],
     )
+    final_technical_leakage = _technical_visual_leakage_from_payload(event.model_dump(mode="json"))
+    if final_technical_leakage is not None:
+        safety_metrics["technical_leakage_final_scenes_count"] = 1
+    if _presentation_noise_fields_from_payload(event.model_dump(mode="json")):
+        safety_metrics["presentation_noise_final_scenes_count"] = 1
+    return _VisualEventBuildResult(event=event, safety_metrics=safety_metrics)
+
+
+def _sanitize_visual_payload_for_kb(payload: dict) -> tuple[dict, dict[str, int]]:
+    sanitized = dict(payload)
+    metrics = empty_visual_safety_metrics()
+    if _technical_visual_leakage_from_payload(payload) is not None:
+        metrics["technical_leakage_raw_scenes_count"] = 1
+
+    presentation_context = _presentation_context_values(payload.get("presentation_context"))
+    metrics["presentation_context_model_entries_count"] = len(presentation_context)
+    if any(_visual_field_noise_markers(value) for value in presentation_context):
+        metrics["technical_leakage_sinked_scenes_count"] = 1
+
+    scrubbed_entries = 0
+    for field in ("observations", "interpretations", "items", "style_topics"):
+        cleaned, removed = _scrub_visual_list_field(payload.get(field), field=field)
+        sanitized[field] = cleaned
+        presentation_context.extend(removed)
+        scrubbed_entries += len(removed)
+
+    for field in ("visual_summary", "notes"):
+        text = _clean_visual_label(payload.get(field))
+        if text and _visual_field_noise_markers(text):
+            sanitized[field] = ""
+            presentation_context.append(text)
+            scrubbed_entries += 1
+        else:
+            sanitized[field] = text
+
+    presenter_payload = dict(payload.get("presenter_context") or {})
+    scene_deltas, removed_scene_deltas = _scrub_visual_list_field(
+        presenter_payload.get("scene_deltas"),
+        field="scene_deltas",
+    )
+    presenter_payload["scene_deltas"] = scene_deltas
+    presentation_context.extend(removed_scene_deltas)
+    scrubbed_entries += len(removed_scene_deltas)
+
+    narrative_brief = _clean_visual_label(presenter_payload.get("narrative_brief"))
+    if narrative_brief and _visual_field_noise_markers(narrative_brief):
+        presenter_payload["narrative_brief"] = ""
+        presentation_context.append(narrative_brief)
+        scrubbed_entries += 1
+    else:
+        presenter_payload["narrative_brief"] = narrative_brief
+
+    sanitized["presenter_context"] = presenter_payload
+    sanitized["presentation_context"] = stable_unique(_clean_visual_label(value) for value in presentation_context)
+    metrics["presentation_context_entries_count"] = len(sanitized["presentation_context"])
+    metrics["presentation_context_scrubbed_entries_count"] = scrubbed_entries
+    if scrubbed_entries:
+        metrics["technical_leakage_scrubbed_scenes_count"] = 1
+    return sanitized, metrics
+
+
+def _presentation_context_values(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [text for text in (_clean_visual_label(item) for item in value) if text]
+    text = _clean_visual_label(value)
+    return [text] if text else []
+
+
+def _scrub_visual_list_field(value: object, *, field: str) -> tuple[list[str], list[str]]:
+    if not isinstance(value, list):
+        return [], []
+    kept: list[str] = []
+    removed: list[str] = []
+    for item in stable_unique(_clean_visual_label(raw_item) for raw_item in value):
+        if not item:
+            continue
+        if _visual_field_noise_markers(item):
+            removed.append(item)
+            continue
+        if field == _VisualListField.ITEMS.value:
+            if _should_drop_visual_label(item, _VisualListField.ITEMS):
+                removed.append(item)
+                continue
+        elif field == _VisualListField.STYLE_TOPICS.value:
+            if _should_drop_visual_label(item, _VisualListField.STYLE_TOPICS):
+                removed.append(item)
+                continue
+        kept.append(item)
+    return kept, removed
 
 
 def _scene_prompt_for_attempt(system_prompt: str, leakage: _VisualContentLeakage | None) -> str:
@@ -1126,6 +1254,31 @@ def _matches_any_pattern(value: str, patterns: tuple[str, ...]) -> bool:
     return any(re.search(pattern, value, flags=re.UNICODE) is not None for pattern in patterns)
 
 
+def technical_visual_markers(value: object) -> list[str]:
+    return _technical_visual_markers(value)
+
+
+def presentation_noise_markers(value: object) -> list[str]:
+    values = value if isinstance(value, list) else [value]
+    markers: list[str] = []
+    for item in values:
+        raw_text = _clean_visual_label(item)
+        normalized = _normalize_visual_label(raw_text)
+        if not normalized:
+            continue
+        if _matches_any_pattern(normalized, _PRESENTATION_NOISE_PATTERNS):
+            markers.append(raw_text)
+    return stable_unique(markers)
+
+
+def visual_field_noise_markers(value: object) -> list[str]:
+    return _visual_field_noise_markers(value)
+
+
+def _visual_field_noise_markers(value: object) -> list[str]:
+    return stable_unique([*technical_visual_markers(value), *presentation_noise_markers(value)])
+
+
 def _technical_visual_leakage_from_payload(payload: dict) -> _VisualContentLeakage | None:
     fields: dict[str, list[str]] = {}
     structured_errors: list[dict[str, object]] = []
@@ -1170,6 +1323,22 @@ def _technical_visual_markers(value: object) -> list[str]:
         if _matches_any_pattern(normalized, _TECHNICAL_VISUAL_PATTERNS):
             markers.append(raw_text)
     return stable_unique(markers)
+
+
+def _presentation_noise_fields_from_payload(payload: dict) -> dict[str, list[str]]:
+    fields = {
+        "visual_summary": presentation_noise_markers(payload.get("visual_summary")),
+        "observations": presentation_noise_markers(payload.get("observations")),
+        "interpretations": presentation_noise_markers(payload.get("interpretations")),
+        "items": presentation_noise_markers(payload.get("items")),
+        "style_topics": presentation_noise_markers(payload.get("style_topics")),
+        "notes": presentation_noise_markers(payload.get("notes")),
+    }
+    presenter_context = payload.get("presenter_context")
+    if isinstance(presenter_context, dict):
+        fields["scene_deltas"] = presentation_noise_markers(presenter_context.get("scene_deltas"))
+        fields["narrative_brief"] = presentation_noise_markers(presenter_context.get("narrative_brief"))
+    return {field: markers for field, markers in fields.items() if markers}
 
 
 def _baseline_leakage_from_payload(payload: dict, presenter_profile: PresenterProfile) -> _VisualContentLeakage | None:
@@ -1427,6 +1596,26 @@ def _log_technical_leakage_summary(context: StageContext, metrics: dict[str, int
     append_text(context.paths.stage_log(Stage10DescribeVisuals.name), "\n".join(lines), encoding="utf-8")
 
 
+def _log_visual_safety_summary(context: StageContext, metrics: dict[str, int]) -> None:
+    lines = [
+        "",
+        "[visual-safety-summary]",
+        f"run_id: {context.run_id or '-'}",
+        f"technical_leakage_raw_scenes_count: {metrics['technical_leakage_raw_scenes_count']}",
+        f"technical_leakage_sinked_scenes_count: {metrics['technical_leakage_sinked_scenes_count']}",
+        f"technical_leakage_scrubbed_scenes_count: {metrics['technical_leakage_scrubbed_scenes_count']}",
+        f"technical_leakage_repaired_scenes_count: {metrics['technical_leakage_repaired_scenes_count']}",
+        f"technical_leakage_final_scenes_count: {metrics['technical_leakage_final_scenes_count']}",
+        f"presentation_noise_final_scenes_count: {metrics['presentation_noise_final_scenes_count']}",
+        f"unsafe_repair_rejected_count: {metrics['unsafe_repair_rejected_count']}",
+        f"presentation_context_entries_count: {metrics['presentation_context_entries_count']}",
+        f"presentation_context_model_entries_count: {metrics['presentation_context_model_entries_count']}",
+        f"presentation_context_scrubbed_entries_count: {metrics['presentation_context_scrubbed_entries_count']}",
+        "",
+    ]
+    append_text(context.paths.stage_log(Stage10DescribeVisuals.name), "\n".join(lines), encoding="utf-8")
+
+
 def _log_vision_content_validation(
     context: StageContext,
     *,
@@ -1573,6 +1762,11 @@ def _dedupe_paths(paths: list[Path]) -> list[Path]:
         seen.add(path)
         unique.append(path)
     return unique
+
+
+def _merge_visual_safety_metrics(target: dict[str, int], source: dict[str, int]) -> None:
+    for key, value in source.items():
+        target[key] = target.get(key, 0) + int(value)
 
 
 def _scene_retry_logger(context: StageContext, task: _SceneTask) -> OnRetry:

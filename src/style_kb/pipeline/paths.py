@@ -78,6 +78,10 @@ class JobPaths:
         return self.job_dir / "reports"
 
     @property
+    def failure_history_dir(self) -> Path:
+        return self.reports_dir / "failure_history"
+
+    @property
     def logs_dir(self) -> Path:
         return self.job_dir / "logs"
 
@@ -227,6 +231,10 @@ class JobPaths:
     def failure_report(self) -> Path:
         return self.reports_dir / "failure_report.json"
 
+    def failure_history_report(self, run_id: str) -> Path:
+        safe_run_id = "".join(character if character.isalnum() or character in {"-", "_"} else "_" for character in run_id)
+        return self.failure_history_dir / f"failure_report_resolved_{safe_run_id}.json"
+
     @property
     def partial_quality_report(self) -> Path:
         return self.reports_dir / "partial_quality_report.json"
@@ -298,6 +306,7 @@ class JobPaths:
             self.export_obsidian_dir / "videos",
             self.export_obsidian_dir / "chunks",
             self.reports_dir,
+            self.failure_history_dir,
             self.logs_dir,
         ]:
             path.mkdir(parents=True, exist_ok=True)

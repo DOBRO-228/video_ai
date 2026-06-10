@@ -20,6 +20,7 @@ class DownloadConfig(BaseModel):
     audio_format: str
     audio_quality: str
     cookies_from_browser: str | None = None
+    remote_components: str | None = None
 
 
 class SttContextConfig(BaseModel):

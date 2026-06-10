@@ -55,6 +55,19 @@ _ADVICE: dict[str, ErrorAdvice] = {
         actions=["Install deno, node, bun, or quickjs.", "Run style-kb resume JOB_ID."],
         inspect=["jobs/JOB_ID/logs/STAGE.log"],
     ),
+    "yt_dlp_remote_components_failed": ErrorAdvice(
+        error_code="yt_dlp_remote_components_failed",
+        retryable=True,
+        resume_safe_after_fix=True,
+        summary="yt-dlp could not use configured YouTube remote components.",
+        actions=[
+            "Inspect the yt-dlp stage log for remote component warnings.",
+            "Check download.remote_components in src/style_kb/config/default.yaml.",
+            "Upgrade yt-dlp if the installed version does not support remote components.",
+            "Run style-kb resume JOB_ID.",
+        ],
+        inspect=["src/style_kb/config/default.yaml", "jobs/JOB_ID/logs/STAGE.log"],
+    ),
     "yt_dlp_version_check_failed": ErrorAdvice(
         error_code="yt_dlp_version_check_failed",
         retryable=False,

@@ -196,6 +196,7 @@ class VisualEvent(GroundedTimeBoundModel):
     scene_id: str
     frames: list[FrameRef]
     presenter_context: PresenterContext
+    presentation_context: list[str] = Field(default_factory=list)
     visual_summary: str
     observations: list[str]
     interpretations: list[str]

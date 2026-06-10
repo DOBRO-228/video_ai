@@ -10,6 +10,7 @@ from style_kb.errors import StyleKbError
 from style_kb.models import Job, JobState, StageState, StageStatus
 from style_kb.pipeline.paths import JobPaths
 from style_kb.pipeline.runner import PipelineRunner
+from style_kb.utils.files import read_json
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 
@@ -81,11 +82,23 @@ def _artifact_paths(job_id: str) -> dict[str, str]:
 
 def _print_diagnostics_block(job: Job, stages: list[StageStatus], paths: JobPaths) -> None:
     failed_stage = next((stage for stage in stages if stage.status == StageState.FAILED), None)
-    if job.status != JobState.FAILED and failed_stage is None:
+    has_failure_history = bool(_latest_failure_history(paths))
+    if job.status != JobState.FAILED and failed_stage is None and not paths.failure_report.exists() and not has_failure_history:
         return
     typer.echo("diagnostics:")
-    failure_report_status = "" if paths.failure_report.exists() else " (missing)"
-    typer.echo(f"  failure_report: {paths.failure_report}{failure_report_status}")
+    if paths.failure_report.exists():
+        typer.echo(f"  current_failure_report: {paths.failure_report}")
+    else:
+        typer.echo("  current_failure_report: none")
+    latest_history = _latest_failure_history(paths)
+    if latest_history is not None:
+        payload = _read_json_safely(latest_history)
+        resolution = payload.get("resolution") if isinstance(payload, dict) else None
+        typer.echo(f"  last_failure_status: {payload.get('status') if isinstance(payload, dict) else 'resolved'}")
+        if isinstance(resolution, dict):
+            typer.echo(f"  last_failure_resolved_at: {resolution.get('resolved_at') or '-'}")
+            typer.echo(f"  last_failure_resolved_by_run_id: {resolution.get('resolved_by_run_id') or '-'}")
+        typer.echo(f"  last_failure_report: {latest_history}")
     typer.echo(f"  pipeline_log: {paths.pipeline_log}")
     if failed_stage is not None:
         typer.echo(f"  failed_stage_log: {paths.stage_log(failed_stage.stage_name)}")
@@ -103,6 +116,21 @@ def _print_diagnostics_block(job: Job, stages: list[StageStatus], paths: JobPath
     typer.echo(f"  resume: style-kb resume {job.job_id}")
 
 
+def _latest_failure_history(paths: JobPaths) -> Path | None:
+    if not paths.failure_history_dir.exists():
+        return None
+    candidates = sorted(paths.failure_history_dir.glob("failure_report_resolved_*.json"), key=lambda path: path.stat().st_mtime)
+    return candidates[-1] if candidates else None
+
+
+def _read_json_safely(path: Path) -> dict:
+    try:
+        payload = read_json(path)
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def _print_stage_status(stage: StageStatus, *, job: Job, paths: JobPaths) -> None:
     log_path = paths.stage_log(stage.stage_name)
     parts = [
@@ -115,10 +143,10 @@ def _print_stage_status(stage: StageStatus, *, job: Job, paths: JobPaths) -> Non
         parts.append(f"log={log_path}")
     typer.echo(" ".join(parts))
     if stage.status == StageState.FAILED or stage.stage_name == job.current_stage:
-        _print_stage_diagnostics(stage, paths=paths)
+        _print_stage_diagnostics(stage, job=job, paths=paths)
 
 
-def _print_stage_diagnostics(stage: StageStatus, *, paths: JobPaths) -> None:
+def _print_stage_diagnostics(stage: StageStatus, *, job: Job, paths: JobPaths) -> None:
     duration = _duration_seconds(stage)
     values = {
         "error_code": stage.error_code,
@@ -127,7 +155,11 @@ def _print_stage_diagnostics(stage: StageStatus, *, paths: JobPaths) -> None:
         "finished_at": stage.finished_at.isoformat() if stage.finished_at else None,
         "duration_seconds": f"{duration:.3f}" if duration is not None else None,
         "log_path": str(paths.stage_log(stage.stage_name)),
-        "failure_report": str(paths.failure_report) if paths.failure_report.exists() else None,
+        "failure_report": (
+            str(paths.failure_report)
+            if paths.failure_report.exists() and (job.status == JobState.FAILED or stage.status == StageState.FAILED)
+            else None
+        ),
         "input_files": str(len(stage.input_files)),
         "output_files": str(len(stage.output_files)),
         "metrics": _compact_mapping(stage.metrics),

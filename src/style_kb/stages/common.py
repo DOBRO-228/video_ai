@@ -197,6 +197,7 @@ def log_openai_retry(
         "[openai-retry]",
         f"attempt: {attempt}",
         f"next_delay_seconds: {delay_seconds:.2f}",
+        f"retry_reason: {_openai_retry_reason(error)}",
         f"error: {type(error).__name__}: {error}",
     ]
     request_id = request_id_from_error(error)
@@ -209,3 +210,17 @@ def log_openai_retry(
         lines.extend(context_lines)
     lines.append("")
     append_text(stage_log_path, "\n".join(lines), encoding="utf-8")
+
+
+def _openai_retry_reason(error: BaseException) -> str:
+    status_code = response_status_from_error(error)
+    if status_code == 429:
+        return "rate_limit"
+    if status_code is not None and status_code >= 500:
+        return "server_error"
+    error_name = type(error).__name__.casefold()
+    if "timeout" in error_name:
+        return "timeout"
+    if "connection" in error_name:
+        return "connection"
+    return "retryable_error"

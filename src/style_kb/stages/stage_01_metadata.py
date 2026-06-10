@@ -28,6 +28,7 @@ class Stage01Metadata(Stage):
             context.job.url,
             log_path=context.paths.stage_log(self.name),
             cookies_from_browser=context.config.download.cookies_from_browser,
+            remote_components=context.config.download.remote_components,
             stdout_artifact=context.paths.metadata_raw_ytdlp,
             pipeline_logger=context.pipeline_logger,
             job_id=context.job.job_id,
@@ -59,6 +60,7 @@ class Stage01Metadata(Stage):
                 "url": context.job.url,
                 "video_id": context.job.video_id,
                 "cookies_from_browser": context.config.download.cookies_from_browser,
+                "yt_dlp_remote_components": context.config.download.remote_components or "disabled",
                 "yt_dlp_version": raw_metadata.get("_style_kb_ytdlp_version"),
                 "title": video_info.title,
                 "channel": video_info.channel,
@@ -72,6 +74,7 @@ class Stage01Metadata(Stage):
             metrics={
                 "duration": video_info.duration,
                 "yt_dlp_version": raw_metadata.get("_style_kb_ytdlp_version"),
+                "yt_dlp_remote_components": raw_metadata.get("_style_kb_ytdlp_remote_components"),
                 "title_present": bool(video_info.title),
                 "channel_present": bool(video_info.channel),
             },

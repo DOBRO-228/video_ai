@@ -31,6 +31,7 @@ class Stage03DownloadVideoProxy(Stage):
             height=context.config.download.video_height,
             video_format=context.config.download.video_format,
             cookies_from_browser=context.config.download.cookies_from_browser,
+            remote_components=context.config.download.remote_components,
             log_path=context.paths.stage_log(self.name),
             pipeline_logger=context.pipeline_logger,
             job_id=context.job.job_id,
@@ -59,6 +60,7 @@ class Stage03DownloadVideoProxy(Stage):
             {
                 "requested_video_height": context.config.download.video_height,
                 "requested_video_format": context.config.download.video_format,
+                "yt_dlp_remote_components": context.config.download.remote_components or "disabled",
                 "destination": str(context.paths.downloads_video_proxy),
                 "file_size_bytes": size_bytes,
                 "ffprobe_duration": duration,

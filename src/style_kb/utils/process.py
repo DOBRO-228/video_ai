@@ -36,6 +36,7 @@ def run_subprocess(
     stderr_limit_bytes: int = _STREAM_LOG_LIMIT_BYTES,
     stdout_artifact: Path | None = None,
     text_log_streams: bool = True,
+    diagnostics: dict[str, object] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     started_at = datetime.now(tz=UTC)
     timer_started = perf_counter()
@@ -52,7 +53,7 @@ def run_subprocess(
         data={
             "command": redacted_args,
             "cwd": str(cwd) if cwd else None,
-            "error_code": error_code,
+            **(diagnostics or {}),
         },
     )
     finished_at = datetime.now(tz=UTC)
@@ -88,6 +89,7 @@ def run_subprocess(
     if log_path is not None:
         stage_name = _stage_name_from_log_path(log_path)
         run_id = pipeline_logger.run_id if pipeline_logger is not None else "-"
+        status = "ok" if completed.returncode == 0 else "failed"
         header_lines = [
             "",
             "[subprocess-attempt]",
@@ -96,7 +98,7 @@ def run_subprocess(
             f"finished_at: {finished_at.isoformat()}",
             f"duration_seconds: {duration_seconds:.3f}",
             f"stage: {stage_name}",
-            f"error_code: {error_code}",
+            f"status: {status}",
             f"return_code: {completed.returncode}",
             f"stdout_bytes: {stdout_bytes}",
             f"stderr_bytes: {stderr_bytes}",
@@ -109,10 +111,14 @@ def run_subprocess(
             f"warning_count: {len(warning_lines)}",
             "command: " + " ".join(redacted_args),
         ]
+        if completed.returncode != 0:
+            header_lines.append(f"failure_code: {error_code}")
         if cwd is not None:
             header_lines.append(f"cwd: {cwd}")
         if stdout_artifact is not None:
             header_lines.append(f"stdout_artifact: {stdout_artifact}")
+        for key, value in (diagnostics or {}).items():
+            header_lines.append(f"{key}: {value}")
         if text_log_streams:
             stream_lines = ["", "[stdout]", stdout_log, "", "[stderr]", stderr_log, ""]
         else:
@@ -122,7 +128,7 @@ def run_subprocess(
     event_data = {
         "command": redacted_args,
         "cwd": str(cwd) if cwd else None,
-        "error_code": error_code,
+        "status": "ok" if completed.returncode == 0 else "failed",
         "return_code": completed.returncode,
         "stdout_bytes": stdout_bytes,
         "stderr_bytes": stderr_bytes,
@@ -131,7 +137,10 @@ def run_subprocess(
         "warning_count": len(warning_lines),
         "warnings": warning_lines[:5],
         "stdout_artifact": str(stdout_artifact) if stdout_artifact is not None else None,
+        **(diagnostics or {}),
     }
+    if completed.returncode != 0:
+        event_data["failure_code"] = error_code
     _emit_subprocess_event(
         pipeline_logger,
         PipelineEvent.SUBPROCESS_COMPLETED if completed.returncode == 0 else PipelineEvent.SUBPROCESS_FAILED,

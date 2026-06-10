@@ -8,6 +8,8 @@ Download the visual proxy video used for scene detection and keyframe extraction
 
 The stage calls the `yt-dlp` video proxy wrapper using configured height and format. By default this is a 720p MP4 proxy. MP4/H.264 is preferred for decoder compatibility, with fallback to any MP4 proxy when H.264 is unavailable. It then runs `ffprobe` and stores the result for duration and FPS consumers.
 
+When configured, `download.remote_components` is passed to yt-dlp as `--remote-components` and logged in subprocess diagnostics.
+
 ## Inputs
 
 - `metadata/video_info.json`

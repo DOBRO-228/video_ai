@@ -15,11 +15,17 @@ MIN_YT_DLP_VERSION = (2025, 11, 12)
 SUPPORTED_JS_RUNTIMES = ("deno", "node", "bun", "quickjs")
 
 
-def _base_args(cookies_from_browser: str | None) -> list[str]:
+def _base_args(cookies_from_browser: str | None, remote_components: str | None) -> list[str]:
     args = ["yt-dlp", "--no-playlist", "--no-progress"]
     if cookies_from_browser:
         args.extend(["--cookies-from-browser", cookies_from_browser])
+    if remote_components:
+        args.extend(["--remote-components", remote_components])
     return args
+
+
+def _download_diagnostics(remote_components: str | None) -> dict[str, object]:
+    return {"yt_dlp_remote_components": remote_components or "disabled"}
 
 
 def fetch_metadata(
@@ -27,6 +33,7 @@ def fetch_metadata(
     *,
     log_path: Path,
     cookies_from_browser: str | None,
+    remote_components: str | None,
     stdout_artifact: Path | None = None,
     pipeline_logger: PipelineLogger | None = None,
     job_id: str | None = None,
@@ -42,7 +49,7 @@ def fetch_metadata(
         stage=stage,
         ordinal=ordinal,
     )
-    args = _base_args(cookies_from_browser) + ["--dump-single-json", url]
+    args = _base_args(cookies_from_browser, remote_components) + ["--dump-single-json", url]
     completed = run_subprocess(
         args,
         error_code="yt_dlp_metadata_failed",
@@ -54,9 +61,12 @@ def fetch_metadata(
         ordinal=ordinal,
         stdout_limit_bytes=0,
         stdout_artifact=stdout_artifact,
+        diagnostics=_download_diagnostics(remote_components),
     )
+    _raise_for_remote_components_warning(completed.stderr, remote_components=remote_components)
     metadata = json.loads(completed.stdout)
     metadata["_style_kb_ytdlp_version"] = version_text
+    metadata["_style_kb_ytdlp_remote_components"] = remote_components or "disabled"
     return metadata
 
 
@@ -67,6 +77,7 @@ def download_audio(
     audio_format: str,
     audio_quality: str,
     cookies_from_browser: str | None,
+    remote_components: str | None,
     log_path: Path,
     pipeline_logger: PipelineLogger | None = None,
     job_id: str | None = None,
@@ -86,7 +97,7 @@ def download_audio(
     with tempfile.TemporaryDirectory(dir=destination.parent) as temp_dir_name:
         temp_dir = Path(temp_dir_name)
         template = temp_dir / "source.%(ext)s"
-        args = _base_args(cookies_from_browser) + [
+        args = _base_args(cookies_from_browser, remote_components) + [
             "--extract-audio",
             "--audio-format",
             audio_format,
@@ -96,7 +107,7 @@ def download_audio(
             str(template),
             url,
         ]
-        run_subprocess(
+        completed = run_subprocess(
             args,
             error_code="yt_dlp_audio_failed",
             log_path=log_path,
@@ -105,7 +116,9 @@ def download_audio(
             video_id=video_id,
             stage=stage,
             ordinal=ordinal,
+            diagnostics=_download_diagnostics(remote_components),
         )
+        _raise_for_remote_components_warning(completed.stderr, remote_components=remote_components)
         candidates = sorted(temp_dir.glob(f"*.{audio_format}"))
         if not candidates:
             candidates = sorted(temp_dir.glob("*"))
@@ -121,6 +134,7 @@ def download_video_proxy(
     height: int,
     video_format: str,
     cookies_from_browser: str | None,
+    remote_components: str | None,
     log_path: Path,
     pipeline_logger: PipelineLogger | None = None,
     job_id: str | None = None,
@@ -141,7 +155,7 @@ def download_video_proxy(
         temp_dir = Path(temp_dir_name)
         template = temp_dir / "video.%(ext)s"
         format_selector = _video_proxy_format_selector(height)
-        args = _base_args(cookies_from_browser) + [
+        args = _base_args(cookies_from_browser, remote_components) + [
             "-f",
             format_selector,
             "--merge-output-format",
@@ -150,7 +164,7 @@ def download_video_proxy(
             str(template),
             url,
         ]
-        run_subprocess(
+        completed = run_subprocess(
             args,
             error_code="yt_dlp_video_failed",
             log_path=log_path,
@@ -159,7 +173,9 @@ def download_video_proxy(
             video_id=video_id,
             stage=stage,
             ordinal=ordinal,
+            diagnostics=_download_diagnostics(remote_components),
         )
+        _raise_for_remote_components_warning(completed.stderr, remote_components=remote_components)
         candidates = sorted(temp_dir.glob(f"*.{video_format}"))
         if not candidates:
             candidates = sorted(temp_dir.glob("*"))
@@ -180,6 +196,38 @@ def _video_proxy_format_selector(height: int) -> str:
         f"/bestvideo{generic_mp4_filter}"
         f"/best{generic_mp4_filter}"
         f"/best{generic_filter}"
+    )
+
+
+def _raise_for_remote_components_warning(stderr: str, *, remote_components: str | None) -> None:
+    if not remote_components:
+        return
+    warning_lines = [
+        line.strip()
+        for line in stderr.splitlines()
+        if _is_remote_components_warning(line)
+    ]
+    if not warning_lines:
+        return
+    details = "\n".join(warning_lines[:10])
+    raise ExternalToolError(
+        (
+            "yt-dlp reported that YouTube remote components are not active. "
+            f"Configured download.remote_components={remote_components!r}, but yt-dlp still emitted remote component warnings."
+        ),
+        error_code="yt_dlp_remote_components_failed",
+        details=details,
+    )
+
+
+def _is_remote_components_warning(line: str) -> bool:
+    text = line.casefold()
+    return (
+        "remote components" in text
+        or "remote component" in text
+        or "remote-components" in text
+        or "challenge solver script" in text
+        or "challenge solving failed" in text
     )
 
 

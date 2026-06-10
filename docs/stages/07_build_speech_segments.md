@@ -18,6 +18,8 @@ Units are forced to break on speaker changes. The LLM is not allowed to combine 
 
 After LLM segmentation, consecutive short segments from the same speaker are merged when the merged segment still respects max duration and max word constraints.
 
+Stage metrics include `semantic_retry_events_count`, `retry_advisor_used_count`, and `semantic_retry_resolved_count` for monitoring retry noise without adding deterministic boundary shifting.
+
 ## Inputs
 
 - `stt/speech_tokens.jsonl`
