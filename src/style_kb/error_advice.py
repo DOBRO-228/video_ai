@@ -197,6 +197,36 @@ _ADVICE: dict[str, ErrorAdvice] = {
             "jobs/JOB_ID/stt/speech_segments_retry_advice_attempt_*.json",
         ],
     ),
+    "openai_segmenter_unsafe_unit_boundary": ErrorAdvice(
+        error_code="openai_segmenter_unsafe_unit_boundary",
+        retryable=True,
+        resume_safe_after_fix=True,
+        summary="OpenAI speech segmentation ended a segment at a non-segmentable unit boundary.",
+        actions=[
+            "Inspect the stage log for the boundary unit and retry-advisor instruction.",
+            "Run style-kb resume JOB_ID.",
+        ],
+        inspect=[
+            "jobs/JOB_ID/logs/07_build_speech_segments.log",
+            "jobs/JOB_ID/stt/speech_segments_raw_attempt_*.json",
+            "jobs/JOB_ID/stt/speech_segments_retry_advice_attempt_*.json",
+        ],
+    ),
+    "openai_segmenter_crossed_must_boundary": ErrorAdvice(
+        error_code="openai_segmenter_crossed_must_boundary",
+        retryable=True,
+        resume_safe_after_fix=True,
+        summary="OpenAI speech segmentation crossed a required unit boundary such as a speaker change.",
+        actions=[
+            "Inspect the stage log for the required boundary unit and retry-advisor instruction.",
+            "Run style-kb resume JOB_ID.",
+        ],
+        inspect=[
+            "jobs/JOB_ID/logs/07_build_speech_segments.log",
+            "jobs/JOB_ID/stt/speech_segments_raw_attempt_*.json",
+            "jobs/JOB_ID/stt/speech_segments_retry_advice_attempt_*.json",
+        ],
+    ),
     "openai_segmenter_failed": ErrorAdvice(
         error_code="openai_segmenter_failed",
         retryable=True,

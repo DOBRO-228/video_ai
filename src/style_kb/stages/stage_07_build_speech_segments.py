@@ -62,6 +62,9 @@ class _TranscriptUnit:
     word_count: int
     speaker: str | None
     speaker_role: str | None
+    boundary_reason: str
+    can_end_segment: bool
+    must_end_segment: bool
 
 
 @dataclass(slots=True)
@@ -110,8 +113,12 @@ class Stage07BuildSpeechSegments(Stage):
         tokens = load_speech_tokens(context.paths.stt_speech_tokens)
         if not segments or not tokens:
             return False
+        units = _build_transcript_units(tokens, context)
+        if not units:
+            return False
 
         token_positions = {token.token_index: index for index, token in enumerate(tokens)}
+        unit_by_end_position = {unit.token_end_position: unit for unit in units}
         max_duration = context.config.speech_segmentation.max_segment_seconds
         max_words = context.config.speech_segmentation.max_segment_words
         previous_end_position = -1
@@ -137,6 +144,14 @@ class Stage07BuildSpeechSegments(Stage):
             if start_position is None or end_position is None or start_position > end_position:
                 return False
             if start_position != previous_end_position + 1:
+                return False
+            if not _segment_boundary_is_valid_for_units(
+                units=units,
+                unit_by_end_position=unit_by_end_position,
+                start_position=start_position,
+                end_position=end_position,
+                tokens_count=len(tokens),
+            ):
                 return False
 
             group = tokens[start_position : end_position + 1]
@@ -195,6 +210,8 @@ class Stage07BuildSpeechSegments(Stage):
         write_models_jsonl(context.paths.stt_speech_segments, segments)
         durations = [round(segment.end - segment.start, 3) for segment in segments]
         words = [_word_count_from_tokens(tokens[_token_position(tokens, segment.token_start_index) : _token_position(tokens, segment.token_end_index) + 1]) for segment in segments]
+        unit_boundary_reasons = Counter(unit.boundary_reason for unit in units)
+        segmentable_unit_boundaries = sum(1 for unit in units if unit.can_end_segment)
         raw_payload = read_payload(context.paths.stt_speech_segments_raw)
         openai_response_id = raw_payload.get("id")
         append_stage_summary(
@@ -214,6 +231,9 @@ class Stage07BuildSpeechSegments(Stage):
                 "accepted_attempt": attempts_used,
                 "segments_count": len(segments),
                 "semantic_units_count": len(units),
+                "unit_boundary_reasons": dict(unit_boundary_reasons),
+                "segmentable_unit_boundaries_count": segmentable_unit_boundaries,
+                "non_segmentable_unit_boundaries_count": len(units) - segmentable_unit_boundaries,
                 "duration_seconds": _distribution(durations),
                 "word_count": _distribution(words),
                 "semantic_boundary_violations": _semantic_boundary_violations(segments)[:5],
@@ -234,6 +254,8 @@ class Stage07BuildSpeechSegments(Stage):
                 "semantic_retry_resolved_count": 1 if retry_feedback else 0,
                 "max_segment_duration": max(durations) if durations else 0,
                 "max_segment_words": max(words) if words else 0,
+                "segmentable_unit_boundaries_count": segmentable_unit_boundaries,
+                "non_segmentable_unit_boundaries_count": len(units) - segmentable_unit_boundaries,
             },
         )
 
@@ -657,6 +679,43 @@ def _collect_raw_segment_validation_errors(
                     ),
                 }
             )
+        crossed_must_boundaries = [
+            unit
+            for unit in units[unit_start_index - 1 : unit_end_index - 1]
+            if unit.must_end_segment
+        ]
+        if crossed_must_boundaries:
+            first_boundary = crossed_must_boundaries[0]
+            errors.append(
+                {
+                    **common_payload,
+                    "code": "openai_segmenter_crossed_must_boundary",
+                    "message": (
+                        f"segment {segment_index} range {unit_start_index}-{unit_end_index} "
+                        f"crosses required boundary after unit {first_boundary.unit_index}"
+                    ),
+                    "boundary_unit_index": first_boundary.unit_index,
+                    "boundary_reason": first_boundary.boundary_reason,
+                }
+            )
+        if unit_end_index < len(units):
+            end_unit = units[unit_end_index - 1]
+            if not end_unit.can_end_segment:
+                next_unit = units[unit_end_index]
+                errors.append(
+                    {
+                        **common_payload,
+                        "code": "openai_segmenter_unsafe_unit_boundary",
+                        "message": (
+                            f"segment {segment_index} ends at non-segmentable unit boundary "
+                            f"after unit {unit_end_index}"
+                        ),
+                        "boundary_unit_index": unit_end_index,
+                        "boundary_reason": end_unit.boundary_reason,
+                        "text_tail": _clip_text(_join_tokens(group)[-160:], limit=160),
+                        "next_text_head": _clip_text(next_unit.text, limit=160),
+                    }
+                )
         expected_start = unit_end_index + 1
 
     if expected_start != len(units) + 1:
@@ -690,6 +749,23 @@ def _raw_unit_index(raw_segment: dict[str, Any], key: str) -> int | None:
     if isinstance(value, int):
         return value
     return None
+
+
+def _segment_boundary_is_valid_for_units(
+    *,
+    units: list[_TranscriptUnit],
+    unit_by_end_position: dict[int, _TranscriptUnit],
+    start_position: int,
+    end_position: int,
+    tokens_count: int,
+) -> bool:
+    end_unit = unit_by_end_position.get(end_position)
+    if end_unit is None:
+        return False
+    for unit in units:
+        if unit.must_end_segment and start_position <= unit.token_end_position < end_position:
+            return False
+    return end_position == tokens_count - 1 or end_unit.can_end_segment
 
 
 def _merge_short_same_speaker_segments(
@@ -825,6 +901,7 @@ def _build_prompt(
         "",
         "Сделай новое полное разбиение. Не повторяй эти ошибки.",
         "Жёсткие лимиты из блока `Ограничения сегментации` важнее идеальной смысловой границы: нельзя превышать max_segment_seconds или max_segment_words.",
+        "Нельзя заканчивать сегмент на unit с can_end_segment=false. Unit с must_end_segment=true обязан быть концом сегмента.",
         "Soft semantic density rule также обязателен для финальной валидации: не оставляй сегмент, где одновременно duration_seconds > preferred_max_segment_seconds, words_count >= preferred_max_segment_words и sentences_count >= preferred_max_segment_sentences.",
         "Если semantic boundary выглядит сомнительно, сдвигай только локальную границу к ближайшему завершённому предложению.",
         "Не исправляй одну плохую границу объединением большого блока, если такой блок нарушает лимиты.",
@@ -1083,6 +1160,9 @@ def _candidate_plan_item(
             "duration_seconds": round(group[-1].end - group[0].start, 3),
             "words_count": _word_count_from_tokens(group),
             "sentences_count": _sentence_boundary_count(text),
+            "end_boundary_reason": end_unit.boundary_reason,
+            "can_end_segment": end_unit.can_end_segment,
+            "must_end_segment": end_unit.must_end_segment,
         }
     )
     return payload
@@ -1125,6 +1205,9 @@ def _raw_segments_for_advisor(
                         "duration_seconds": round(group[-1].end - group[0].start, 3),
                         "words_count": _word_count_from_tokens(group),
                         "sentences_count": _sentence_boundary_count(text),
+                        "end_boundary_reason": end_unit.boundary_reason,
+                        "can_end_segment": end_unit.can_end_segment,
+                        "must_end_segment": end_unit.must_end_segment,
                         "speakers": [
                             {"speaker": speaker, "speaker_role": speaker_role}
                             for speaker, speaker_role in _content_speaker_identities(group)
@@ -1300,19 +1383,26 @@ def _build_transcript_units(tokens: list[SpeechToken], context: StageContext) ->
         if _content_token_starts_word(tokens, position, previous_position):
             current_words += 1
         next_content_position = content_positions[content_index + 1] if content_index + 1 < len(content_positions) else None
-        if not _should_break_unit(
+        boundary_reason = _unit_boundary_reason(
             tokens=tokens,
             start_position=content_positions[start_content_index],
             end_position=position,
             next_content_position=next_content_position,
             current_words=current_words,
             context=context,
-        ):
+        )
+        if boundary_reason is None:
             continue
         unit_end_position = _extend_through_trailing_whitespace(tokens, position, next_content_position)
         unit_start_position = content_positions[start_content_index]
         unit_tokens = tokens[unit_start_position : unit_end_position + 1]
         unit_speaker, unit_speaker_role = _single_content_speaker(unit_tokens)
+        can_end_segment = _can_end_segment_at_unit_boundary(
+            tokens=tokens,
+            end_position=position,
+            next_content_position=next_content_position,
+            boundary_reason=boundary_reason,
+        )
         units.append(
             _TranscriptUnit(
                 unit_index=len(units) + 1,
@@ -1326,6 +1416,9 @@ def _build_transcript_units(tokens: list[SpeechToken], context: StageContext) ->
                 word_count=current_words,
                 speaker=unit_speaker,
                 speaker_role=unit_speaker_role,
+                boundary_reason=boundary_reason,
+                can_end_segment=can_end_segment,
+                must_end_segment=boundary_reason in {"end", "speaker_change"},
             )
         )
         start_content_index = content_index + 1
@@ -1333,7 +1426,7 @@ def _build_transcript_units(tokens: list[SpeechToken], context: StageContext) ->
     return units
 
 
-def _should_break_unit(
+def _unit_boundary_reason(
     *,
     tokens: list[SpeechToken],
     start_position: int,
@@ -1341,31 +1434,102 @@ def _should_break_unit(
     next_content_position: int | None,
     current_words: int,
     context: StageContext,
-) -> bool:
+) -> str | None:
     current_token = tokens[end_position]
     duration = current_token.end - tokens[start_position].start
     terminal_char = _terminal_char(current_token.text)
 
     if next_content_position is None:
-        return True
+        return "end"
 
     next_content_token = tokens[next_content_position]
     if current_token.speaker and next_content_token.speaker and current_token.speaker != next_content_token.speaker:
-        return True
+        return "speaker_change"
     gap_ms = max(0, next_content_token.start_ms - current_token.end_ms)
     if gap_ms >= context.config.speech_segmentation.pause_break_ms:
-        return True
+        return "pause"
     if terminal_char in _SENTENCE_END_CHARS:
-        return True
+        return "sentence_end"
     if terminal_char in _STRONG_CLAUSE_END_CHARS and (
         duration >= _UNIT_CLAUSE_MIN_SECONDS or current_words >= _UNIT_CLAUSE_MIN_WORDS
     ):
+        return "strong_clause"
+    if duration >= _UNIT_MAX_SECONDS and _is_safe_soft_unit_boundary(
+        tokens=tokens,
+        end_position=end_position,
+        next_content_position=next_content_position,
+    ):
+        return "soft_max_seconds"
+    if current_words >= _UNIT_MAX_WORDS and _is_safe_soft_unit_boundary(
+        tokens=tokens,
+        end_position=end_position,
+        next_content_position=next_content_position,
+    ):
+        return "soft_max_words"
+    return None
+
+
+def _can_end_segment_at_unit_boundary(
+    *,
+    tokens: list[SpeechToken],
+    end_position: int,
+    next_content_position: int | None,
+    boundary_reason: str,
+) -> bool:
+    if boundary_reason in {"end", "speaker_change"}:
         return True
-    if duration >= _UNIT_MAX_SECONDS:
+    return _is_semantically_safe_unit_boundary(
+        tokens=tokens,
+        end_position=end_position,
+        next_content_position=next_content_position,
+    )
+
+
+def _is_safe_soft_unit_boundary(
+    *,
+    tokens: list[SpeechToken],
+    end_position: int,
+    next_content_position: int | None,
+) -> bool:
+    return _is_semantically_safe_unit_boundary(
+        tokens=tokens,
+        end_position=end_position,
+        next_content_position=next_content_position,
+    )
+
+
+def _is_semantically_safe_unit_boundary(
+    *,
+    tokens: list[SpeechToken],
+    end_position: int,
+    next_content_position: int | None,
+) -> bool:
+    if next_content_position is None:
         return True
-    if current_words >= _UNIT_MAX_WORDS:
+    current_token = tokens[end_position]
+    terminal_char = _terminal_char(current_token.text)
+    if terminal_char in _SENTENCE_END_CHARS:
         return True
-    return False
+    if terminal_char in _NON_TERMINAL_END_CHARS:
+        return False
+    if not _content_token_starts_word(tokens, next_content_position, end_position):
+        return False
+    next_text = _boundary_next_text(tokens, next_content_position)
+    if _starts_with_lowercase(next_text):
+        return False
+    return _first_word(next_text) not in _CONTINUATION_START_WORDS
+
+
+def _boundary_next_text(tokens: list[SpeechToken], next_content_position: int, *, limit: int = 8) -> str:
+    end_position = next_content_position
+    content_count = 0
+    while end_position < len(tokens):
+        if not _is_whitespace_token(tokens[end_position]):
+            content_count += 1
+        end_position += 1
+        if content_count >= limit:
+            break
+    return _join_tokens(tokens[next_content_position:end_position])
 
 
 def _prompt_path(context: StageContext) -> Path:
@@ -1385,6 +1549,9 @@ def _unit_payload(unit: _TranscriptUnit) -> dict[str, object]:
         "word_count": unit.word_count,
         "speaker": unit.speaker,
         "speaker_role": unit.speaker_role,
+        "boundary_reason": unit.boundary_reason,
+        "can_end_segment": unit.can_end_segment,
+        "must_end_segment": unit.must_end_segment,
         "text": unit.text,
     }
 

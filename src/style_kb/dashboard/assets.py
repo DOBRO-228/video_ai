@@ -727,6 +727,19 @@ tr:last-child td {
   font-weight: 800;
 }
 
+.frame--dropped {
+  opacity: 0.48;
+  outline: 2px dashed var(--rust);
+  outline-offset: -3px;
+}
+
+.frame-review-label {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
 .progress-list {
   display: grid;
   gap: 8px;
@@ -1204,6 +1217,7 @@ function buildIndex(job) {
   const claimsById = new Map();
   const visualsByScene = new Map();
   const framesByScene = new Map();
+  const droppedFramesByScene = new Map();
   const claimsByEvent = new Map();
   const claimsByChunk = new Map();
   const originalClaimsById = new Map();
@@ -1225,6 +1239,9 @@ function buildIndex(job) {
     for (const eventId of claim.timeline_event_ids || []) addMapList(claimsByEvent, eventId, claim);
   }
   for (const frame of job.frame_refs || []) addMapList(framesByScene, frame.scene_id, frame);
+  for (const frame of job.frame_dedup?.frames || []) {
+    if (frame.included_in_frame_refs === false) addMapList(droppedFramesByScene, frame.scene_id, droppedFrameView(frame));
+  }
   for (const visual of job.visual_events || []) {
     visualsByScene.set(visual.scene_id, visual);
     for (const frame of visual.frames || []) addMapList(framesByScene, frame.scene_id, frame);
@@ -1255,6 +1272,7 @@ function buildIndex(job) {
     claimsById,
     visualsByScene,
     framesByScene,
+    droppedFramesByScene,
     claimsByEvent,
     claimsByChunk,
     originalClaimsById,
@@ -1265,6 +1283,19 @@ function buildIndex(job) {
     issuesByClaim,
     issuesByVisual,
     issuesByScene
+  };
+}
+
+function droppedFrameView(frame) {
+  const dedup = frame.dedup || {};
+  return {
+    ...frame,
+    dedup_status: 'duplicate',
+    matched_frame: dedup.matched_frame,
+    matched_timestamp: dedup.matched_timestamp,
+    phash_distance: dedup.phash_distance,
+    ssim: dedup.ssim,
+    skip_reason: dedup.skip_reason
   };
 }
 
@@ -1482,12 +1513,32 @@ function renderVisuals() {
   const visuals = (state.job.visual_events || []).filter((visual) => matchesQuery(visual, query, [
     'visual_event_id', 'scene_id', 'visual_summary', 'observations', 'interpretations', 'on_screen_text', 'items', 'style_topics', 'notes'
   ]));
+  const frameOnlyScenes = frameOnlySceneCards(query);
   els.content.innerHTML = `
     ${searchControls('visualQuery', query, 'Поиск по visuals, OCR, items')}
     <div class="card-list">
-      ${visuals.length ? visuals.map((visual) => visualCard(visual)).join('') : empty('Нет visual events')}
+      ${visuals.length ? visuals.map((visual) => visualCard(visual)).join('') : ''}
+      ${frameOnlyScenes}
+      ${!visuals.length && !frameOnlyScenes ? empty('Нет visual events или frame refs') : ''}
     </div>
   `;
+}
+
+function frameOnlySceneCards(query) {
+  const analyzedScenes = new Set((state.job.visual_events || []).map((visual) => visual.scene_id).filter(Boolean));
+  const cards = [];
+  for (const [sceneId, frames] of state.index.framesByScene.entries()) {
+    if (analyzedScenes.has(sceneId)) continue;
+    const view = {
+      scene_id: sceneId,
+      start: frames[0]?.start,
+      end: frames[0]?.end,
+      frames
+    };
+    if (!matchesQuery(view, query, ['scene_id', 'frames'])) continue;
+    cards.push(frameSceneCard(view));
+  }
+  return cards.join('');
 }
 
 function renderLogs() {
@@ -1638,6 +1689,7 @@ function chunkCard(chunk) {
 
 function visualCard(visual) {
   const frames = state.index.framesByScene.get(visual.scene_id) || visual.frames || [];
+  const droppedFrames = state.index.droppedFramesByScene.get(visual.scene_id) || [];
   const issueRefs = mergeIssueRefs(
     state.index.issuesByVisual.get(visual.visual_event_id) || [],
     state.index.issuesByScene.get(visual.scene_id) || []
@@ -1660,6 +1712,26 @@ function visualCard(visual) {
         ...(visual.interpretations || [])
       ].filter(Boolean).join('\n'), 700))}</div>
       ${frameStrip(frames)}
+      ${droppedFrameStrip(droppedFrames)}
+    </article>
+  `;
+}
+
+function frameSceneCard(scene) {
+  const droppedFrames = state.index.droppedFramesByScene.get(scene.scene_id) || [];
+  const issueRefs = state.index.issuesByScene.get(scene.scene_id) || [];
+  return `
+    <article class="card" data-inspect-kind="frame-scene" data-inspect-id="${attr(scene.scene_id)}">
+      <div class="card-head">
+        <div>
+          <h3 class="card-title">${formatRange(scene.start, scene.end)} · ${escapeHtml(scene.scene_id || '')}</h3>
+          <p class="card-subtitle">${num(scene.frames.length)} frames · visual analysis pending</p>
+        </div>
+        ${statusPill('frames only', 'status unknown')}
+      </div>
+      ${itemIssuesBlock(issueRefs)}
+      ${frameStrip(scene.frames)}
+      ${droppedFrameStrip(droppedFrames)}
     </article>
   `;
 }
@@ -1979,18 +2051,29 @@ function resolveSelection(selection) {
   if (selection.kind === 'claim') return state.index.claimsById.get(selection.id);
   if (selection.kind === 'chunk') return state.index.chunksById.get(selection.id);
   if (selection.kind === 'visual') return (state.job.visual_events || []).find((item) => item.visual_event_id === selection.id);
+  if (selection.kind === 'frame-scene') {
+    const frames = state.index.framesByScene.get(selection.id) || [];
+    if (!frames.length) return null;
+    return {
+      scene_id: selection.id,
+      start: frames[0]?.start,
+      end: frames[0]?.end,
+      frames
+    };
+  }
   if (selection.kind === 'stage') return (state.job.stages || []).find((item) => item.stage_name === selection.id);
   if (selection.kind === 'log') return (state.job.pipeline_events || []).find((item) => (item.event_id || String(item.seq)) === selection.id);
   return null;
 }
 
 function inspectorHtml(kind, item) {
-  const title = item.title || item.claim_id || item.chunk_id || item.event_id || item.visual_event_id || item.stage_name || item.event || kind;
+  const title = item.title || item.claim_id || item.chunk_id || item.event_id || item.visual_event_id || item.scene_id || item.stage_name || item.event || kind;
   let frames = [];
   if (kind === 'event') frames = state.index.framesByScene.get(item.scene_id) || [];
   if (kind === 'claim') frames = framesForEventIds(item.timeline_event_ids || []);
   if (kind === 'chunk') frames = framesForEventIds(item.timeline_event_ids || []);
   if (kind === 'visual') frames = state.index.framesByScene.get(item.scene_id) || item.frames || [];
+  if (kind === 'frame-scene') frames = item.frames || [];
   if (kind === 'issue') frames = framesForIssue(item);
   return `
     <div class="inspector-head">
@@ -2044,6 +2127,18 @@ function summaryForInspector(kind, item) {
       ${chips(item.style_topics, 'teal')}
       ${chips(item.on_screen_text, 'gold')}
       <p class="text-block">${escapeHtml([item.visual_summary, ...(item.observations || []), ...(item.interpretations || [])].filter(Boolean).join('\n'))}</p>
+    `;
+  }
+  if (kind === 'frame-scene') {
+    return `
+      ${statusPill('frames only', 'status unknown')}
+      <p class="text-block muted">Stage 09 extracted these frames. Stage 10 visual analysis has not materialized a visual event for this scene yet.</p>
+      ${keyValueList({
+        scene_id: item.scene_id,
+        frames: item.frames.length,
+        start: formatTime(item.start),
+        end: formatTime(item.end)
+      })}
     `;
   }
   if (kind === 'stage') {
@@ -2271,6 +2366,27 @@ function frameStrip(frames) {
           <span>${escapeHtml(formatTime(frame.timestamp ?? frame.start))}</span>
         </a>
       `).join('')}
+    </div>
+  `;
+}
+
+function droppedFrameStrip(frames) {
+  if (!frames?.length) return '';
+  return `
+    <div class="frame-review-label">Отброшенные дубли (в анализ не отправлялись)</div>
+    <div class="frame-strip">
+      ${frames.map((frame) => {
+        const distance = frame.phash_distance ?? '?';
+        const ssim = frame.ssim == null ? '-' : Number(frame.ssim).toFixed(3);
+        const matched = frame.matched_frame || '-';
+        const title = `time ${formatTime(frame.timestamp)} · match ${matched} · ssim ${ssim}`;
+        return `
+          <a class="frame frame--dropped" href="${attr(mediaUrl(frame.path))}" target="_blank" rel="noreferrer" title="${attr(title)}">
+            <img loading="lazy" src="${attr(mediaUrl(frame.path))}" alt="${attr(frame.scene_id || 'duplicate frame')}">
+            <span>dup Δ${escapeHtml(String(distance))}</span>
+          </a>
+        `;
+      }).join('')}
     </div>
   `;
 }

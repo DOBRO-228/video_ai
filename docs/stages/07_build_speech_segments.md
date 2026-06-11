@@ -6,7 +6,9 @@ Convert token-level transcript output into meaning-oriented speech segments suit
 
 ## How It Works
 
-The stage builds deterministic transcript units from Soniox tokens, then sends the full transcript plus unit metadata to the OpenAI segmenter. The model returns segment ranges by unit index. The stage validates contiguity, duration, word limits, token coverage, speaker consistency, and semantic boundary quality, then writes `SpeechSegment` objects.
+The stage builds deterministic transcript units from Soniox tokens, then sends the full transcript plus unit metadata to the OpenAI segmenter. Unit boundaries carry boundary metadata: `boundary_reason`, `can_end_segment`, and `must_end_segment`. The model returns segment ranges by unit index, but it may only end a segment at a segmentable unit boundary. The stage validates contiguity, duration, word limits, token coverage, speaker consistency, required boundaries, segmentable end boundaries, and semantic boundary quality, then writes `SpeechSegment` objects.
+
+Units are planning atoms, not all legal segment ends. Speaker changes and transcript end are required boundaries. Sentence endings are safe segment boundaries. Pauses, strong clauses, and soft duration/word planning boundaries can be internal boundaries when ending there would split a word, leave non-terminal punctuation, or start the next segment with a continuation. Soft duration/word boundaries are only emitted at semantically safe boundaries; the old behavior of cutting exactly at `_UNIT_MAX_SECONDS` or `_UNIT_MAX_WORDS` regardless of word/phrase shape is intentionally avoided.
 
 When a segmentation attempt fails validation, the stage records structured errors in the stage log and sends the failed ranges plus errors to the retry-advisor model configured in `speech_segmentation.retry_advisor_model`. The advisor must return only repair instructions, not replacement ranges. Those instructions are appended to the next retry prompt for the main segmenter model. Final acceptance is still deterministic: advisor output cannot bypass stage validation.
 
@@ -24,6 +26,8 @@ The semantic prompt is hardened for observed failure patterns:
 
 - dense ranges around 40-48 seconds with 90+ words and 6+ sentences should be split before validation;
 - boundaries must not split a recognized word or word form across units;
+- a segment must not end at a unit where `can_end_segment=false`;
+- a segment must not cross a unit where `must_end_segment=true`;
 - a colon that introduces a quoted question/example should stay with the quoted content until that mini-construction ends;
 - retry-advisor output must be a direct repair instruction for the next main-model attempt, not a replacement plan and not general advice.
 
@@ -44,13 +48,14 @@ The semantic prompt is hardened for observed failure patterns:
 
 ## Skip Validation
 
-The stage can be skipped when raw segmentation output exists, all speech segments parse, cover every token exactly once, respect configured limits, preserve speaker turns, and do not have semantic boundary violations.
+The stage can be skipped when raw segmentation output exists, all speech segments parse, cover every token exactly once, align with the current transcript-unit boundaries, respect configured limits, preserve speaker turns, do not cross required boundaries, end only at segmentable unit boundaries, and do not have semantic boundary violations.
 
 ## Important Notes
 
 - This stage uses an LLM for semantic segmentation, not a simple pause-only algorithm.
 - Source grounding must remain token-based: segment start/end come from the first and last covered token.
 - Short speaker-labeled turns may be shorter than `min_segment_seconds`; speaker changes must not be merged just to satisfy a duration floor.
+- Soft unit thresholds are planning hints, not permission to create word-splitting or phrase-splitting segment boundaries.
 - `SpeechSegment.speaker` and `SpeechSegment.speaker_role` should represent exactly one speaker turn, not a majority vote across multiple speakers.
 - Do not summarize or rewrite transcript text here.
 - `stt/speech_segments_raw.json` is retained for audit/debugging the accepted segmentation output. It is not KB input.

@@ -4,7 +4,7 @@
 
 Твоя задача:
 1. Проанализируй переданные candidate segments и validation errors.
-2. Найди паттерн ошибки: слишком длинные диапазоны, слишком много слов, слишком много предложений, soft semantic density violation, разрыв фразы, non-contiguous ranges, mixed speakers или неполное покрытие.
+2. Найди паттерн ошибки: слишком длинные диапазоны, слишком много слов, слишком много предложений, soft semantic density violation, non-segmentable unit boundary, разрыв фразы, non-contiguous ranges, mixed speakers или неполное покрытие.
 3. Напиши краткую repair instruction для следующей попытки основной модели.
 4. Инструкция должна объяснить, что именно исправить и каких ошибок не повторять.
 5. Инструкция должна опираться на конкретные ranges из ошибок.
@@ -22,7 +22,8 @@
 10. Для boundary внутри распознанного слова или словоформы укажи перенести границу к концу полного предложения. Примеры паттерна: previous tail обрывается на `зна` или `га`, next head начинается со строчного продолжения `ет` или `рмонично`.
 11. Для dense block около 40-48 секунд, 90+ слов и 6+ предложений укажи локально разделить только этот диапазон на 2-3 сегмента по завершённым предложениям, смене подпункта, примеру или выводу.
 12. Если previous segment заканчивается на вводную фразу с двоеточием (`спрашивают:`), а next head начинается цитируемым вопросом, укажи держать вводную фразу и цитату в одном локальном сегменте.
-13. Всегда проверяй hard limits и speaker boundaries: локальная правка не должна создать mixed speakers, exceed max_segment_seconds или exceed max_segment_words.
+13. Если ошибка указывает `can_end_segment=false` или `openai_segmenter_unsafe_unit_boundary`, укажи основной модели объединить этот internal unit со следующими units до ближайшей границы с `can_end_segment=true`.
+14. Всегда проверяй hard limits и speaker boundaries: локальная правка не должна создать mixed speakers, exceed max_segment_seconds или exceed max_segment_words.
 
 Ожидаемый JSON:
 {

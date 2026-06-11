@@ -245,6 +245,7 @@ def job_payload(output_root: Path, job_id: str) -> dict[str, Any]:
     style_claims_current = read_jsonl(current_claims_path(paths))
     visual_events = read_jsonl(paths.visual_events_jsonl)
     frame_refs = read_jsonl(paths.frame_refs_jsonl)
+    frame_dedup = read_json(paths.frame_extraction_report)
     pipeline_events = tail_jsonl(paths.pipeline_events_jsonl, max_items=1200)
     selected_claims = read_json(paths.claims_dir / "style_claims_selected.json")
 
@@ -269,6 +270,7 @@ def job_payload(output_root: Path, job_id: str) -> dict[str, Any]:
         "claim_edit_history": build_claim_edit_history(claim_edits),
         "visual_events": visual_events,
         "frame_refs": frame_refs,
+        "frame_dedup": frame_dedup,
         "pipeline_events": pipeline_events,
     }
     payload["quality_issues"] = build_quality_issues(payload)
@@ -394,6 +396,7 @@ def artifact_statuses(paths: JobPaths) -> list[dict[str, Any]]:
         "speech_segments": paths.stt_speech_segments,
         "scenes": paths.scenes_jsonl,
         "frame_refs": paths.frame_refs_jsonl,
+        "frame_extraction_report": paths.frame_extraction_report,
         "visual_events": paths.visual_events_jsonl,
         "presenter_profile": paths.visual_presenter_profile,
         "timeline_events": paths.timeline_events_jsonl,

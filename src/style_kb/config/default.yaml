@@ -80,22 +80,25 @@ stt:
 scene_detection:
   detector: adaptive
   min_scene_len_seconds: 1.5
-  images_per_scene: 3
-  extra_sample_every_seconds: 10
+  images_per_scene: 4
+  extra_sample_every_seconds: 4
+  max_frames_per_scene: 8
+  intra_scene_dedup: true
+  phash_max_distance: 8
+  ssim_confirm: 0.85
+  min_frames_per_scene: 1
   fallback_scene_seconds: 30
 
 vision:
-  # OpenAI is active until Gemini billing is available.
-  # Gemini values kept for the next switch:
-  # provider: gemini
-  # model: gemini-3-flash-preview
-  # media_resolution: high
-  # thinking_level: low
-  # batch_size: 6
-  provider: openai
-  model: gpt-5-nano
-  detail: high
+  provider: gemini
+  model: gemini-3-flash-preview
+  media_resolution: high
+  thinking_level: low
   batch_size: 6
+  # OpenAI values kept for rollback:
+  # provider: openai
+  # model: gpt-5-nano
+  # detail: high
   presenter_bootstrap_enabled: true
   presenter_bootstrap_prompt_file: presenter_profile_ru.txt
   presenter_bootstrap_scene_limit: 12

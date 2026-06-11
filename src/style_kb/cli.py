@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Annotated
 
 import typer
 
@@ -14,12 +15,20 @@ from style_kb.utils.files import read_json
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 
+StopAfterStageArg = Annotated[
+    int | None,
+    typer.Argument(
+        min=1,
+        help="Optional stage number to stop immediately after. Example: 9 stops before visual description.",
+    ),
+]
+
 
 @app.command()
-def ingest(url: str) -> None:
+def ingest(url: str, stop_after_stage: StopAfterStageArg = None) -> None:
     """Ingest exactly one YouTube video URL."""
     runner = PipelineRunner(Path.cwd(), progress_callback=typer.echo)
-    _run_command(lambda: runner.ingest(url), action="ingest")
+    _run_command(lambda: runner.ingest(url, stop_after_stage=stop_after_stage), action="ingest")
 
 
 @app.command()
@@ -55,10 +64,10 @@ def status(job_id: str) -> None:
 
 
 @app.command()
-def resume(job_id: str) -> None:
+def resume(job_id: str, stop_after_stage: StopAfterStageArg = None) -> None:
     """Resume an existing job."""
     runner = PipelineRunner(Path.cwd(), progress_callback=typer.echo)
-    _run_command(lambda: runner.resume(job_id), action="resume")
+    _run_command(lambda: runner.resume(job_id, stop_after_stage=stop_after_stage), action="resume")
 
 
 def _run_command(func, *, action: str) -> None:

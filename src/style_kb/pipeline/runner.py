@@ -18,7 +18,7 @@ from style_kb.diagnostics_env import run_environment_snapshot
 from style_kb.error_advice import advice_for_error_code
 from style_kb.errors import JobLockError, StageExecutionError, StyleKbError
 from style_kb.models import Job, JobState, StageState, StageStatus
-from style_kb.pipeline.base import StageContext
+from style_kb.pipeline.base import Stage, StageContext
 from style_kb.pipeline.catalog import STAGES
 from style_kb.pipeline.paths import JobPaths
 from style_kb.state.db import initialize_database
@@ -47,13 +47,15 @@ class PipelineRunner:
         self.run_id: str | None = None
         self._stage_run_start_logs: set[tuple[str, str]] = set()
 
-    def ingest(self, url: str) -> Job:
+    def ingest(self, url: str, stop_after_stage: int | None = None) -> Job:
         self._start_run()
+        _validate_stop_after_stage(stop_after_stage)
         video_id = extract_video_id(url)
-        return self._run_for_job(video_id=video_id, url=url, requested_job_id=video_id)
+        return self._run_for_job(video_id=video_id, url=url, requested_job_id=video_id, stop_after_stage=stop_after_stage)
 
-    def resume(self, job_id: str) -> Job:
+    def resume(self, job_id: str, stop_after_stage: int | None = None) -> Job:
         self._start_run()
+        _validate_stop_after_stage(stop_after_stage)
         job = self.repository.get_job(job_id)
         if job is None:
             raise StyleKbError(f"job not found: {job_id}")
@@ -73,7 +75,7 @@ class PipelineRunner:
             )
             self._write_partial_quality_report_safely(paths=paths, job=job, failed_stage="pipeline_setup")
             raise
-        return self._run_existing_job(job, job_event=PipelineEvent.JOB_RESUMED)
+        return self._run_existing_job(job, job_event=PipelineEvent.JOB_RESUMED, stop_after_stage=stop_after_stage)
 
     def status(self, job_id: str) -> tuple[Job, list[StageStatus]]:
         job = self.repository.get_job(job_id)
@@ -81,7 +83,7 @@ class PipelineRunner:
             raise StyleKbError(f"job not found: {job_id}")
         return job, self.repository.list_stages(job_id)
 
-    def _run_for_job(self, *, video_id: str, url: str, requested_job_id: str) -> Job:
+    def _run_for_job(self, *, video_id: str, url: str, requested_job_id: str, stop_after_stage: int | None) -> Job:
         paths = JobPaths(self.output_root, requested_job_id)
         paths.ensure_directories()
         existing_job = self.repository.get_job(requested_job_id)
@@ -134,22 +136,36 @@ class PipelineRunner:
             job,
             job_event=PipelineEvent.JOB_STARTED,
             job_created=existing_job is None,
+            stop_after_stage=stop_after_stage,
         )
 
-    def _run_existing_job(self, job: Job, *, job_event: PipelineEvent, job_created: bool = False) -> Job:
+    def _run_existing_job(
+        self,
+        job: Job,
+        *,
+        job_event: PipelineEvent,
+        job_created: bool = False,
+        stop_after_stage: int | None = None,
+    ) -> Job:
+        _validate_stop_after_stage(stop_after_stage)
         paths = JobPaths(self.output_root, job.job_id)
         paths.ensure_directories()
         pipeline_logger = self._pipeline_logger(paths)
         self._emit_run_started(pipeline_logger, job)
         if job_created:
             self._emit_job_created(pipeline_logger, job)
+        run_request_data: dict[str, object] = {"job_dir": job.job_dir}
+        if stop_after_stage is not None:
+            stop_stage = _stage_by_ordinal(stop_after_stage)
+            run_request_data["stop_after_stage"] = stop_after_stage
+            run_request_data["stop_after_stage_name"] = stop_stage.name if stop_stage is not None else None
         pipeline_logger.emit(
             job_event,
             job_id=job.job_id,
             video_id=job.video_id,
             status=job.status,
             message="job run requested",
-            data={"job_dir": job.job_dir},
+            data=run_request_data,
         )
         try:
             self._acquire_job_lock(job)
@@ -225,6 +241,13 @@ class PipelineRunner:
                     )
                     self._write_stage_reuse_log(paths=paths, stage_status=skipped_stage)
                     self._emit_stage_progress(skipped_stage, pipeline_logger=pipeline_logger, job=job)
+                    if _should_stop_after_stage(stage.ordinal, stop_after_stage):
+                        return self._stop_job_after_stage(
+                            job=job,
+                            paths=paths,
+                            pipeline_logger=pipeline_logger,
+                            stage_status=skipped_stage,
+                        )
                     continue
 
                 running_stage = self.repository.mark_stage_running(
@@ -267,6 +290,13 @@ class PipelineRunner:
                     data=self._stage_event_data(finished_stage),
                 )
                 self._emit_stage_progress(finished_stage, pipeline_logger=pipeline_logger, job=job)
+                if _should_stop_after_stage(stage.ordinal, stop_after_stage):
+                    return self._stop_job_after_stage(
+                        job=job,
+                        paths=paths,
+                        pipeline_logger=pipeline_logger,
+                        stage_status=finished_stage,
+                    )
                 job = self.repository.get_job(job.job_id)
                 if job is None:
                     raise StyleKbError("job disappeared during execution")
@@ -457,6 +487,60 @@ class PipelineRunner:
             status=completed_job.status,
             message="run completed",
         )
+        return final_job
+
+    def _stop_job_after_stage(
+        self,
+        *,
+        job: Job,
+        paths: JobPaths,
+        pipeline_logger: PipelineLogger,
+        stage_status: StageStatus,
+    ) -> Job:
+        stopped_job = self.repository.update_job(
+            job.job_id,
+            status=JobState.STOPPED,
+            current_stage=stage_status.stage_name,
+            finished_at=datetime.now(tz=UTC),
+            error_code=None,
+            error_message=None,
+        )
+        self._release_job_lock(job.job_id)
+        final_job = self.repository.get_job(job.job_id)
+        if final_job is None:
+            raise StyleKbError(f"job not found after stop: {job.job_id}")
+        self._write_partial_quality_report_safely(paths=paths, job=final_job, failed_stage=None)
+        message = f"job stopped after stage {stage_status.ordinal:02d} {stage_status.stage_name}"
+        data = {
+            "job_dir": final_job.job_dir,
+            "stop_after_stage": stage_status.ordinal,
+            "stop_after_stage_name": stage_status.stage_name,
+            "last_stage_status": stage_status.status.value,
+        }
+        pipeline_logger.emit(
+            PipelineEvent.JOB_STOPPED,
+            job_id=final_job.job_id,
+            video_id=final_job.video_id,
+            stage=stage_status.stage_name,
+            ordinal=stage_status.ordinal,
+            attempt=stage_status.attempt,
+            status=stopped_job.status,
+            message=message,
+            data=data,
+        )
+        pipeline_logger.emit(
+            PipelineEvent.RUN_STOPPED,
+            job_id=final_job.job_id,
+            video_id=final_job.video_id,
+            stage=stage_status.stage_name,
+            ordinal=stage_status.ordinal,
+            attempt=stage_status.attempt,
+            status=stopped_job.status,
+            message="run stopped by stop-after-stage argument",
+            data=data,
+        )
+        if self.progress_callback is not None:
+            self.progress_callback(f"[pipeline] {message}")
         return final_job
 
     def _pipeline_logger(self, paths: JobPaths) -> PipelineLogger:
@@ -1004,9 +1088,16 @@ def _stage_outputs_may_be_cleaned(stage_name: str, config: AppConfig) -> bool:
     return stage_name == "09_extract_keyframes" and not config.project.keep_frames
 
 
-def _stage_by_name(stage_name: str):
+def _stage_by_name(stage_name: str) -> Stage | None:
     for stage_class in STAGES:
         if stage_class.name == stage_name:
+            return stage_class()
+    return None
+
+
+def _stage_by_ordinal(ordinal: int) -> Stage | None:
+    for stage_class in STAGES:
+        if stage_class.ordinal == ordinal:
             return stage_class()
     return None
 
@@ -1014,6 +1105,19 @@ def _stage_by_name(stage_name: str):
 def _stage_ordinal(stage_name: str) -> int:
     stage = _stage_by_name(stage_name)
     return stage.ordinal if stage is not None else 0
+
+
+def _validate_stop_after_stage(stop_after_stage: int | None) -> None:
+    if stop_after_stage is None:
+        return
+    if _stage_by_ordinal(stop_after_stage) is not None:
+        return
+    available = ", ".join(str(stage_class.ordinal) for stage_class in STAGES)
+    raise StyleKbError(f"invalid stop_after_stage: {stop_after_stage}; available stages: {available}")
+
+
+def _should_stop_after_stage(stage_ordinal: int, stop_after_stage: int | None) -> bool:
+    return stop_after_stage is not None and stage_ordinal == stop_after_stage
 
 
 def _file_manifest_lines(paths: list[str]) -> list[str]:

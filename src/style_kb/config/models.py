@@ -49,8 +49,13 @@ class SceneDetectionConfig(BaseModel):
 
     detector: str
     min_scene_len_seconds: float = Field(gt=0)
-    images_per_scene: int = Field(gt=0)
-    extra_sample_every_seconds: int = Field(gt=0)
+    images_per_scene: int = Field(default=4, gt=0)
+    extra_sample_every_seconds: int = Field(default=4, gt=0)
+    max_frames_per_scene: int = Field(default=8, gt=0)
+    intra_scene_dedup: bool = True
+    phash_max_distance: int = Field(default=8, ge=0)
+    ssim_confirm: float | None = Field(default=0.85, ge=0, le=1)
+    min_frames_per_scene: int = Field(default=1, gt=0)
     fallback_scene_seconds: int = Field(gt=0)
 
 

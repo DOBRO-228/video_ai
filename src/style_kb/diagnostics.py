@@ -18,11 +18,13 @@ SCHEMA_VERSION = 1
 
 class PipelineEvent(StrEnum):
     RUN_STARTED = "run_started"
+    RUN_STOPPED = "run_stopped"
     RUN_COMPLETED = "run_completed"
     RUN_FAILED = "run_failed"
     JOB_CREATED = "job_created"
     JOB_STARTED = "job_started"
     JOB_RESUMED = "job_resumed"
+    JOB_STOPPED = "job_stopped"
     JOB_COMPLETED = "job_completed"
     JOB_FAILED = "job_failed"
     STAGE_STARTED = "stage_started"

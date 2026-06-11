@@ -24,6 +24,7 @@ class StageState(ValueEnum):
 class JobState(ValueEnum):
     PENDING = "pending"
     RUNNING = "running"
+    STOPPED = "stopped"
     COMPLETED = "completed"
     FAILED = "failed"
 
