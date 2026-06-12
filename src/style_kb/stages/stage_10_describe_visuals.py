@@ -11,7 +11,7 @@ from enum import StrEnum
 from pathlib import Path
 from time import perf_counter
 
-from style_kb.clients._retry import OnRetry
+from style_kb.clients._retry import OnRetry, RetryPolicy
 from style_kb.clients.provider_diagnostics import ProviderCallDiagnostics, ProviderName
 from style_kb.clients.gemini_vision import GeminiVisionClient, load_cached_gemini_visual_result
 from style_kb.clients.openai_vision import OpenAIVisionClient, load_cached_visual_result as load_cached_openai_visual_result
@@ -34,10 +34,11 @@ from style_kb.stages.common import (
     load_scenes,
     load_speech_segments,
     load_visual_events,
-    log_openai_retry,
+    log_provider_retry,
     emit_stage_validation_failed,
     emit_provider_event,
     provider_error_extra,
+    provider_retry_reason,
     ProviderOperation,
     request_id_from_error,
     youtube_source_ref,
@@ -53,6 +54,14 @@ _SCENE_CONTENT_MAX_ATTEMPTS = 2
 _CONTENT_VALIDATION_METADATA_KEY = "_style_kb_content_validation"
 _CONTENT_VALIDATION_ACCEPTED_WITH_WARNING = "accepted_with_warning"
 _REQUEST_METADATA_KEY = "_style_kb_request"
+_GEMINI_MAX_PARALLEL_REQUESTS = 2
+_GEMINI_RETRY_POLICY = RetryPolicy(
+    max_attempts=6,
+    base_delay_seconds=2.0,
+    max_delay_seconds=60.0,
+    jitter=0.25,
+    retry_after_cap_seconds=180.0,
+)
 _BASELINE_LEAKAGE_MARKER_THRESHOLD = 1
 _BASELINE_LEAKAGE_FIELDS = (
     "visual_summary",
@@ -356,8 +365,8 @@ class Stage10DescribeVisuals(Stage):
             _log_scene_result(context, cached_result, completed=completed, total_scenes=total_scenes)
             _emit_scene_progress(context, cached_result, completed=completed, total_scenes=total_scenes)
 
+        max_workers = _effective_vision_max_workers(context)
         if pending_tasks:
-            max_workers = max(1, context.config.vision.batch_size)
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_map = {
                     executor.submit(
@@ -430,6 +439,8 @@ class Stage10DescribeVisuals(Stage):
                 "visual_events_count": len(ordered_visual_events),
                 "cached_scenes_count": cached_count,
                 "api_scenes_count": api_count,
+                "configured_parallel_requests": context.config.vision.batch_size,
+                "effective_parallel_requests": max_workers,
                 "input_tokens_total": total_input_tokens,
                 "output_tokens_total": total_output_tokens,
                 "reasoning_tokens_total": total_reasoning_tokens,
@@ -453,6 +464,19 @@ def _frame_map(frame_refs: list[FrameRef]) -> dict[str, list[FrameRef]]:
     for frames in frame_map.values():
         frames.sort(key=lambda frame: frame.timestamp)
     return frame_map
+
+
+def _effective_vision_max_workers(context: StageContext) -> int:
+    configured = max(1, context.config.vision.batch_size)
+    if _vision_provider(context) == ProviderName.GEMINI:
+        return min(configured, _GEMINI_MAX_PARALLEL_REQUESTS)
+    return configured
+
+
+def _vision_retry_policy(context: StageContext) -> RetryPolicy:
+    if _vision_provider(context) == ProviderName.GEMINI:
+        return _GEMINI_RETRY_POLICY
+    return RetryPolicy()
 
 
 def _load_or_build_presenter_profile(
@@ -747,6 +771,7 @@ def _build_vision_client(context: StageContext, *, on_retry: OnRetry | None = No
         return OpenAIVisionClient(
             os.environ.get("OPENAI_API_KEY"),
             model=context.config.vision.model,
+            retry_policy=_vision_retry_policy(context),
             on_retry=on_retry,
         )
     if provider == ProviderName.GEMINI:
@@ -755,6 +780,8 @@ def _build_vision_client(context: StageContext, *, on_retry: OnRetry | None = No
             model=context.config.vision.model,
             media_resolution=context.config.vision.media_resolution,
             thinking_level=context.config.vision.thinking_level,
+            thinking_budget=context.config.vision.thinking_budget,
+            retry_policy=_vision_retry_policy(context),
             on_retry=on_retry,
         )
     raise AssertionError(f"unhandled vision provider: {provider.value}")
@@ -800,6 +827,7 @@ def _vision_settings_metadata(context: StageContext) -> dict[str, object]:
         "detail": context.config.vision.detail,
         "media_resolution": context.config.vision.media_resolution,
         "thinking_level": context.config.vision.thinking_level,
+        "thinking_budget": context.config.vision.thinking_budget,
     }
 
 
@@ -1771,10 +1799,13 @@ def _merge_visual_safety_metrics(target: dict[str, int], source: dict[str, int])
 
 def _scene_retry_logger(context: StageContext, task: _SceneTask) -> OnRetry:
     stage_log_path = context.paths.stage_log(Stage10DescribeVisuals.name)
+    provider = _vision_provider(context).value
+    max_attempts = _vision_retry_policy(context).max_attempts
 
     def _on_retry(attempt: int, delay: float, error: BaseException) -> None:
-        log_openai_retry(
+        log_provider_retry(
             stage_log_path,
+            provider=provider,
             attempt=attempt,
             delay_seconds=delay,
             error=error,
@@ -1784,23 +1815,104 @@ def _scene_retry_logger(context: StageContext, task: _SceneTask) -> OnRetry:
                 f"scene_id: {task.scene.scene_id}",
             ],
         )
+        _emit_provider_retry_progress(
+            context,
+            provider=provider,
+            operation="scene",
+            attempt=attempt,
+            max_attempts=max_attempts,
+            delay_seconds=delay,
+            error=error,
+            scene_order=task.order,
+        )
 
     return _on_retry
 
 
 def _presenter_retry_logger(context: StageContext) -> OnRetry:
     stage_log_path = context.paths.stage_log(Stage10DescribeVisuals.name)
+    provider = _vision_provider(context).value
+    max_attempts = _vision_retry_policy(context).max_attempts
 
     def _on_retry(attempt: int, delay: float, error: BaseException) -> None:
-        log_openai_retry(
+        log_provider_retry(
             stage_log_path,
+            provider=provider,
             attempt=attempt,
             delay_seconds=delay,
             error=error,
             context_lines=[f"run_id: {context.run_id or '-'}", "operation: presenter_profile_bootstrap"],
         )
+        _emit_provider_retry_progress(
+            context,
+            provider=provider,
+            operation="presenter_profile",
+            attempt=attempt,
+            max_attempts=max_attempts,
+            delay_seconds=delay,
+            error=error,
+        )
 
     return _on_retry
+
+
+def _emit_provider_retry_progress(
+    context: StageContext,
+    *,
+    provider: str,
+    operation: str,
+    attempt: int,
+    max_attempts: int,
+    delay_seconds: float,
+    error: BaseException,
+    scene_order: int | None = None,
+) -> None:
+    retry_reason = provider_retry_reason(error)
+    error_extra = provider_error_extra(error)
+    if context.pipeline_logger is not None:
+        context.pipeline_logger.emit(
+            PipelineEvent.STAGE_RETRY,
+            job_id=context.job.job_id,
+            video_id=context.job.video_id,
+            stage=Stage10DescribeVisuals.name,
+            ordinal=Stage10DescribeVisuals.ordinal,
+            attempt=attempt,
+            message="vision provider request retry scheduled",
+            details_path=context.paths.stage_log(Stage10DescribeVisuals.name),
+            request_id=request_id_from_error(error),
+            data={
+                "provider": provider,
+                "operation": operation,
+                "scene_order": scene_order,
+                "failed_attempt": attempt,
+                "next_attempt": attempt + 1,
+                "max_attempts": max_attempts,
+                "delay_seconds": round(delay_seconds, 3),
+                "retry_reason": retry_reason,
+                **error_extra,
+            },
+        )
+    if context.progress_callback is None:
+        return
+    parts = [
+        f"[10 {Stage10DescribeVisuals.name}]",
+        "provider retry",
+        f"provider={provider}",
+        f"operation={operation}",
+    ]
+    if scene_order is not None:
+        parts.append(f"scene={scene_order}")
+    parts.extend(
+        [
+            f"attempt={attempt + 1}/{max_attempts}",
+            f"delay={delay_seconds:.2f}s",
+            f"reason={retry_reason}",
+        ]
+    )
+    status_code = error_extra.get("status_code")
+    if status_code is not None:
+        parts.append(f"status={status_code}")
+    context.progress_callback(" ".join(parts))
 
 
 def _log_concurrent_abort(

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ProjectConfig(BaseModel):
@@ -44,11 +44,42 @@ class SttConfig(BaseModel):
     context: SttContextConfig
 
 
+class FrameQualityConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    probe_window_seconds: float = Field(default=0.6, gt=0)
+    probe_step_seconds: float = Field(default=0.3, gt=0)
+    prefer_planned_timestamp_score_ratio: float = Field(default=0.92, ge=0, le=1)
+    drop_low_quality: bool = False
+    min_quality_frames_per_scene: int = Field(default=1, gt=0)
+    central_region_weight: float = Field(default=1.5, gt=0)
+    grid_size: int = Field(default=4, gt=0)
+    keep_rejected_probe_files: bool = False
+
+
+class PaletteBoundaryRefinementConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    sample_step_seconds: float = Field(default=0.25, gt=0)
+    min_scene_duration_seconds: float = Field(default=6.0, gt=0)
+    max_boundary_shift_seconds: float = Field(default=3.0, gt=0)
+    min_segment_seconds: float = Field(default=1.5, gt=0)
+    stable_window_seconds: float = Field(default=1.0, gt=0)
+    edge_guard_seconds: float = Field(default=0.75, ge=0)
+    min_saturation_delta: float = Field(default=30.0, ge=0)
+    min_colorfulness_delta: float = Field(default=8.0, ge=0)
+    min_histogram_distance: float = Field(default=0.25, gt=0)
+    min_confidence: float = Field(default=0.75, ge=0, le=1)
+
+
 class SceneDetectionConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     detector: str
     min_scene_len_seconds: float = Field(gt=0)
+    keyframe_edge_inset_seconds: float = Field(default=0.35, ge=0)
     images_per_scene: int = Field(default=4, gt=0)
     extra_sample_every_seconds: int = Field(default=4, gt=0)
     max_frames_per_scene: int = Field(default=8, gt=0)
@@ -57,6 +88,16 @@ class SceneDetectionConfig(BaseModel):
     ssim_confirm: float | None = Field(default=0.85, ge=0, le=1)
     min_frames_per_scene: int = Field(default=1, gt=0)
     fallback_scene_seconds: int = Field(gt=0)
+    frame_quality: FrameQualityConfig = Field(default_factory=FrameQualityConfig)
+    palette_boundary_refinement: PaletteBoundaryRefinementConfig = Field(default_factory=PaletteBoundaryRefinementConfig)
+
+    @model_validator(mode="after")
+    def validate_frame_quality_minimum(self):
+        if self.frame_quality.min_quality_frames_per_scene < self.min_frames_per_scene:
+            raise ValueError("frame_quality.min_quality_frames_per_scene must be >= min_frames_per_scene")
+        if self.palette_boundary_refinement.min_segment_seconds < self.palette_boundary_refinement.stable_window_seconds:
+            raise ValueError("palette_boundary_refinement.min_segment_seconds must be >= stable_window_seconds")
+        return self
 
 
 class VisionConfig(BaseModel):
@@ -67,6 +108,7 @@ class VisionConfig(BaseModel):
     detail: str | None = None
     media_resolution: str | None = None
     thinking_level: str | None = None
+    thinking_budget: int | None = Field(default=None, ge=-1, le=24576)
     batch_size: int = Field(gt=0)
     presenter_bootstrap_enabled: bool
     presenter_bootstrap_prompt_file: str
@@ -78,6 +120,12 @@ class VisionConfig(BaseModel):
     transcript_context_after_seconds: int = Field(ge=0)
     ocr: bool
     prompt_file: str
+
+    @model_validator(mode="after")
+    def validate_thinking_config(self):
+        if self.thinking_level is not None and self.thinking_budget is not None:
+            raise ValueError("vision.thinking_level and vision.thinking_budget are mutually exclusive")
+        return self
 
 
 class SpeechSegmentationConfig(BaseModel):

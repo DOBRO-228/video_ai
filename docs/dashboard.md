@@ -36,5 +36,6 @@ Views:
 Frame duplicate review:
 
 - Canonical frame strips use `frames/frame_refs.jsonl` and show only frames that were sent to visual analysis.
-- Dropped duplicate frames are read from `frames/frame_extraction_report.json` and shown only in a separate review strip on Visuals cards.
+- Dropped duplicate and quality-rejected frames are read from `frames/frame_extraction_report.json` and shown only in a separate review strip on Visuals cards.
+- Frame quality diagnostics expose selected-vs-planned timestamps, selection decisions, quality classes, and probe metrics in the raw job payload/report; rejected probes are not mixed into normal evidence strips.
 - Dropped duplicate frames are diagnostic data and are not shown as claim/chunk/timeline evidence.

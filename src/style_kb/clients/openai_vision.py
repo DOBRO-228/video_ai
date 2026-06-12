@@ -13,6 +13,7 @@ from style_kb.clients.provider_diagnostics import (
     openai_response_diagnostics,
     start_operation,
 )
+from style_kb.clients.token_usage import openai_responses_usage
 from style_kb.clients.vision import PRESENTER_PROFILE_SCHEMA, VISUAL_RESPONSE_SCHEMA, VisionAnalysisResult
 from style_kb.errors import MissingApiKeyError, ProviderError
 from style_kb.utils.files import read_json, write_json_atomic
@@ -167,19 +168,12 @@ def _result_from_raw_payload(
             error_code="openai_vision_json_parse_failed",
             details=str(error),
         ) from error
-    usage = raw_payload.get("usage") or {}
-    output_details = usage.get("output_tokens_details") or {}
     remote_duration = None
     created_at = raw_payload.get("created_at")
     completed_at = raw_payload.get("completed_at")
     if isinstance(created_at, (int, float)) and isinstance(completed_at, (int, float)):
         remote_duration = max(0.0, float(completed_at) - float(created_at))
-    usage_payload = {
-        "input_tokens": int(usage.get("input_tokens") or 0),
-        "output_tokens": int(usage.get("output_tokens") or 0),
-        "reasoning_tokens": int(output_details.get("reasoning_tokens") or 0),
-        "total_tokens": int(usage.get("total_tokens") or 0),
-    }
+    usage_payload = openai_responses_usage(raw_payload)
     model = str(raw_payload.get("model")) if raw_payload.get("model") is not None else None
     return VisionAnalysisResult(
         payload=payload,

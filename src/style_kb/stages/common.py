@@ -184,9 +184,10 @@ def emit_stage_validation_failed(
     )
 
 
-def log_openai_retry(
+def log_provider_retry(
     stage_log_path: Path,
     *,
+    provider: str,
     attempt: int,
     delay_seconds: float,
     error: BaseException,
@@ -194,10 +195,12 @@ def log_openai_retry(
 ) -> None:
     lines = [
         "",
-        "[openai-retry]",
-        f"attempt: {attempt}",
+        "[provider-retry]",
+        f"provider: {provider}",
+        f"failed_attempt: {attempt}",
+        f"next_attempt: {attempt + 1}",
         f"next_delay_seconds: {delay_seconds:.2f}",
-        f"retry_reason: {_openai_retry_reason(error)}",
+        f"retry_reason: {provider_retry_reason(error)}",
         f"error: {type(error).__name__}: {error}",
     ]
     request_id = request_id_from_error(error)
@@ -210,6 +213,28 @@ def log_openai_retry(
         lines.extend(context_lines)
     lines.append("")
     append_text(stage_log_path, "\n".join(lines), encoding="utf-8")
+
+
+def log_openai_retry(
+    stage_log_path: Path,
+    *,
+    attempt: int,
+    delay_seconds: float,
+    error: BaseException,
+    context_lines: list[str] | None = None,
+) -> None:
+    log_provider_retry(
+        stage_log_path,
+        provider="openai",
+        attempt=attempt,
+        delay_seconds=delay_seconds,
+        error=error,
+        context_lines=context_lines,
+    )
+
+
+def provider_retry_reason(error: BaseException) -> str:
+    return _openai_retry_reason(error)
 
 
 def _openai_retry_reason(error: BaseException) -> str:

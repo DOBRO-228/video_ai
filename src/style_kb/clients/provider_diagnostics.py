@@ -189,7 +189,11 @@ def request_id_from_error(error: BaseException) -> str | None:
 def response_status_from_error(error: BaseException) -> int | None:
     for current in _exception_chain(error):
         response = getattr(current, "response", None)
-        status_code = getattr(response, "status_code", None) or getattr(current, "status_code", None)
+        status_code = (
+            getattr(response, "status_code", None)
+            or getattr(current, "status_code", None)
+            or getattr(current, "code", None)
+        )
         try:
             if status_code is not None:
                 return int(status_code)

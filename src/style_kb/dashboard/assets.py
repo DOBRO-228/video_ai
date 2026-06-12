@@ -740,6 +740,23 @@ tr:last-child td {
   font-weight: 800;
 }
 
+.quality-frame-list {
+  display: grid;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.quality-frame-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+}
+
 .progress-list {
   display: grid;
   gap: 8px;
@@ -1218,6 +1235,7 @@ function buildIndex(job) {
   const visualsByScene = new Map();
   const framesByScene = new Map();
   const droppedFramesByScene = new Map();
+  const qualityFramesByScene = new Map();
   const claimsByEvent = new Map();
   const claimsByChunk = new Map();
   const originalClaimsById = new Map();
@@ -1241,6 +1259,7 @@ function buildIndex(job) {
   for (const frame of job.frame_refs || []) addMapList(framesByScene, frame.scene_id, frame);
   for (const frame of job.frame_dedup?.frames || []) {
     if (frame.included_in_frame_refs === false) addMapList(droppedFramesByScene, frame.scene_id, droppedFrameView(frame));
+    if (frame.included_in_frame_refs === true && frame.quality) addMapList(qualityFramesByScene, frame.scene_id, frame);
   }
   for (const visual of job.visual_events || []) {
     visualsByScene.set(visual.scene_id, visual);
@@ -1273,6 +1292,7 @@ function buildIndex(job) {
     visualsByScene,
     framesByScene,
     droppedFramesByScene,
+    qualityFramesByScene,
     claimsByEvent,
     claimsByChunk,
     originalClaimsById,
@@ -1288,14 +1308,16 @@ function buildIndex(job) {
 
 function droppedFrameView(frame) {
   const dedup = frame.dedup || {};
+  const qualityDrop = frame.quality_drop || {};
+  const isQualityDrop = Boolean(frame.quality_drop);
   return {
     ...frame,
-    dedup_status: 'duplicate',
+    dedup_status: isQualityDrop ? 'quality' : 'duplicate',
     matched_frame: dedup.matched_frame,
     matched_timestamp: dedup.matched_timestamp,
     phash_distance: dedup.phash_distance,
     ssim: dedup.ssim,
-    skip_reason: dedup.skip_reason
+    skip_reason: dedup.skip_reason || qualityDrop.skip_reason || frame.quality_class
   };
 }
 
@@ -1690,6 +1712,7 @@ function chunkCard(chunk) {
 function visualCard(visual) {
   const frames = state.index.framesByScene.get(visual.scene_id) || visual.frames || [];
   const droppedFrames = state.index.droppedFramesByScene.get(visual.scene_id) || [];
+  const qualityFrames = state.index.qualityFramesByScene.get(visual.scene_id) || [];
   const issueRefs = mergeIssueRefs(
     state.index.issuesByVisual.get(visual.visual_event_id) || [],
     state.index.issuesByScene.get(visual.scene_id) || []
@@ -1712,6 +1735,7 @@ function visualCard(visual) {
         ...(visual.interpretations || [])
       ].filter(Boolean).join('\n'), 700))}</div>
       ${frameStrip(frames)}
+      ${frameQualityStrip(qualityFrames)}
       ${droppedFrameStrip(droppedFrames)}
     </article>
   `;
@@ -1719,6 +1743,7 @@ function visualCard(visual) {
 
 function frameSceneCard(scene) {
   const droppedFrames = state.index.droppedFramesByScene.get(scene.scene_id) || [];
+  const qualityFrames = state.index.qualityFramesByScene.get(scene.scene_id) || [];
   const issueRefs = state.index.issuesByScene.get(scene.scene_id) || [];
   return `
     <article class="card" data-inspect-kind="frame-scene" data-inspect-id="${attr(scene.scene_id)}">
@@ -1731,6 +1756,7 @@ function frameSceneCard(scene) {
       </div>
       ${itemIssuesBlock(issueRefs)}
       ${frameStrip(scene.frames)}
+      ${frameQualityStrip(qualityFrames)}
       ${droppedFrameStrip(droppedFrames)}
     </article>
   `;
@@ -2373,18 +2399,47 @@ function frameStrip(frames) {
 function droppedFrameStrip(frames) {
   if (!frames?.length) return '';
   return `
-    <div class="frame-review-label">Отброшенные дубли (в анализ не отправлялись)</div>
+    <div class="frame-review-label">Отброшенные кадры (в анализ не отправлялись)</div>
     <div class="frame-strip">
       ${frames.map((frame) => {
         const distance = frame.phash_distance ?? '?';
         const ssim = frame.ssim == null ? '-' : Number(frame.ssim).toFixed(3);
         const matched = frame.matched_frame || '-';
-        const title = `time ${formatTime(frame.timestamp)} · match ${matched} · ssim ${ssim}`;
+        const isQualityDrop = frame.dedup_status === 'quality';
+        const title = isQualityDrop
+          ? `time ${formatTime(frame.timestamp)} · ${frame.skip_reason || frame.quality_class || 'quality'}`
+          : `time ${formatTime(frame.timestamp)} · match ${matched} · ssim ${ssim}`;
+        const label = isQualityDrop ? 'quality' : `dup Δ${escapeHtml(String(distance))}`;
         return `
           <a class="frame frame--dropped" href="${attr(mediaUrl(frame.path))}" target="_blank" rel="noreferrer" title="${attr(title)}">
             <img loading="lazy" src="${attr(mediaUrl(frame.path))}" alt="${attr(frame.scene_id || 'duplicate frame')}">
-            <span>dup Δ${escapeHtml(String(distance))}</span>
+            <span>${label}</span>
           </a>
+        `;
+      }).join('')}
+    </div>
+  `;
+}
+
+function frameQualityStrip(frames) {
+  if (!frames?.length) return '';
+  return `
+    <div class="frame-review-label">Качество выбранных кадров</div>
+    <div class="quality-frame-list">
+      ${frames.map((frame) => {
+        const quality = frame.quality || {};
+        const delta = frame.timestamp_delta_seconds == null ? '-' : `${Number(frame.timestamp_delta_seconds).toFixed(3)}s`;
+        const score = quality.score == null ? '-' : Number(quality.score).toFixed(3);
+        const flags = (quality.flags || []).join(', ') || 'no flags';
+        return `
+          <div class="quality-frame-row">
+            <span>${escapeHtml(formatTime(frame.timestamp))}</span>
+            <span>${escapeHtml(frame.selection_decision || '-')}</span>
+            <span>${escapeHtml(frame.quality_class || '-')}</span>
+            <span>score ${escapeHtml(score)}</span>
+            <span>delta ${escapeHtml(delta)}</span>
+            <span class="muted">${escapeHtml(flags)}</span>
+          </div>
         `;
       }).join('')}
     </div>

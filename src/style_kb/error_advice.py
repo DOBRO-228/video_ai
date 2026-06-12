@@ -287,6 +287,22 @@ _ADVICE: dict[str, ErrorAdvice] = {
         actions=["Use minimal, low, medium, or high in src/style_kb/config/default.yaml.", "Run style-kb resume JOB_ID."],
         inspect=["src/style_kb/config/default.yaml"],
     ),
+    "gemini_thinking_budget_invalid": ErrorAdvice(
+        error_code="gemini_thinking_budget_invalid",
+        retryable=False,
+        resume_safe_after_fix=True,
+        summary="Gemini thinking_budget is invalid.",
+        actions=["Use -1 for dynamic thinking, 0 to disable thinking, or 1..24576 in src/style_kb/config/default.yaml.", "Run style-kb resume JOB_ID."],
+        inspect=["src/style_kb/config/default.yaml"],
+    ),
+    "gemini_thinking_config_conflict": ErrorAdvice(
+        error_code="gemini_thinking_config_conflict",
+        retryable=False,
+        resume_safe_after_fix=True,
+        summary="Gemini thinking_level and thinking_budget cannot both be set.",
+        actions=["Set only one Gemini thinking control in src/style_kb/config/default.yaml.", "Run style-kb resume JOB_ID."],
+        inspect=["src/style_kb/config/default.yaml"],
+    ),
     "gemini_vision_failed": ErrorAdvice(
         error_code="gemini_vision_failed",
         retryable=True,

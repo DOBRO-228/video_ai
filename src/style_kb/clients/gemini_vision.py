@@ -6,6 +6,7 @@ from typing import Any
 
 from style_kb.clients._retry import OnRetry, RetryPolicy, call_with_retry
 from style_kb.clients.provider_diagnostics import cached_gemini_diagnostics, gemini_response_diagnostics, start_operation
+from style_kb.clients.token_usage import gemini_usage
 from style_kb.clients.vision import PRESENTER_PROFILE_SCHEMA, VISUAL_RESPONSE_SCHEMA, VisionAnalysisResult
 from style_kb.errors import MissingApiKeyError, ProviderError
 from style_kb.utils.files import read_json, write_json_atomic
@@ -22,6 +23,7 @@ class GeminiVisionClient:
         model: str,
         media_resolution: str | None,
         thinking_level: str | None,
+        thinking_budget: int | None,
         retry_policy: RetryPolicy | None = None,
         on_retry: OnRetry | None = None,
     ) -> None:
@@ -36,6 +38,12 @@ class GeminiVisionClient:
         self.model = model
         self.media_resolution = _normalize_media_resolution(media_resolution)
         self.thinking_level = _normalize_thinking_level(thinking_level)
+        self.thinking_budget = _normalize_thinking_budget(thinking_budget)
+        if self.thinking_level is not None and self.thinking_budget is not None:
+            raise ProviderError(
+                "Gemini thinking_level and thinking_budget are mutually exclusive",
+                error_code="gemini_thinking_config_conflict",
+            )
         self.retry_policy = retry_policy or RetryPolicy()
         self.on_retry = on_retry
 
@@ -103,9 +111,7 @@ class GeminiVisionClient:
                     config=self.types.GenerateContentConfig(
                         response_mime_type="application/json",
                         response_json_schema=schema,
-                        thinking_config=self.types.ThinkingConfig(thinking_level=self.thinking_level)
-                        if self.thinking_level
-                        else None,
+                        thinking_config=self._thinking_config(),
                     ),
                 ),
                 policy=self.retry_policy,
@@ -127,6 +133,13 @@ class GeminiVisionClient:
         raw_payload["_style_kb_diagnostics"] = diagnostics.to_dict()
         write_json_atomic(raw_output_path, raw_payload)
         return _result_from_raw_payload(raw_payload, fallback_output_text=output_text)
+
+    def _thinking_config(self) -> Any | None:
+        if self.thinking_budget is not None:
+            return self.types.ThinkingConfig(thinking_budget=self.thinking_budget)
+        if self.thinking_level is not None:
+            return self.types.ThinkingConfig(thinking_level=self.thinking_level)
+        return None
 
 
 def load_cached_gemini_visual_result(raw_output_path: Path) -> VisionAnalysisResult:
@@ -186,6 +199,17 @@ def _normalize_thinking_level(value: str | None) -> str | None:
     return normalized
 
 
+def _normalize_thinking_budget(value: int | None) -> int | None:
+    if value is None:
+        return None
+    if value < -1 or value > 24576:
+        raise ProviderError(
+            f"Unsupported Gemini thinking_budget: {value}",
+            error_code="gemini_thinking_budget_invalid",
+        )
+    return value
+
+
 def _model_dump(response: Any) -> dict[str, Any]:
     model_dump = getattr(response, "model_dump", None)
     if callable(model_dump):
@@ -212,8 +236,8 @@ def _result_from_raw_payload(
             error_code="gemini_vision_json_parse_failed",
             details=str(error),
         ) from error
-    usage_payload = _usage_from_raw_payload(raw_payload)
     model = _string_value(raw_payload.get("model_version")) or _string_value(raw_payload.get("modelVersion"))
+    usage_payload = gemini_usage(raw_payload, model=model)
     return VisionAnalysisResult(
         payload=payload,
         raw_payload=raw_payload,
@@ -222,18 +246,6 @@ def _result_from_raw_payload(
         remote_duration_seconds=None,
         diagnostics=cached_gemini_diagnostics(raw_payload, model=model, usage=usage_payload),
     )
-
-
-def _usage_from_raw_payload(raw_payload: dict[str, Any]) -> dict[str, int]:
-    usage = raw_payload.get("usage_metadata") or raw_payload.get("usageMetadata") or {}
-    if not isinstance(usage, dict):
-        usage = {}
-    return {
-        "input_tokens": _int_from_mapping(usage, "prompt_token_count", "promptTokenCount"),
-        "output_tokens": _int_from_mapping(usage, "candidates_token_count", "candidatesTokenCount"),
-        "reasoning_tokens": _int_from_mapping(usage, "thoughts_token_count", "thoughtsTokenCount"),
-        "total_tokens": _int_from_mapping(usage, "total_token_count", "totalTokenCount"),
-    }
 
 
 def _extract_output_text(raw_payload: dict[str, Any]) -> str:
@@ -250,16 +262,6 @@ def _extract_output_text(raw_payload: dict[str, Any]) -> str:
         "Gemini vision response does not contain output text",
         error_code="gemini_vision_output_missing",
     )
-
-
-def _int_from_mapping(value: dict[str, Any], *keys: str) -> int:
-    for key in keys:
-        try:
-            if value.get(key) is not None:
-                return int(value[key])
-        except (TypeError, ValueError):
-            continue
-    return 0
 
 
 def _string_value(value: object) -> str | None:

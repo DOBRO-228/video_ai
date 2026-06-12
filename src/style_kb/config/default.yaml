@@ -80,6 +80,7 @@ stt:
 scene_detection:
   detector: adaptive
   min_scene_len_seconds: 1.5
+  keyframe_edge_inset_seconds: 0.35
   images_per_scene: 4
   extra_sample_every_seconds: 4
   max_frames_per_scene: 8
@@ -88,12 +89,35 @@ scene_detection:
   ssim_confirm: 0.85
   min_frames_per_scene: 1
   fallback_scene_seconds: 30
+  frame_quality:
+    enabled: true
+    probe_window_seconds: 0.6
+    probe_step_seconds: 0.3
+    prefer_planned_timestamp_score_ratio: 0.92
+    drop_low_quality: false
+    min_quality_frames_per_scene: 1
+    central_region_weight: 1.5
+    grid_size: 4
+    keep_rejected_probe_files: false
+  palette_boundary_refinement:
+    enabled: true
+    sample_step_seconds: 0.25
+    min_scene_duration_seconds: 6.0
+    max_boundary_shift_seconds: 3.0
+    min_segment_seconds: 1.5
+    stable_window_seconds: 1.0
+    edge_guard_seconds: 0.75
+    min_saturation_delta: 30.0
+    min_colorfulness_delta: 8.0
+    min_histogram_distance: 0.25
+    min_confidence: 0.75
 
 vision:
   provider: gemini
-  model: gemini-3-flash-preview
+  model: gemini-2.5-flash
   media_resolution: high
-  thinking_level: low
+  thinking_level: null
+  thinking_budget: 8192
   batch_size: 6
   # OpenAI values kept for rollback:
   # provider: openai

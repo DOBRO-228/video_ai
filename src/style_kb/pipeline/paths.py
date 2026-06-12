@@ -160,6 +160,10 @@ class JobPaths:
         return self.scenes_dir / "scenes.jsonl"
 
     @property
+    def scene_detection_report(self) -> Path:
+        return self.scenes_dir / "scene_detection_report.json"
+
+    @property
     def frame_refs_jsonl(self) -> Path:
         return self.frames_dir / "frame_refs.jsonl"
 

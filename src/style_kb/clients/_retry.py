@@ -7,6 +7,8 @@ from typing import Callable, TypeVar
 
 from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
 
+from style_kb.clients.provider_diagnostics import response_status_from_error
+
 _T = TypeVar("_T")
 
 RETRYABLE_OPENAI_EXCEPTIONS: tuple[type[BaseException], ...] = (
@@ -15,6 +17,7 @@ RETRYABLE_OPENAI_EXCEPTIONS: tuple[type[BaseException], ...] = (
     RateLimitError,
     InternalServerError,
 )
+RETRYABLE_STATUS_CODES = frozenset({408, 409, 425, 429})
 
 
 @dataclass(slots=True)
@@ -48,7 +51,9 @@ def call_with_retry(
     for attempt in range(1, policy.max_attempts + 1):
         try:
             return func()
-        except RETRYABLE_OPENAI_EXCEPTIONS as error:
+        except Exception as error:
+            if not is_retryable_error(error):
+                raise
             last_error = error
             if attempt >= policy.max_attempts:
                 break
@@ -62,6 +67,15 @@ def call_with_retry(
             time.sleep(delay)
     assert last_error is not None
     raise last_error
+
+
+def is_retryable_error(error: BaseException) -> bool:
+    if isinstance(error, RETRYABLE_OPENAI_EXCEPTIONS):
+        return True
+    status_code = response_status_from_error(error)
+    if status_code is None:
+        return False
+    return status_code in RETRYABLE_STATUS_CODES or status_code >= 500
 
 
 def _retry_after_seconds(error: BaseException) -> float | None:
