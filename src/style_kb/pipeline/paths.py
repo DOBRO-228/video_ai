@@ -216,6 +216,14 @@ class JobPaths:
         return self.claims_dir / "style_claims.jsonl"
 
     @property
+    def style_claims_current_jsonl(self) -> Path:
+        return self.claims_dir / "style_claims_current.jsonl"
+
+    @property
+    def style_claims_manual_edits_jsonl(self) -> Path:
+        return self.claims_dir / "style_claims_manual_edits.jsonl"
+
+    @property
     def style_claims_raw(self) -> Path:
         return self.claims_dir / "style_claims_raw.json"
 
@@ -238,6 +246,10 @@ class JobPaths:
     def failure_history_report(self, run_id: str) -> Path:
         safe_run_id = "".join(character if character.isalnum() or character in {"-", "_"} else "_" for character in run_id)
         return self.failure_history_dir / f"failure_report_resolved_{safe_run_id}.json"
+
+    @property
+    def human_review_report(self) -> Path:
+        return self.reports_dir / "human_review.json"
 
     @property
     def partial_quality_report(self) -> Path:
@@ -267,6 +279,22 @@ class JobPaths:
 
     def style_claims_retry_advice_attempt(self, chunk_id: str, attempt: int) -> Path:
         return self.claims_raw_dir / f"{chunk_id}_retry_advice_attempt_{attempt:02d}.json"
+
+    @property
+    def style_claims_batch_input(self) -> Path:
+        return self.claims_raw_dir / "batch_extract_input.jsonl"
+
+    @property
+    def style_claims_batch_manifest(self) -> Path:
+        return self.claims_raw_dir / "batch_extract_manifest.json"
+
+    @property
+    def style_claims_batch_output(self) -> Path:
+        return self.claims_raw_dir / "batch_extract_output.jsonl"
+
+    @property
+    def style_claims_batch_errors(self) -> Path:
+        return self.claims_raw_dir / "batch_extract_errors.jsonl"
 
     @property
     def style_claims_raw_curate(self) -> Path:
@@ -323,6 +351,7 @@ class JobPaths:
             "chunks": str(self.chunks_jsonl),
             "chunk_plan": str(self.chunk_plan),
             "style_claims": str(self.style_claims_jsonl),
+            "style_claims_current": str(self.style_claims_current_jsonl),
             "jsonl_manifest": str(self.export_jsonl("manifest.json")),
             "quality_report": str(self.quality_report),
             "obsidian_index": str(self.obsidian_index),

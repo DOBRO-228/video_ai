@@ -11,12 +11,13 @@ from style_kb.models import (
 )
 from style_kb.pipeline.base import Stage, StageContext, StageResult
 from style_kb.stages.common import (
+    effective_style_claims_path,
     load_chunks,
+    load_effective_style_claims,
     load_frame_refs,
     load_scenes,
     load_speech_segments,
     load_speech_tokens,
-    load_style_claims,
     load_timeline_events,
     load_video_info,
     load_visual_events,
@@ -31,25 +32,30 @@ from style_kb.stages.stage_10_describe_visuals import (
 from style_kb.utils.collections import stable_unique
 from style_kb.utils.pydantic_io import read_model, write_model
 
+
 class Stage16QualityReport(Stage):
     name = "16_quality_report"
     ordinal = 16
 
     def input_files(self, context: StageContext) -> list:
-        return [
+        inputs = [
             context.paths.metadata_video_info,
             context.paths.timeline_media_durations,
             context.paths.stt_speaker_diarization,
             context.paths.stt_speech_tokens,
             context.paths.stt_speech_segments,
-            context.paths.scenes_jsonl,
-            context.paths.frame_refs_jsonl,
-            context.paths.visual_events_jsonl,
-            context.paths.visual_presenter_profile,
             context.paths.timeline_events_jsonl,
             context.paths.chunks_jsonl,
-            context.paths.style_claims_jsonl,
+            effective_style_claims_path(context),
         ]
+        if context.config.pipeline.visual_enabled:
+            inputs[5:5] = [
+                context.paths.scenes_jsonl,
+                context.paths.frame_refs_jsonl,
+                context.paths.visual_events_jsonl,
+                context.paths.visual_presenter_profile,
+            ]
+        return inputs
 
     def output_files(self, context: StageContext) -> list:
         return [context.paths.quality_report]
@@ -64,12 +70,12 @@ class Stage16QualityReport(Stage):
         speech_tokens = load_speech_tokens(context.paths.stt_speech_tokens)
         speaker_diarization = read_model(context.paths.stt_speaker_diarization, SpeakerDiarization)
         speech_segments = load_speech_segments(context.paths.stt_speech_segments)
-        scenes = load_scenes(context.paths.scenes_jsonl)
-        frame_refs = load_frame_refs(context.paths.frame_refs_jsonl)
-        visual_events = load_visual_events(context.paths.visual_events_jsonl)
+        scenes = load_scenes(context.paths.scenes_jsonl) if context.config.pipeline.visual_enabled else []
+        frame_refs = load_frame_refs(context.paths.frame_refs_jsonl) if context.config.pipeline.visual_enabled else []
+        visual_events = load_visual_events(context.paths.visual_events_jsonl) if context.config.pipeline.visual_enabled else []
         timeline_events = load_timeline_events(context.paths.timeline_events_jsonl)
         chunks = load_chunks(context.paths.chunks_jsonl)
-        style_claims = load_style_claims(context.paths.style_claims_jsonl)
+        style_claims = load_effective_style_claims(context)
         if not timeline_events:
             raise StageExecutionError("timeline is empty", error_code="quality_empty_timeline")
         if not chunks:
@@ -82,9 +88,9 @@ class Stage16QualityReport(Stage):
         timeline_end = timeline_events[-1].end
         chunks_end = chunks[-1].end
         warnings: list[str] = []
-        if abs(video_info.duration - video_duration) > 1.0:
+        if context.config.pipeline.visual_enabled and abs(video_info.duration - video_duration) > 1.0:
             warnings.append("metadata duration differs from proxy video duration by more than 1.0s")
-        if len(scenes) == 1:
+        if context.config.pipeline.visual_enabled and len(scenes) == 1:
             warnings.append("scene detection produced a single scene")
         if speaker_diarization.enabled and speaker_diarization.detected_speakers == 0:
             warnings.append("speaker diarization is enabled but no speaker labels were detected")
@@ -102,6 +108,7 @@ class Stage16QualityReport(Stage):
         visual_presentation_noise_metrics = _visual_presentation_noise_metrics(visual_events)
         chunk_presentation_noise_metrics = _chunk_presentation_noise_metrics(chunks)
         quality_metrics = {
+            "visual_enabled": int(context.config.pipeline.visual_enabled),
             **baseline_leakage_metrics,
             **technical_leakage_metrics,
             **visual_presentation_noise_metrics,
@@ -163,6 +170,8 @@ class Stage16QualityReport(Stage):
 
 
 def _quality_baseline_leakage_metrics(context: StageContext, visual_events: list[VisualEvent]) -> dict[str, int]:
+    if not context.config.pipeline.visual_enabled:
+        return empty_baseline_leakage_metrics()
     if not context.paths.visual_presenter_profile.exists():
         return empty_baseline_leakage_metrics()
     profile = read_model(context.paths.visual_presenter_profile, PresenterProfile)
@@ -178,6 +187,8 @@ def _presenter_warnings(
     baseline_leakage_metrics: dict[str, int],
 ) -> list[str]:
     warnings: list[str] = []
+    if not context.config.pipeline.visual_enabled:
+        return warnings
     if not context.paths.visual_presenter_profile.exists():
         return warnings
     profile = read_model(context.paths.visual_presenter_profile, PresenterProfile)

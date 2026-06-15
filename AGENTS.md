@@ -6,19 +6,26 @@ This file is for AI agents working on this repository.
 
 `style-kb` is a CLI-first Python application that ingests exactly one YouTube video URL into a local multimodal knowledge base.
 
-The public ingest command is fixed:
+The default public ingest command remains:
 
 ```bash
 style-kb ingest "https://www.youtube.com/watch?v=VIDEO_ID"
 ```
 
-Do not add CLI options for config, output paths, providers, models, quality, formats, cleanup, chunking, language, or partial execution. Runtime product settings come from `src/style_kb/config/default.yaml`.
+The ingest command may also take the existing optional stop-after-stage positional argument and the explicit OpenAI Batch API switch:
+
+```bash
+style-kb ingest "https://www.youtube.com/watch?v=VIDEO_ID" 13 --batch
+```
+
+Do not add CLI options for config, output paths, providers, models, quality, formats, cleanup, chunking, language, or other partial execution controls. Runtime product settings come from `src/style_kb/config/default.yaml`. The only allowed runtime execution switch is `--batch`, which enables eligible OpenAI Batch API requests for that run.
 
 Allowed service commands are:
 
 ```bash
 style-kb status JOB_ID
 style-kb resume JOB_ID
+style-kb resume JOB_ID --batch
 ```
 
 ## Before Editing

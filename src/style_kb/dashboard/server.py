@@ -18,7 +18,7 @@ from style_kb.config import load_default_config
 from style_kb.dashboard.assets import APP_JS, INDEX_HTML, STYLES_CSS
 from style_kb.models import ClaimType, ConfidenceLevel, StyleClaim
 from style_kb.pipeline.paths import JobPaths
-from style_kb.utils.files import write_jsonl_atomic
+from style_kb.utils.files import write_json_atomic, write_jsonl_atomic
 
 
 HOST = "127.0.0.1"
@@ -63,6 +63,7 @@ _CLAIM_TYPE_VALUES = set(ClaimType.values())
 _CLAIM_CONFIDENCE_VALUES = set(ConfidenceLevel.values())
 _CLAIM_EDIT_LOCKS_LOCK = threading.Lock()
 _CLAIM_EDIT_LOCKS: dict[Path, threading.Lock] = {}
+_HUMAN_REVIEW_LOCK = threading.Lock()
 
 
 def main() -> None:
@@ -132,6 +133,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_PATCH(self) -> None:
         parsed = urlparse(self.path)
         try:
+            review_match = re.fullmatch(r"/api/jobs/([^/]+)/human-review", parsed.path)
+            if review_match:
+                job_id = unquote(review_match.group(1))
+                self._send_json(update_human_review(self.output_root, job_id, self._read_json_body()))
+                return
+
             match = re.fullmatch(r"/api/jobs/([^/]+)/claims/([^/]+)", parsed.path)
             if not match:
                 self._send_json({"error": "not_found", "path": parsed.path}, status=404)
@@ -139,6 +146,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
             job_id = unquote(match.group(1))
             claim_id = unquote(match.group(2))
             self._send_json(update_claim(self.output_root, job_id, claim_id, self._read_json_body()))
+        except DashboardError as error:
+            self._send_json({"error": error.code, "message": error.message}, status=error.status)
+        except Exception as error:
+            self._send_json({"error": "internal_error", "message": str(error)}, status=500)
+
+    def do_DELETE(self) -> None:
+        parsed = urlparse(self.path)
+        try:
+            match = re.fullmatch(r"/api/jobs/([^/]+)/claims/([^/]+)", parsed.path)
+            if not match:
+                self._send_json({"error": "not_found", "path": parsed.path}, status=404)
+                return
+            job_id = unquote(match.group(1))
+            claim_id = unquote(match.group(2))
+            self._send_json(delete_claim(self.output_root, job_id, claim_id))
         except DashboardError as error:
             self._send_json({"error": error.code, "message": error.message}, status=error.status)
         except Exception as error:
@@ -248,9 +270,11 @@ def job_payload(output_root: Path, job_id: str) -> dict[str, Any]:
     frame_dedup = read_json(paths.frame_extraction_report)
     pipeline_events = tail_jsonl(paths.pipeline_events_jsonl, max_items=1200)
     selected_claims = read_json(paths.claims_dir / "style_claims_selected.json")
+    human_review = read_human_review(paths)
 
     payload = {
         "job": job,
+        "human_review": human_review,
         "stages": stages,
         "artifacts": artifact_statuses(paths),
         "video_info": video_info,
@@ -344,6 +368,7 @@ def enrich_job_summary(output_root: Path, job: dict[str, Any]) -> dict[str, Any]
     paths = JobPaths(output_root, job["job_id"])
     video_info = read_json(paths.metadata_video_info)
     quality = read_json(paths.quality_report)
+    human_review = read_human_review(paths)
     if video_info:
         job["title"] = job.get("title") or video_info.get("title")
         job["channel"] = job.get("channel") or video_info.get("channel")
@@ -353,6 +378,7 @@ def enrich_job_summary(output_root: Path, job: dict[str, Any]) -> dict[str, Any]
         job["stage_counts"] = quality.get("stage_counts", {})
         job["warnings_count"] = len(quality.get("warnings", []))
         job["errors_count"] = len(quality.get("errors", []))
+    apply_human_review_summary(job, human_review)
     job["artifact_mtime"] = iso_mtime(paths.job_dir)
     return job
 
@@ -361,8 +387,9 @@ def synthesize_job(paths: JobPaths) -> dict[str, Any]:
     video_info = read_json(paths.metadata_video_info)
     quality = read_json(paths.quality_report)
     failure = read_json(paths.failure_report)
+    human_review = read_human_review(paths)
     created_at = iso_mtime(paths.job_dir)
-    return {
+    job = {
         "job_id": paths.job_id,
         "video_id": (video_info or quality or failure or {}).get("video_id", paths.job_id),
         "url": (video_info or failure or {}).get("url", ""),
@@ -387,6 +414,8 @@ def synthesize_job(paths: JobPaths) -> dict[str, Any]:
         "errors_count": len((quality or {}).get("errors", [])),
         "artifact_mtime": created_at,
     }
+    apply_human_review_summary(job, human_review)
+    return job
 
 
 def artifact_statuses(paths: JobPaths) -> list[dict[str, Any]]:
@@ -412,6 +441,7 @@ def artifact_statuses(paths: JobPaths) -> list[dict[str, Any]]:
         "partial_quality_report": paths.partial_quality_report,
         "failure_report": paths.failure_report,
         "cleanup_report": paths.cleanup_report,
+        "human_review": paths.human_review_report,
         "pipeline_events": paths.pipeline_events_jsonl,
         "pipeline_log": paths.pipeline_human_log,
         "obsidian_index": paths.obsidian_index,
@@ -440,11 +470,70 @@ def file_status(key: str, path: Path, *, base_dir: Path) -> dict[str, Any]:
 
 
 def claim_edits_path(paths: JobPaths) -> Path:
-    return paths.claims_dir / "style_claims_manual_edits.jsonl"
+    return paths.style_claims_manual_edits_jsonl
 
 
 def current_claims_path(paths: JobPaths) -> Path:
-    return paths.claims_dir / "style_claims_current.jsonl"
+    return paths.style_claims_current_jsonl
+
+
+def read_human_review(paths: JobPaths) -> dict[str, Any]:
+    payload = read_json(paths.human_review_report)
+    if not isinstance(payload, dict):
+        return default_human_review()
+    return {
+        "schema_version": 1,
+        "human_reviewed": bool(payload.get("human_reviewed")),
+        "reviewed_at": payload.get("reviewed_at") if isinstance(payload.get("reviewed_at"), str) else None,
+        "reviewed_by": payload.get("reviewed_by") if isinstance(payload.get("reviewed_by"), str) else None,
+        "updated_at": payload.get("updated_at") if isinstance(payload.get("updated_at"), str) else None,
+        "actor": payload.get("actor") if isinstance(payload.get("actor"), str) else None,
+    }
+
+
+def default_human_review() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "human_reviewed": False,
+        "reviewed_at": None,
+        "reviewed_by": None,
+        "updated_at": None,
+        "actor": None,
+    }
+
+
+def apply_human_review_summary(job: dict[str, Any], human_review: dict[str, Any]) -> None:
+    job["human_review"] = human_review
+    job["human_reviewed"] = bool(human_review.get("human_reviewed"))
+    job["human_reviewed_at"] = human_review.get("reviewed_at")
+    job["human_review_updated_at"] = human_review.get("updated_at")
+
+
+def update_human_review(output_root: Path, job_id: str, updates: Any) -> dict[str, Any]:
+    if not job_id or "/" in job_id or "\\" in job_id:
+        raise DashboardError("bad_job_id", "job id contains unsupported characters", status=400)
+    if not isinstance(updates, dict):
+        raise DashboardError("bad_human_review_update", "human review update must be a JSON object", status=400)
+    if not isinstance(updates.get("human_reviewed"), bool):
+        raise DashboardError("bad_human_reviewed", "human_reviewed must be a boolean", status=400)
+
+    paths = JobPaths(output_root, job_id)
+    if not paths.job_dir.exists():
+        raise DashboardError("job_not_found", f"job not found: {job_id}", status=404)
+
+    human_reviewed = updates["human_reviewed"]
+    now = datetime.now(tz=UTC).isoformat(timespec="microseconds")
+    payload = {
+        "schema_version": 1,
+        "human_reviewed": human_reviewed,
+        "reviewed_at": now if human_reviewed else None,
+        "reviewed_by": "dashboard" if human_reviewed else None,
+        "updated_at": now,
+        "actor": "dashboard",
+    }
+    with _HUMAN_REVIEW_LOCK:
+        write_json_atomic(paths.human_review_report, payload)
+    return job_payload(output_root, job_id)
 
 
 def update_claim(output_root: Path, job_id: str, claim_id: str, updates: Any) -> dict[str, Any]:
@@ -474,7 +563,9 @@ def update_claim(output_root: Path, job_id: str, claim_id: str, updates: Any) ->
             for claim in apply_claim_edits(original_claims, claim_edits)
             if claim.get("claim_id")
         }
-        previous_claim = effective_by_id.get(claim_id) or deepcopy(original_claim)
+        previous_claim = effective_by_id.get(claim_id)
+        if previous_claim is None:
+            raise DashboardError("claim_deleted", f"claim was deleted: {claim_id}", status=409)
         updated_claim = build_updated_claim(previous_claim, updates)
         changes = claim_field_changes(previous_claim, updated_claim)
         if changes:
@@ -498,6 +589,56 @@ def update_claim(output_root: Path, job_id: str, claim_id: str, updates: Any) ->
             write_jsonl_atomic(edits_path, next_claim_edits)
         if next_claim_edits:
             write_current_claims(paths, original_claims, next_claim_edits)
+
+    return job_payload(output_root, job_id)
+
+
+def delete_claim(output_root: Path, job_id: str, claim_id: str) -> dict[str, Any]:
+    if not job_id or "/" in job_id or "\\" in job_id:
+        raise DashboardError("bad_job_id", "job id contains unsupported characters", status=400)
+    if not claim_id or "/" in claim_id or "\\" in claim_id:
+        raise DashboardError("bad_claim_id", "claim id contains unsupported characters", status=400)
+
+    paths = JobPaths(output_root, job_id)
+    if not paths.job_dir.exists():
+        raise DashboardError("job_not_found", f"job not found: {job_id}", status=404)
+
+    original_claims = read_jsonl(paths.style_claims_jsonl)
+    original_by_id = {claim.get("claim_id"): claim for claim in original_claims if claim.get("claim_id")}
+    original_claim = original_by_id.get(claim_id)
+    if not original_claim:
+        raise DashboardError("claim_not_found", f"claim not found: {claim_id}", status=404)
+
+    edits_path = claim_edits_path(paths)
+    with claim_edit_lock(edits_path):
+        claim_edits = read_jsonl(edits_path)
+        effective_by_id = {
+            claim.get("claim_id"): strip_claim_dashboard_fields(claim)
+            for claim in apply_claim_edits(original_claims, claim_edits)
+            if claim.get("claim_id")
+        }
+        previous_claim = effective_by_id.get(claim_id)
+        if previous_claim is not None:
+            edited_at = datetime.now(tz=UTC).isoformat(timespec="microseconds")
+            deleted_claim = strip_claim_dashboard_fields(previous_claim)
+            edit_record = {
+                "schema_version": 1,
+                "edit_id": claim_delete_id(job_id, claim_id, edited_at, deleted_claim),
+                "action": "delete",
+                "actor": "dashboard",
+                "job_id": job_id,
+                "claim_id": claim_id,
+                "edited_at": edited_at,
+                "original_artifact": "claims/style_claims.jsonl",
+                "original_claim": strip_claim_dashboard_fields(original_claim),
+                "previous_claim": deleted_claim,
+                "deleted_claim": deleted_claim,
+                "changed_fields": ["deleted"],
+                "field_changes": {"deleted": {"before": False, "after": True}},
+            }
+            claim_edits = [*claim_edits, edit_record]
+            write_jsonl_atomic(edits_path, claim_edits)
+        write_current_claims(paths, original_claims, claim_edits)
 
     return job_payload(output_root, job_id)
 
@@ -597,9 +738,25 @@ def claim_edit_id(job_id: str, claim_id: str, edited_at: str, updated_claim: dic
     return f"manual_claim_edit_{short_hash(fingerprint)}"
 
 
+def claim_delete_id(job_id: str, claim_id: str, edited_at: str, deleted_claim: dict[str, Any]) -> str:
+    fingerprint = json.dumps(
+        {"job_id": job_id, "claim_id": claim_id, "edited_at": edited_at, "deleted_claim": deleted_claim},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return f"manual_claim_delete_{short_hash(fingerprint)}"
+
+
 def write_current_claims(paths: JobPaths, original_claims: list[dict[str, Any]], claim_edits: list[dict[str, Any]]) -> None:
     current_claims = current_claim_rows(original_claims, claim_edits)
     write_jsonl_atomic(current_claims_path(paths), current_claims)
+    write_existing_exported_claims(paths, current_claims)
+
+
+def write_existing_exported_claims(paths: JobPaths, current_claims: list[dict[str, Any]]) -> None:
+    exported_claims_path = paths.export_jsonl("style_claims.jsonl")
+    if exported_claims_path.exists():
+        write_jsonl_atomic(exported_claims_path, current_claims)
 
 
 def current_claim_rows(original_claims: list[dict[str, Any]], claim_edits: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -612,10 +769,18 @@ def current_claim_rows(original_claims: list[dict[str, Any]], claim_edits: list[
 def apply_claim_edits(original_claims: list[dict[str, Any]], claim_edits: list[dict[str, Any]]) -> list[dict[str, Any]]:
     claims_by_id = {claim.get("claim_id"): strip_claim_dashboard_fields(claim) for claim in original_claims if claim.get("claim_id")}
     history_by_id = build_claim_edit_history(claim_edits)
+    deleted_claim_ids: set[str] = set()
     for edit in claim_edits:
-        if edit.get("action") != "update":
-            continue
         claim_id = edit.get("claim_id")
+        if not isinstance(claim_id, str):
+            continue
+        action = edit.get("action")
+        if action == "delete":
+            deleted_claim_ids.add(claim_id)
+            claims_by_id.pop(claim_id, None)
+            continue
+        if action != "update" or claim_id in deleted_claim_ids:
+            continue
         updated_claim = edit.get("updated_claim")
         if claim_id not in claims_by_id or not isinstance(updated_claim, dict):
             continue
@@ -629,7 +794,9 @@ def apply_claim_edits(original_claims: list[dict[str, Any]], claim_edits: list[d
     effective_claims: list[dict[str, Any]] = []
     for original_claim in original_claims:
         claim_id = original_claim.get("claim_id")
-        claim = deepcopy(claims_by_id.get(claim_id) or strip_claim_dashboard_fields(original_claim))
+        if claim_id not in claims_by_id:
+            continue
+        claim = deepcopy(claims_by_id[claim_id])
         history = history_by_id.get(claim_id) or []
         if history:
             latest = history[-1]

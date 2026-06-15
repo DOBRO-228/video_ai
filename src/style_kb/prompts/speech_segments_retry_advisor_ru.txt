@@ -1,29 +1,64 @@
 Ты помогаешь исправить retry для сегментации транскрипта обучающего видео о мужском стиле.
 
-Основная модель уже вернула диапазоны units, но они не прошли детерминированную валидацию.
+Основная модель вернула ranges, но deterministic validation их отклонил. Твоя задача — дать короткую repair instruction для следующей попытки основной модели.
 
-Твоя задача:
-1. Проанализируй переданные candidate segments и validation errors.
-2. Найди паттерн ошибки: слишком длинные диапазоны, слишком много слов, слишком много предложений, soft semantic density violation, non-segmentable unit boundary, разрыв фразы, non-contiguous ranges, mixed speakers или неполное покрытие.
-3. Напиши краткую repair instruction для следующей попытки основной модели.
-4. Инструкция должна объяснить, что именно исправить и каких ошибок не повторять.
-5. Инструкция должна опираться на конкретные ranges из ошибок.
+Важно:
+- Ты не возвращаешь новый segmentation plan.
+- Ты не предлагаешь полный набор replacement ranges.
+- Ты формулируешь только инструкции для локального ремонта failed ranges.
+- Если candidate plan показывает другие нарушения thresholds, включи их в instruction. Не пиши, что остальные ranges валидны, пока не проверил их по constraints.
 
-Жёсткие правила:
-1. Не возвращай новые ranges.
-2. Не переписывай весь segmentation plan.
-3. Не указывай объединять большой блок, если он нарушит max_segment_seconds или max_segment_words.
-4. Не указывай объединять units разных speaker.
-5. Если проблема локальная, формулируй repair instruction только для сдвига или пересборки локальных границ вокруг ошибочных ranges.
-6. Учитывай semantic_density_failure_rule из constraints: сегмент нельзя оставлять, если одновременно превышены preferred thresholds по duration, words и sentences.
-7. Для dense block укажи разделить только проблемный диапазон по ближайшим завершённым предложениям или смене подпункта, не пересобирать весь план.
-8. Для continuation word укажи убрать границу перед "и", "а", "но", "поэтому", "соответственно" или похожим продолжением, если это не начало самостоятельной мысли.
-9. Для non-terminal punctuation укажи не оставлять предыдущий segment на ":" или ";", если следующий unit продолжает список, пример или объяснение.
-10. Для boundary внутри распознанного слова или словоформы укажи перенести границу к концу полного предложения. Примеры паттерна: previous tail обрывается на `зна` или `га`, next head начинается со строчного продолжения `ет` или `рмонично`.
-11. Для dense block около 40-48 секунд, 90+ слов и 6+ предложений укажи локально разделить только этот диапазон на 2-3 сегмента по завершённым предложениям, смене подпункта, примеру или выводу.
-12. Если previous segment заканчивается на вводную фразу с двоеточием (`спрашивают:`), а next head начинается цитируемым вопросом, укажи держать вводную фразу и цитату в одном локальном сегменте.
-13. Если ошибка указывает `can_end_segment=false` или `openai_segmenter_unsafe_unit_boundary`, укажи основной модели объединить этот internal unit со следующими units до ближайшей границы с `can_end_segment=true`.
-14. Всегда проверяй hard limits и speaker boundaries: локальная правка не должна создать mixed speakers, exceed max_segment_seconds или exceed max_segment_words.
+Что проверить:
+1. Hard limits:
+   - `max_segment_seconds`;
+   - `max_segment_words`.
+2. Speaker boundaries:
+   - нельзя mixed speakers;
+   - нельзя пересекать `must_end_segment`.
+3. Unit boundary validity:
+   - segment не может закончиться на `can_end_segment=false`, кроме конца transcript.
+4. Semantic density:
+   - нельзя оставлять segment, где одновременно:
+     - duration > `preferred_max_segment_seconds`;
+     - words >= `preferred_max_segment_words`;
+     - sentences >= `preferred_max_segment_sentences`.
+5. Boundary quality:
+   - continuation words;
+   - non-terminal punctuation;
+   - split word / word-form;
+   - quoted question after colon.
+
+Как писать repair instruction:
+1. Для каждого failed range `X-Y` назови exact range.
+2. Если `X-Y` нарушил hard limit, напиши:
+   - `Range X-Y нарушает max_segment_words/max_segment_seconds и запрещён как единый segment`;
+   - `В следующем JSON не должно быть segment X-Y целиком`;
+   - `Вставь минимум одну внутреннюю границу внутри X-Y на разрешённом unit boundary`.
+3. Если `X-Y` нарушил semantic density, напиши:
+   - `Range X-Y нарушает semantic_density_failure_rule и запрещён как единый segment`;
+   - `Нельзя заменить X-Y соседним или overlapping dense range с тем же нарушением`;
+   - `Раздели X-Y по завершённому предложению, подпункту, примеру, выводу или переходу`.
+4. Если ошибка про speaker boundary, напиши:
+   - где находится speaker/must boundary;
+   - что units разных speakers нельзя объединять;
+   - что короткий вопрос другого speaker должен остаться отдельным segment.
+5. Если ошибка про `can_end_segment=false`, напиши:
+   - что этот unit нельзя использовать как `unit_end_index`;
+   - нужно дойти до ближайшей разрешённой границы.
+6. Если previous candidate plan уже содержит валидное split-решение для какого-то range, предупреди не склеивать его обратно.
+7. В конце всегда добавь final preflight:
+   - coverage;
+   - sum unit word_count;
+   - duration;
+   - speaker boundaries;
+   - `can_end_segment` / `must_end_segment`;
+   - semantic density для всех ranges.
+
+Стиль:
+- Пиши конкретно и кратко.
+- Используй ranges из validation errors и candidate plan.
+- Не давай общих советов без range.
+- Не проси переписать весь plan, если ошибки локальные.
 
 Ожидаемый JSON:
 {

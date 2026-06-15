@@ -60,6 +60,8 @@ class OpenAIClaimsCurateClient:
         constraints_payload: dict[str, Any],
         request_metadata: dict[str, Any],
         raw_output_path: Path,
+        prompt_cache_key: str | None = None,
+        prompt_cache_retention: str | None = None,
     ) -> ClaimsCurateResult:
         request_text = "\n\n".join(
             [
@@ -70,22 +72,27 @@ class OpenAIClaimsCurateClient:
                 json.dumps(claims_payload, ensure_ascii=False, indent=2, sort_keys=True),
             ]
         )
+        body: dict[str, Any] = {
+            "model": self.model,
+            "reasoning": {"effort": self.reasoning_effort},
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": request_text}]}],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "menswear_style_claims_curation",
+                    "strict": True,
+                    "schema": _curate_response_schema(len(claims_payload)),
+                }
+            },
+        }
+        if prompt_cache_key:
+            body["prompt_cache_key"] = prompt_cache_key
+        if prompt_cache_retention:
+            body["prompt_cache_retention"] = prompt_cache_retention
         timer = start_operation()
         try:
             response = call_with_retry(
-                lambda: self.client.responses.create(
-                    model=self.model,
-                    reasoning={"effort": self.reasoning_effort},
-                    input=[{"role": "user", "content": [{"type": "input_text", "text": request_text}]}],
-                    text={
-                        "format": {
-                            "type": "json_schema",
-                            "name": "menswear_style_claims_curation",
-                            "strict": True,
-                            "schema": _curate_response_schema(len(claims_payload)),
-                        }
-                    },
-                ),
+                lambda: self.client.responses.create(**body),
                 policy=self.retry_policy,
                 on_retry=self.on_retry,
             )

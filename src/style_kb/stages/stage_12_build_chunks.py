@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from style_kb.clients._retry import OnRetry
+from style_kb.clients.openai_cache import openai_prompt_cache_fingerprint, openai_prompt_cache_key
 from style_kb.clients.provider_diagnostics import ProviderCallDiagnostics, ProviderName
 from style_kb.clients.openai_chunk_planner import (
     ChunkPlanAnalysisResult,
@@ -256,6 +257,7 @@ def _build_chunk_plan(
     planned_items, _ = _annotate_question_answer_warnings(planned_items, speech_segments, context)
     plan = ChunkPlan(
         video_id=context.job.video_id,
+        visual_enabled=context.config.pipeline.visual_enabled,
         provider=context.config.chunking.provider,
         model=context.config.chunking.model,
         retry_advisor_model=context.config.chunking.retry_advisor_model,
@@ -460,7 +462,7 @@ def _plan_window_with_cache(
     window: _PlannerWindow,
     timeline_events: list[TimelineEvent],
 ) -> _WindowPlanResult:
-    planner_payload = _planner_payload(window, timeline_events)
+    planner_payload = _planner_payload(window, timeline_events, context)
     request_metadata = _window_request_metadata(
         context,
         window,
@@ -510,6 +512,12 @@ def _plan_window_with_retries(
         model=context.config.chunking.retry_advisor_model,
         on_retry=_chunk_retry_logger(context),
     )
+    prompt_cache_key, prompt_cache_retention = _openai_prompt_cache_settings(
+        context,
+        namespace="chunk-plan",
+        model=context.config.chunking.model,
+        fingerprint=openai_prompt_cache_fingerprint(prompt_sha),
+    )
     for attempt in range(1, context.config.chunking.max_retries + 1):
         constraints_payload = _constraints_payload(
             context,
@@ -548,6 +556,8 @@ def _plan_window_with_retries(
                 planner_payload=planner_payload,
                 constraints_payload=constraints_payload,
                 raw_output_path=raw_output_path,
+                prompt_cache_key=prompt_cache_key,
+                prompt_cache_retention=prompt_cache_retention,
             )
         except ProviderError as error:
             emit_provider_event(
@@ -836,10 +846,18 @@ def _build_chunk_plan_retry_advice(
         "planner_input": planner_payload,
     }
     try:
+        prompt_cache_key, prompt_cache_retention = _openai_prompt_cache_settings(
+            context,
+            namespace="chunk-plan-retry-advisor",
+            model=context.config.chunking.retry_advisor_model,
+            fingerprint=openai_prompt_cache_fingerprint(_sha256_text(system_prompt)),
+        )
         advisor_payload = advisor_client.analyze_plan_errors(
             system_prompt=system_prompt,
             repair_payload=repair_payload,
             raw_output_path=raw_output_path,
+            prompt_cache_key=prompt_cache_key,
+            prompt_cache_retention=prompt_cache_retention,
         )
     except ProviderError as error:
         _log_chunk_plan_retry_advisor_failure(context, window=window, raw_output_path=raw_output_path, error=error)
@@ -911,6 +929,7 @@ def _window_request_metadata(
     return {
         "schema_version": _PLAN_SCHEMA_VERSION,
         "video_id": context.job.video_id,
+        "visual_enabled": context.config.pipeline.visual_enabled,
         "provider": context.config.chunking.provider,
         "model": context.config.chunking.model,
         "retry_advisor_model": context.config.chunking.retry_advisor_model,
@@ -1145,6 +1164,7 @@ def _plan_validation_errors(
     expected_metadata = _plan_metadata(context)
     actual_metadata = {
         "video_id": plan.video_id,
+        "visual_enabled": plan.visual_enabled,
         "provider": plan.provider,
         "model": plan.model,
         "retry_advisor_model": plan.retry_advisor_model,
@@ -1314,7 +1334,14 @@ def _materialize_chunks(
                 modality=modality,
                 speaker_roles=speaker_roles,
                 timeline_event_ids=[event.event_id for event in chunk_events],
-                source_refs=_chunk_source_refs(context.job.video_id, start, end, chunk_events, title=video_info.title),
+                source_refs=_chunk_source_refs(
+                    context.job.video_id,
+                    start,
+                    end,
+                    chunk_events,
+                    title=video_info.title,
+                    include_visual_refs=context.config.pipeline.visual_enabled,
+                ),
             )
         )
     return chunks
@@ -1437,16 +1464,47 @@ def _qa_safe_window_end(
     return min(end_index + 1, len(segments))
 
 
-def _planner_payload(window: _PlannerWindow, timeline_events: list[TimelineEvent]) -> dict[str, Any]:
+def _planner_payload(window: _PlannerWindow, timeline_events: list[TimelineEvent], context: StageContext) -> dict[str, Any]:
     return {
         "window_index": window.window_index,
-        "context_before": [_segment_payload(segment, timeline_events, planning_allowed=False) for segment in window.context_before],
-        "segments": [_segment_payload(segment, timeline_events, planning_allowed=True) for segment in window.core_segments],
-        "context_after": [_segment_payload(segment, timeline_events, planning_allowed=False) for segment in window.context_after],
+        "visual_enabled": context.config.pipeline.visual_enabled,
+        "context_before": [
+            _segment_payload(
+                segment,
+                timeline_events,
+                planning_allowed=False,
+                visual_enabled=context.config.pipeline.visual_enabled,
+            )
+            for segment in window.context_before
+        ],
+        "segments": [
+            _segment_payload(
+                segment,
+                timeline_events,
+                planning_allowed=True,
+                visual_enabled=context.config.pipeline.visual_enabled,
+            )
+            for segment in window.core_segments
+        ],
+        "context_after": [
+            _segment_payload(
+                segment,
+                timeline_events,
+                planning_allowed=False,
+                visual_enabled=context.config.pipeline.visual_enabled,
+            )
+            for segment in window.context_after
+        ],
     }
 
 
-def _segment_payload(segment: SpeechSegment, timeline_events: list[TimelineEvent], *, planning_allowed: bool) -> dict[str, Any]:
+def _segment_payload(
+    segment: SpeechSegment,
+    timeline_events: list[TimelineEvent],
+    *,
+    planning_allowed: bool,
+    visual_enabled: bool,
+) -> dict[str, Any]:
     overlapping_events = _overlapping_timeline_events(segment.start, segment.end, timeline_events)
     return {
         "segment_id": segment.segment_id,
@@ -1469,7 +1527,7 @@ def _segment_payload(segment: SpeechSegment, timeline_events: list[TimelineEvent
                 "presenter_relevance": event.presenter_context.relevance,
             }
             for event in overlapping_events
-        ],
+        ] if visual_enabled else [],
     }
 
 
@@ -1484,6 +1542,7 @@ def _constraints_payload(
     payload = {
         "schema_version": _PLAN_SCHEMA_VERSION,
         "video_id": context.job.video_id,
+        "visual_enabled": context.config.pipeline.visual_enabled,
         "mode": context.config.chunking.mode,
         "provider": context.config.chunking.provider,
         "model": context.config.chunking.model,
@@ -1523,6 +1582,7 @@ def _plan_metadata(context: StageContext) -> dict[str, Any]:
     retry_advisor_prompt_text = _retry_advisor_prompt_path(context).read_text(encoding="utf-8")
     return {
         "video_id": context.job.video_id,
+        "visual_enabled": context.config.pipeline.visual_enabled,
         "provider": context.config.chunking.provider,
         "model": context.config.chunking.model,
         "retry_advisor_model": context.config.chunking.retry_advisor_model,
@@ -1796,18 +1856,20 @@ def _chunk_source_refs(
     events: list[TimelineEvent],
     *,
     title: str | None,
+    include_visual_refs: bool,
 ) -> list[SourceRef]:
     refs = [youtube_source_ref(video_id, start, end, title=title, modality="audio")]
-    refs.extend(
-        SourceRef(
-            type="visual",
-            url=event.timestamp_url,
-            start=event.start,
-            end=event.end,
-            modality="visual",
+    if include_visual_refs:
+        refs.extend(
+            SourceRef(
+                type="visual",
+                url=event.timestamp_url,
+                start=event.start,
+                end=event.end,
+                modality="visual",
+            )
+            for event in events
         )
-        for event in events
-    )
     seen: set[str] = set()
     unique: list[SourceRef] = []
     for ref in refs:
@@ -2345,6 +2407,22 @@ def _clip_string(value: str, max_chars: int) -> str:
 def _fingerprint(value: object) -> str:
     payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return _sha256_text(payload)
+
+
+def _openai_prompt_cache_settings(
+    context: StageContext,
+    *,
+    namespace: str,
+    model: str,
+    fingerprint: str,
+) -> tuple[str | None, str | None]:
+    cache_config = context.config.openai.prompt_cache
+    if not cache_config.enabled:
+        return None, None
+    return (
+        openai_prompt_cache_key(namespace=namespace, model=model, fingerprint=fingerprint),
+        cache_config.retention,
+    )
 
 
 def _sha256_text(value: str) -> str:

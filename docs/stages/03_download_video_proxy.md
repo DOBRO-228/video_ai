@@ -6,6 +6,8 @@ Download the visual proxy video used for scene detection and keyframe extraction
 
 ## How It Works
 
+When `pipeline.visual_enabled=false` (the default audio-only mode), the pipeline skips this stage by config. No proxy video or video ffprobe artifact is required for downstream audio-only stages.
+
 The stage calls the `yt-dlp` video proxy wrapper using configured height and format. By default this is a 720p MP4 proxy. MP4/H.264 is preferred for decoder compatibility, with fallback to any MP4 proxy when H.264 is unavailable. It then runs `ffprobe` and stores the result for duration and FPS consumers.
 
 When configured, `download.remote_components` is passed to yt-dlp as `--remote-components` and logged in subprocess diagnostics.
@@ -29,6 +31,7 @@ The stage can be skipped when the video and ffprobe JSON exist and the probed du
 ## Important Notes
 
 - Downstream visual stages depend on this proxy, not on the original full-quality video.
+- Audio-only jobs must not download a video proxy.
 - Cleanup may remove proxy video and probe output after successful quality reporting when `project.keep_media=false`.
 - Avoid changing proxy quality defaults without considering vision provider cost and PySceneDetect runtime.
 

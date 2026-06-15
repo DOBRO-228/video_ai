@@ -19,7 +19,7 @@ from style_kb.error_advice import advice_for_error_code
 from style_kb.errors import JobLockError, StageExecutionError, StyleKbError
 from style_kb.models import Job, JobState, StageState, StageStatus
 from style_kb.pipeline.base import Stage, StageContext
-from style_kb.pipeline.catalog import STAGES
+from style_kb.pipeline.catalog import STAGES, stage_disabled_by_config
 from style_kb.pipeline.paths import JobPaths
 from style_kb.state.db import initialize_database
 from style_kb.state.repository import StateRepository
@@ -47,13 +47,19 @@ class PipelineRunner:
         self.run_id: str | None = None
         self._stage_run_start_logs: set[tuple[str, str]] = set()
 
-    def ingest(self, url: str, stop_after_stage: int | None = None) -> Job:
+    def ingest(self, url: str, stop_after_stage: int | None = None, *, openai_batch: bool = False) -> Job:
         self._start_run()
         _validate_stop_after_stage(stop_after_stage)
         video_id = extract_video_id(url)
-        return self._run_for_job(video_id=video_id, url=url, requested_job_id=video_id, stop_after_stage=stop_after_stage)
+        return self._run_for_job(
+            video_id=video_id,
+            url=url,
+            requested_job_id=video_id,
+            stop_after_stage=stop_after_stage,
+            openai_batch=openai_batch,
+        )
 
-    def resume(self, job_id: str, stop_after_stage: int | None = None) -> Job:
+    def resume(self, job_id: str, stop_after_stage: int | None = None, *, openai_batch: bool = False) -> Job:
         self._start_run()
         _validate_stop_after_stage(stop_after_stage)
         job = self.repository.get_job(job_id)
@@ -75,7 +81,12 @@ class PipelineRunner:
             )
             self._write_partial_quality_report_safely(paths=paths, job=job, failed_stage="pipeline_setup")
             raise
-        return self._run_existing_job(job, job_event=PipelineEvent.JOB_RESUMED, stop_after_stage=stop_after_stage)
+        return self._run_existing_job(
+            job,
+            job_event=PipelineEvent.JOB_RESUMED,
+            stop_after_stage=stop_after_stage,
+            openai_batch=openai_batch,
+        )
 
     def status(self, job_id: str) -> tuple[Job, list[StageStatus]]:
         job = self.repository.get_job(job_id)
@@ -83,7 +94,15 @@ class PipelineRunner:
             raise StyleKbError(f"job not found: {job_id}")
         return job, self.repository.list_stages(job_id)
 
-    def _run_for_job(self, *, video_id: str, url: str, requested_job_id: str, stop_after_stage: int | None) -> Job:
+    def _run_for_job(
+        self,
+        *,
+        video_id: str,
+        url: str,
+        requested_job_id: str,
+        stop_after_stage: int | None,
+        openai_batch: bool,
+    ) -> Job:
         paths = JobPaths(self.output_root, requested_job_id)
         paths.ensure_directories()
         existing_job = self.repository.get_job(requested_job_id)
@@ -137,6 +156,7 @@ class PipelineRunner:
             job_event=PipelineEvent.JOB_STARTED,
             job_created=existing_job is None,
             stop_after_stage=stop_after_stage,
+            openai_batch=openai_batch,
         )
 
     def _run_existing_job(
@@ -146,6 +166,7 @@ class PipelineRunner:
         job_event: PipelineEvent,
         job_created: bool = False,
         stop_after_stage: int | None = None,
+        openai_batch: bool = False,
     ) -> Job:
         _validate_stop_after_stage(stop_after_stage)
         paths = JobPaths(self.output_root, job.job_id)
@@ -159,6 +180,8 @@ class PipelineRunner:
             stop_stage = _stage_by_ordinal(stop_after_stage)
             run_request_data["stop_after_stage"] = stop_after_stage
             run_request_data["stop_after_stage_name"] = stop_stage.name if stop_stage is not None else None
+        if openai_batch:
+            run_request_data["openai_batch"] = True
         pipeline_logger.emit(
             job_event,
             job_id=job.job_id,
@@ -212,9 +235,25 @@ class PipelineRunner:
                     ),
                     pipeline_logger=pipeline_logger,
                     run_id=self._current_run_id(),
+                    openai_batch_enabled=openai_batch,
                 )
                 stage_row = self.repository.get_stage(job.job_id, stage.name)
                 self._write_stage_run_start(paths=paths, stage_name=stage.name)
+                if stage_disabled_by_config(stage.name, self.config):
+                    disabled_stage = self._skip_stage_disabled_by_config(
+                        pipeline_logger,
+                        job=job,
+                        paths=paths,
+                        stage=stage,
+                    )
+                    if _should_stop_after_stage(stage.ordinal, stop_after_stage):
+                        return self._stop_job_after_stage(
+                            job=job,
+                            paths=paths,
+                            pipeline_logger=pipeline_logger,
+                            stage_status=disabled_stage,
+                        )
+                    continue
                 self._emit_stage_reuse_decision(pipeline_logger, job=job, paths=paths, stage=stage, context=context)
                 should_skip = stage.validate_outputs(context) and stage.outputs_are_current(context)
                 if should_skip:
@@ -595,6 +634,28 @@ class PipelineRunner:
         for stage_class in STAGES:
             stage = stage_class()
             self._write_stage_run_start(paths=paths, stage_name=stage.name)
+            if stage_disabled_by_config(stage.name, self.config):
+                self._emit_stage_reuse_decision_data(
+                    pipeline_logger,
+                    job=job,
+                    paths=paths,
+                    stage=stage,
+                    data=_disabled_stage_reuse_decision_data(stage),
+                )
+                stage_row = self.repository.get_stage(job.job_id, stage.name)
+                if stage_row is not None:
+                    self._write_stage_reuse_log(
+                        paths=paths,
+                        stage_status=stage_row.model_copy(
+                            update={
+                                "status": StageState.SKIPPED,
+                                "input_files": [],
+                                "output_files": [],
+                                "metrics": _disabled_stage_metrics(),
+                            }
+                        ),
+                    )
+                continue
             data = self._stage_reuse_decision_data(stage, context)
             if _stage_outputs_may_be_cleaned(stage.name, self.config) and not data["can_skip"]:
                 data = {
@@ -953,6 +1014,8 @@ class PipelineRunner:
         )
         for stage_class in STAGES:
             stage = stage_class()
+            if stage_disabled_by_config(stage.name, self.config):
+                continue
             if _stage_outputs_may_be_cleaned(stage.name, self.config):
                 continue
             try:
@@ -1057,6 +1120,46 @@ class PipelineRunner:
             f"[{stage_status.ordinal:02d} {stage_status.stage_name}] {stage_status.status}"
         )
 
+    def _skip_stage_disabled_by_config(
+        self,
+        pipeline_logger: PipelineLogger,
+        *,
+        job: Job,
+        paths: JobPaths,
+        stage: Stage,
+    ) -> StageStatus:
+        data = _disabled_stage_reuse_decision_data(stage)
+        self._emit_stage_reuse_decision_data(
+            pipeline_logger,
+            job=job,
+            paths=paths,
+            stage=stage,
+            data=data,
+        )
+        skipped_stage = self.repository.mark_stage_skipped(
+            job_id=job.job_id,
+            stage_name=stage.name,
+            input_files=[],
+            output_files=[],
+            remote_refs={},
+            metrics=_disabled_stage_metrics(),
+        )
+        self._write_stage_reuse_log(paths=paths, stage_status=skipped_stage)
+        pipeline_logger.emit(
+            PipelineEvent.STAGE_SKIPPED,
+            job_id=job.job_id,
+            video_id=job.video_id,
+            stage=stage.name,
+            ordinal=stage.ordinal,
+            attempt=skipped_stage.attempt,
+            status=StageState.SKIPPED,
+            message="stage disabled by config",
+            details_path=paths.stage_log(stage.name),
+            data=self._stage_event_data(skipped_stage),
+        )
+        self._emit_stage_progress(skipped_stage, pipeline_logger=pipeline_logger, job=job)
+        return skipped_stage
+
 
 def _stage_input_file_strings(stage, context: StageContext, *, fallback: list[str]) -> list[str]:
     try:
@@ -1070,6 +1173,26 @@ def _stage_output_file_strings(stage, context: StageContext, *, fallback: list[s
         return [str(path) for path in stage.output_files(context)]
     except Exception:
         return fallback
+
+
+def _disabled_stage_metrics() -> dict[str, object]:
+    return {
+        "disabled_by_config": True,
+        "pipeline_visual_enabled": False,
+    }
+
+
+def _disabled_stage_reuse_decision_data(stage: Stage) -> dict[str, object]:
+    return {
+        "stage_name": stage.name,
+        "valid_outputs": True,
+        "outputs_current": True,
+        "can_skip": True,
+        "reasons": ["stage disabled because pipeline.visual_enabled=false"],
+        "missing_input_files": [],
+        "missing_output_files": [],
+        "stale_output_files": [],
+    }
 
 
 def _is_pid_alive(pid: int) -> bool:

@@ -27,6 +27,10 @@ class ProviderCallDiagnostics:
     raw_output_path: str | None = None
     request_id: str | None = None
     response_id: str | None = None
+    transport: str | None = None
+    batch_id: str | None = None
+    batch_custom_id: str | None = None
+    status_code: int | None = None
     started_at: str | None = None
     finished_at: str | None = None
     duration_seconds: float | None = None
@@ -40,6 +44,10 @@ class ProviderCallDiagnostics:
             "raw_output_path": self.raw_output_path,
             "request_id": self.request_id,
             "response_id": self.response_id,
+            "transport": self.transport,
+            "batch_id": self.batch_id,
+            "batch_custom_id": self.batch_custom_id,
+            "status_code": self.status_code,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "duration_seconds": self.duration_seconds,
@@ -74,6 +82,10 @@ class ProviderCallDiagnostics:
             raw_output_path=_string_or_none(value.get("raw_output_path")) or _path_string(raw_output_path),
             request_id=_string_or_none(value.get("request_id")),
             response_id=_string_or_none(value.get("response_id")),
+            transport=_string_or_none(value.get("transport")),
+            batch_id=_string_or_none(value.get("batch_id")),
+            batch_custom_id=_string_or_none(value.get("batch_custom_id")),
+            status_code=_int_or_none(value.get("status_code")),
             started_at=_string_or_none(value.get("started_at")),
             finished_at=_string_or_none(value.get("finished_at")),
             duration_seconds=_float_or_none(value.get("duration_seconds")),
@@ -103,6 +115,7 @@ def openai_response_diagnostics(
         raw_output_path=str(raw_output_path),
         request_id=_string_or_none(getattr(response, "_request_id", None)),
         response_id=_string_or_none(raw_payload.get("id") or getattr(response, "id", None)),
+        transport="sync",
         started_at=timer.started_at,
         finished_at=finished_at,
         duration_seconds=round(duration_seconds, 6),
@@ -249,3 +262,12 @@ def _float_or_none(value: object) -> float | None:
         return float(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _int_or_none(value: object) -> int | None:
+    try:
+        if value is not None:
+            return int(value)
+    except (TypeError, ValueError):
+        return None
+    return None

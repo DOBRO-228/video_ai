@@ -20,6 +20,7 @@ def run_environment_snapshot(*, config: AppConfig, config_path: Path) -> dict[st
         "config": {
             "path": str(config_path),
             "sha256": _file_sha256(config_path),
+            "visual_enabled": config.pipeline.visual_enabled,
             "keep_media": config.project.keep_media,
             "keep_frames": config.project.keep_frames,
         },

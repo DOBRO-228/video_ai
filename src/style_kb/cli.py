@@ -22,13 +22,20 @@ StopAfterStageArg = Annotated[
         help="Optional stage number to stop immediately after. Example: 9 stops before visual description.",
     ),
 ]
+BatchOption = Annotated[
+    bool,
+    typer.Option(
+        "--batch",
+        help="Use OpenAI Batch API for eligible stage 13 claim extraction requests.",
+    ),
+]
 
 
 @app.command()
-def ingest(url: str, stop_after_stage: StopAfterStageArg = None) -> None:
+def ingest(url: str, stop_after_stage: StopAfterStageArg = None, batch: BatchOption = False) -> None:
     """Ingest exactly one YouTube video URL."""
     runner = PipelineRunner(Path.cwd(), progress_callback=typer.echo)
-    _run_command(lambda: runner.ingest(url, stop_after_stage=stop_after_stage), action="ingest")
+    _run_command(lambda: runner.ingest(url, stop_after_stage=stop_after_stage, openai_batch=batch), action="ingest")
 
 
 @app.command()
@@ -64,10 +71,10 @@ def status(job_id: str) -> None:
 
 
 @app.command()
-def resume(job_id: str, stop_after_stage: StopAfterStageArg = None) -> None:
+def resume(job_id: str, stop_after_stage: StopAfterStageArg = None, batch: BatchOption = False) -> None:
     """Resume an existing job."""
     runner = PipelineRunner(Path.cwd(), progress_callback=typer.echo)
-    _run_command(lambda: runner.resume(job_id, stop_after_stage=stop_after_stage), action="resume")
+    _run_command(lambda: runner.resume(job_id, stop_after_stage=stop_after_stage, openai_batch=batch), action="resume")
 
 
 def _run_command(func, *, action: str) -> None:

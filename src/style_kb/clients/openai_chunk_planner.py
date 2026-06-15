@@ -100,6 +100,8 @@ class OpenAIChunkPlannerClient:
         planner_payload: dict[str, Any],
         constraints_payload: dict[str, Any],
         raw_output_path: Path,
+        prompt_cache_key: str | None = None,
+        prompt_cache_retention: str | None = None,
     ) -> ChunkPlanAnalysisResult:
         request_text = "\n\n".join(
             [
@@ -110,21 +112,26 @@ class OpenAIChunkPlannerClient:
                 json.dumps(planner_payload, ensure_ascii=False, indent=2, sort_keys=True),
             ]
         )
+        body: dict[str, Any] = {
+            "model": self.model,
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": request_text}]}],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "menswear_chunk_plan",
+                    "strict": True,
+                    "schema": CHUNK_PLAN_RESPONSE_SCHEMA,
+                }
+            },
+        }
+        if prompt_cache_key:
+            body["prompt_cache_key"] = prompt_cache_key
+        if prompt_cache_retention:
+            body["prompt_cache_retention"] = prompt_cache_retention
         timer = start_operation()
         try:
             response = call_with_retry(
-                lambda: self.client.responses.create(
-                    model=self.model,
-                    input=[{"role": "user", "content": [{"type": "input_text", "text": request_text}]}],
-                    text={
-                        "format": {
-                            "type": "json_schema",
-                            "name": "menswear_chunk_plan",
-                            "strict": True,
-                            "schema": CHUNK_PLAN_RESPONSE_SCHEMA,
-                        }
-                    },
-                ),
+                lambda: self.client.responses.create(**body),
                 policy=self.retry_policy,
                 on_retry=self.on_retry,
             )
@@ -156,6 +163,8 @@ class OpenAIChunkPlannerClient:
         system_prompt: str,
         repair_payload: dict[str, Any],
         raw_output_path: Path,
+        prompt_cache_key: str | None = None,
+        prompt_cache_retention: str | None = None,
     ) -> dict[str, Any]:
         request_text = "\n\n".join(
             [
@@ -164,21 +173,26 @@ class OpenAIChunkPlannerClient:
                 json.dumps(repair_payload, ensure_ascii=False, indent=2, sort_keys=True),
             ]
         )
+        body: dict[str, Any] = {
+            "model": self.model,
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": request_text}]}],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "menswear_chunk_plan_retry_advice",
+                    "strict": True,
+                    "schema": CHUNK_PLAN_RETRY_ADVISOR_RESPONSE_SCHEMA,
+                }
+            },
+        }
+        if prompt_cache_key:
+            body["prompt_cache_key"] = prompt_cache_key
+        if prompt_cache_retention:
+            body["prompt_cache_retention"] = prompt_cache_retention
         timer = start_operation()
         try:
             response = call_with_retry(
-                lambda: self.client.responses.create(
-                    model=self.model,
-                    input=[{"role": "user", "content": [{"type": "input_text", "text": request_text}]}],
-                    text={
-                        "format": {
-                            "type": "json_schema",
-                            "name": "menswear_chunk_plan_retry_advice",
-                            "strict": True,
-                            "schema": CHUNK_PLAN_RETRY_ADVISOR_RESPONSE_SCHEMA,
-                        }
-                    },
-                ),
+                lambda: self.client.responses.create(**body),
                 policy=self.retry_policy,
                 on_retry=self.on_retry,
             )

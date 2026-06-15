@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+_REASONING_EFFORT_VALUES = {None, "none", "minimal", "low", "medium", "high", "xhigh"}
+
 
 class ProjectConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -21,6 +23,46 @@ class DownloadConfig(BaseModel):
     audio_quality: str
     cookies_from_browser: str | None = None
     remote_components: str | None = None
+
+
+class PipelineConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    visual_enabled: bool = False
+
+
+class OpenAIPromptCacheConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    retention: str | None = None
+
+    @model_validator(mode="after")
+    def validate_retention(self):
+        if self.retention not in {None, "in_memory", "24h"}:
+            raise ValueError("openai.prompt_cache.retention must be null, 'in_memory', or '24h'")
+        return self
+
+
+class OpenAIBatchConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    completion_window: str = "24h"
+    poll_interval_seconds: float = Field(default=15, gt=0)
+    poll_timeout_seconds: float | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def validate_completion_window(self):
+        if self.completion_window != "24h":
+            raise ValueError("openai.batch.completion_window must be '24h'")
+        return self
+
+
+class OpenAIConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    prompt_cache: OpenAIPromptCacheConfig = Field(default_factory=OpenAIPromptCacheConfig)
+    batch: OpenAIBatchConfig = Field(default_factory=OpenAIBatchConfig)
 
 
 class SttContextConfig(BaseModel):
@@ -84,8 +126,8 @@ class SceneDetectionConfig(BaseModel):
     extra_sample_every_seconds: int = Field(default=4, gt=0)
     max_frames_per_scene: int = Field(default=8, gt=0)
     intra_scene_dedup: bool = True
-    phash_max_distance: int = Field(default=8, ge=0)
-    ssim_confirm: float | None = Field(default=0.85, ge=0, le=1)
+    phash_max_distance: int = Field(default=10, ge=0)
+    ssim_confirm: float | None = Field(default=0.82, ge=0, le=1)
     min_frames_per_scene: int = Field(default=1, gt=0)
     fallback_scene_seconds: int = Field(gt=0)
     frame_quality: FrameQualityConfig = Field(default_factory=FrameQualityConfig)
@@ -125,6 +167,12 @@ class VisionConfig(BaseModel):
     def validate_thinking_config(self):
         if self.thinking_level is not None and self.thinking_budget is not None:
             raise ValueError("vision.thinking_level and vision.thinking_budget are mutually exclusive")
+        provider = self.provider.casefold()
+        model = self.model.casefold()
+        if provider == "gemini" and model.startswith("gemini-2.5") and self.thinking_level is not None:
+            raise ValueError("Gemini 2.5 models use vision.thinking_budget, not vision.thinking_level")
+        if provider == "gemini" and model.startswith("gemini-3") and self.thinking_budget is not None:
+            raise ValueError("Gemini 3 models use vision.thinking_level, not vision.thinking_budget")
         return self
 
 
@@ -133,13 +181,27 @@ class SpeechSegmentationConfig(BaseModel):
 
     provider: str
     model: str
+    reasoning_effort: str | None = None
     retry_advisor_model: str
+    retry_advisor_reasoning_effort: str | None = None
     retry_advisor_prompt_file: str
     prompt_file: str
     max_segment_seconds: float = Field(gt=0)
     min_segment_seconds: float = Field(gt=0)
     pause_break_ms: int = Field(gt=0)
     max_segment_words: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def validate_reasoning_effort(self):
+        if self.reasoning_effort not in _REASONING_EFFORT_VALUES:
+            raise ValueError(
+                "speech_segmentation.reasoning_effort must be null, 'none', 'minimal', 'low', 'medium', 'high', or 'xhigh'"
+            )
+        if self.retry_advisor_reasoning_effort not in _REASONING_EFFORT_VALUES:
+            raise ValueError(
+                "speech_segmentation.retry_advisor_reasoning_effort must be null, 'none', 'minimal', 'low', 'medium', 'high', or 'xhigh'"
+            )
+        return self
 
 
 class ChunkingConfig(BaseModel):
@@ -200,6 +262,8 @@ class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     project: ProjectConfig
+    pipeline: PipelineConfig
+    openai: OpenAIConfig
     download: DownloadConfig
     stt: SttConfig
     scene_detection: SceneDetectionConfig

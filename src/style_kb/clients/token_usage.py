@@ -5,9 +5,11 @@ from typing import Any
 
 def openai_responses_usage(raw_payload: dict[str, Any]) -> dict[str, int]:
     usage = _mapping(raw_payload.get("usage"))
+    input_details = _mapping(usage.get("input_tokens_details"))
     output_details = _mapping(usage.get("output_tokens_details"))
     return {
         "input_tokens": _int_or_zero(usage.get("input_tokens")),
+        "cached_input_tokens": _int_or_zero(input_details.get("cached_tokens")),
         "output_tokens": _int_or_zero(usage.get("output_tokens")),
         "reasoning_tokens": _int_or_zero(output_details.get("reasoning_tokens")),
         "total_tokens": _int_or_zero(usage.get("total_tokens")),
@@ -16,8 +18,14 @@ def openai_responses_usage(raw_payload: dict[str, Any]) -> dict[str, int]:
 
 def gemini_usage(raw_payload: dict[str, Any], *, model: str | None = None) -> dict[str, int]:
     model_name = _model_name(model or raw_payload.get("model_version") or raw_payload.get("modelVersion"))
-    if model_name == "gemini-2.5-flash":
+    if model_name.startswith("gemini-3-flash"):
+        return _gemini_3_flash_usage(raw_payload)
+    if model_name.startswith("gemini-2.5-flash"):
         return _gemini_2_5_flash_usage(raw_payload)
+    return _generic_gemini_usage(raw_payload)
+
+
+def _gemini_3_flash_usage(raw_payload: dict[str, Any]) -> dict[str, int]:
     return _generic_gemini_usage(raw_payload)
 
 

@@ -11,13 +11,23 @@ from typing import Any
 from pydantic import ValidationError as PydanticValidationError
 
 from style_kb.clients._retry import OnRetry
+from style_kb.clients.openai_batch import OpenAIBatchClient, OpenAIBatchRequest
+from style_kb.clients.openai_cache import openai_prompt_cache_fingerprint, openai_prompt_cache_key
 from style_kb.clients.provider_diagnostics import ProviderCallDiagnostics, ProviderName
-from style_kb.clients.openai_claims import ClaimsAnalysisResult, OpenAIClaimsClient, load_cached_claims_result
+from style_kb.clients.openai_claims import (
+    ClaimsAnalysisResult,
+    OpenAIClaimsClient,
+    build_claims_cached_payload,
+    build_claims_request_body,
+    claims_result_from_cached_payload,
+    load_cached_claims_result,
+)
 from style_kb.clients.openai_claims_curate import (
     ClaimsCurateResult,
     OpenAIClaimsCurateClient,
     load_cached_claims_curate_result,
 )
+from style_kb.clients.token_usage import openai_responses_usage
 from style_kb.diagnostics import PipelineEvent
 from style_kb.errors import ProviderError, StageExecutionError
 from style_kb.models import (
@@ -154,11 +164,27 @@ class _ChunkClaimsResult:
     claims: list[StyleClaim]
     raw_files: list[Path]
     input_tokens: int
+    cached_input_tokens: int
     output_tokens: int
     reasoning_tokens: int
     total_tokens: int
     cache_hit: bool
     diagnostics: ProviderCallDiagnostics | None = None
+
+
+@dataclass(slots=True)
+class _PreparedClaimsChunk:
+    chunk: Chunk
+    chunk_payload: dict[str, Any]
+    request_metadata: dict[str, Any]
+    raw_path: Path
+
+
+@dataclass(slots=True)
+class _PromptCacheSettings:
+    metadata: dict[str, Any]
+    key: str | None
+    retention: str | None
 
 
 @dataclass(slots=True)
@@ -175,6 +201,7 @@ class _CuratedClaimsResult:
     claims: list[StyleClaim]
     raw_files: list[Path]
     input_tokens: int
+    cached_input_tokens: int
     output_tokens: int
     reasoning_tokens: int
     total_tokens: int
@@ -266,10 +293,14 @@ class Stage13ExtractStyleClaims(Stage):
         legacy_raw_cache_removed_count = _remove_legacy_raw_caches(context, chunks)
         cached_chunks = 0
         api_chunks = 0
+        batch_chunks = 0
+        sync_chunks = 0
         input_tokens = 0
+        cached_input_tokens = 0
         output_tokens = 0
         reasoning_tokens = 0
         total_tokens = 0
+        pending_chunks: list[_PreparedClaimsChunk] = []
 
         for chunk in chunks:
             missing_event_ids = [event_id for event_id in chunk.timeline_event_ids if event_id not in event_map]
@@ -289,7 +320,40 @@ class Stage13ExtractStyleClaims(Stage):
                 retry_advisor_prompt_sha,
             )
             raw_path = context.paths.style_claims_raw_chunk(chunk.chunk_id)
+            canonical_raw_files.append(raw_path)
             chunk_result = _load_cached_chunk_result(raw_path, request_metadata, chunk, context)
+            if chunk_result is None:
+                pending_chunks.append(
+                    _PreparedClaimsChunk(
+                        chunk=chunk,
+                        chunk_payload=chunk_payload,
+                        request_metadata=request_metadata,
+                        raw_path=raw_path,
+                    )
+                )
+                continue
+
+            cached_chunks += 1
+            raw_output_files.extend(chunk_result.raw_files)
+            all_candidates.extend(chunk_result.claims)
+            input_tokens += chunk_result.input_tokens
+            cached_input_tokens += chunk_result.cached_input_tokens
+            output_tokens += chunk_result.output_tokens
+            reasoning_tokens += chunk_result.reasoning_tokens
+            total_tokens += chunk_result.total_tokens
+
+        batch_results, batch_raw_files = _extract_batch_claims_if_enabled(
+            context=context,
+            pending_chunks=pending_chunks,
+            system_prompt=prompt_text,
+            prompt_sha=prompt_sha,
+            retry_advisor_prompt_sha=retry_advisor_prompt_sha,
+            claim_errors=claim_errors,
+        )
+        raw_output_files.extend(batch_raw_files)
+
+        for prepared in pending_chunks:
+            chunk_result = batch_results.get(prepared.chunk.chunk_id)
             if chunk_result is None:
                 if client is None:
                     client = OpenAIClaimsClient(
@@ -307,22 +371,22 @@ class Stage13ExtractStyleClaims(Stage):
                     context=context,
                     client=client,
                     advisor_client=advisor_client,
-                    chunk=chunk,
-                    chunk_payload=chunk_payload,
-                    request_metadata=request_metadata,
+                    chunk=prepared.chunk,
+                    chunk_payload=prepared.chunk_payload,
+                    request_metadata=prepared.request_metadata,
                     system_prompt=prompt_text,
                     retry_advisor_prompt_text=retry_advisor_prompt_text,
-                    canonical_raw_path=raw_path,
+                    canonical_raw_path=prepared.raw_path,
                     claim_errors=claim_errors,
                 )
-                api_chunks += 1
+                sync_chunks += 1
             else:
-                cached_chunks += 1
-
+                batch_chunks += 1
+            api_chunks += 1
             raw_output_files.extend(chunk_result.raw_files)
-            canonical_raw_files.append(raw_path)
             all_candidates.extend(chunk_result.claims)
             input_tokens += chunk_result.input_tokens
+            cached_input_tokens += chunk_result.cached_input_tokens
             output_tokens += chunk_result.output_tokens
             reasoning_tokens += chunk_result.reasoning_tokens
             total_tokens += chunk_result.total_tokens
@@ -334,6 +398,7 @@ class Stage13ExtractStyleClaims(Stage):
         style_claims = curate_result.claims
         raw_output_files.extend(curate_result.raw_files)
         input_tokens += curate_result.input_tokens
+        cached_input_tokens += curate_result.cached_input_tokens
         output_tokens += curate_result.output_tokens
         reasoning_tokens += curate_result.reasoning_tokens
         total_tokens += curate_result.total_tokens
@@ -363,6 +428,8 @@ class Stage13ExtractStyleClaims(Stage):
                 "claims_after_exact_dedupe": len(style_claims_after_exact_dedupe),
                 "cached_chunks_count": cached_chunks,
                 "api_chunks_count": api_chunks,
+                "batch_chunks_count": batch_chunks,
+                "sync_chunks_count": sync_chunks,
                 "legacy_raw_cache_removed_count": legacy_raw_cache_removed_count,
                 "claim_retry_errors_count": len(claim_errors),
                 "deterministic_cleanup_changed_claims_count": cleanup_result.changed_claims_count,
@@ -371,11 +438,296 @@ class Stage13ExtractStyleClaims(Stage):
                 "curate_split_candidates_count": curate_result.metrics.get("curate_split_candidates_count", 0),
                 "curate_rewrite_suggestions_count": curate_result.metrics.get("curate_rewrite_suggestions_count", 0),
                 "input_tokens_total": input_tokens,
+                "cached_input_tokens_total": cached_input_tokens,
                 "output_tokens_total": output_tokens,
                 "reasoning_tokens_total": reasoning_tokens,
                 "total_tokens_total": total_tokens,
             },
         )
+
+
+def _extract_batch_claims_if_enabled(
+    *,
+    context: StageContext,
+    pending_chunks: list[_PreparedClaimsChunk],
+    system_prompt: str,
+    prompt_sha: str,
+    retry_advisor_prompt_sha: str,
+    claim_errors: list[dict[str, Any]],
+) -> tuple[dict[str, _ChunkClaimsResult], list[Path]]:
+    if not pending_chunks:
+        return {}, []
+    if context.config.style_claims.provider.casefold() != ProviderName.OPENAI.value:
+        return {}, []
+    if not context.openai_batch_enabled:
+        return {}, []
+
+    prompt_cache = _claims_extract_prompt_cache(context, prompt_sha)
+    request_metadata = {
+        "schema_version": _SCHEMA_VERSION,
+        "stage": Stage13ExtractStyleClaims.name,
+        "operation": ProviderOperation.CLAIMS_EXTRACT.value,
+        "video_id": context.job.video_id,
+        "provider": context.config.style_claims.provider,
+        "model": context.config.style_claims.model,
+        "prompt_file": context.config.style_claims.prompt_file,
+        "prompt_sha256": prompt_sha,
+        "retry_advisor_model": context.config.style_claims.retry_advisor_model,
+        "retry_advisor_prompt_sha256": retry_advisor_prompt_sha,
+        "max_claims_per_chunk": context.config.style_claims.max_claims_per_chunk,
+        "chunks_count": len(pending_chunks),
+        "chunk_ids": [prepared.chunk.chunk_id for prepared in pending_chunks],
+        "prompt_cache": prompt_cache.metadata,
+    }
+    batch_requests = [
+        OpenAIBatchRequest(
+            custom_id=prepared.chunk.chunk_id,
+            body=build_claims_request_body(
+                model=context.config.style_claims.model,
+                system_prompt=system_prompt,
+                chunk_payload=prepared.chunk_payload,
+                constraints_payload=_constraints_payload(context),
+                max_claims_per_chunk=context.config.style_claims.max_claims_per_chunk,
+                prompt_cache_key=prompt_cache.key,
+                prompt_cache_retention=prompt_cache.retention,
+            ),
+        )
+        for prepared in pending_chunks
+    ]
+    raw_files = [
+        context.paths.style_claims_batch_input,
+        context.paths.style_claims_batch_manifest,
+        context.paths.style_claims_batch_output,
+    ]
+    event_extra = {
+        "chunks_count": len(pending_chunks),
+        "completion_window": context.config.openai.batch.completion_window,
+        "prompt_cache_key": prompt_cache.key,
+        "prompt_cache_retention": prompt_cache.retention,
+    }
+    emit_provider_event(
+        context,
+        PipelineEvent.PROVIDER_REQUEST_STARTED,
+        stage_name=Stage13ExtractStyleClaims.name,
+        ordinal=Stage13ExtractStyleClaims.ordinal,
+        operation=ProviderOperation.CLAIMS_EXTRACT,
+        diagnostics=ProviderCallDiagnostics(
+            provider=ProviderName.OPENAI,
+            model=context.config.style_claims.model,
+            raw_output_path=str(context.paths.style_claims_batch_manifest),
+            transport="batch",
+        ),
+        attempt=1,
+        message="claims batch request started",
+        extra=event_extra,
+    )
+    try:
+        batch_result = OpenAIBatchClient(os.environ.get("OPENAI_API_KEY")).run_responses_batch(
+            requests=batch_requests,
+            request_metadata=request_metadata,
+            input_path=context.paths.style_claims_batch_input,
+            manifest_path=context.paths.style_claims_batch_manifest,
+            output_path=context.paths.style_claims_batch_output,
+            error_path=context.paths.style_claims_batch_errors,
+            completion_window=context.config.openai.batch.completion_window,
+            poll_interval_seconds=context.config.openai.batch.poll_interval_seconds,
+            poll_timeout_seconds=context.config.openai.batch.poll_timeout_seconds,
+            on_progress=lambda message: _emit_claim_progress(context, message),
+        )
+    except ProviderError as error:
+        _log_claim_batch_failure(context, error=error)
+        emit_provider_event(
+            context,
+            PipelineEvent.PROVIDER_REQUEST_FAILED,
+            stage_name=Stage13ExtractStyleClaims.name,
+            ordinal=Stage13ExtractStyleClaims.ordinal,
+            operation=ProviderOperation.CLAIMS_EXTRACT,
+            diagnostics=ProviderCallDiagnostics(
+                provider=ProviderName.OPENAI,
+                model=context.config.style_claims.model,
+                raw_output_path=str(context.paths.style_claims_batch_manifest),
+                request_id=request_id_from_error(error),
+                transport="batch",
+            ),
+            attempt=1,
+            message="claims batch request failed; falling back to sync requests",
+            extra={**provider_error_extra(error), **event_extra},
+        )
+        return {}, [path for path in raw_files if path.exists()]
+
+    if batch_result.error_file.exists():
+        raw_files.append(batch_result.error_file)
+    raw_files = [path for path in raw_files if path.exists()]
+    emit_provider_event(
+        context,
+        PipelineEvent.PROVIDER_REQUEST_COMPLETED,
+        stage_name=Stage13ExtractStyleClaims.name,
+        ordinal=Stage13ExtractStyleClaims.ordinal,
+        operation=ProviderOperation.CLAIMS_EXTRACT,
+        diagnostics=ProviderCallDiagnostics(
+            provider=ProviderName.OPENAI,
+            model=context.config.style_claims.model,
+            raw_output_path=str(batch_result.output_file),
+            transport="batch",
+            batch_id=batch_result.batch_id,
+        ),
+        attempt=1,
+        message="claims batch request completed",
+        extra={**event_extra, "batch_id": batch_result.batch_id},
+    )
+    results: dict[str, _ChunkClaimsResult] = {}
+    side_effect_files: list[Path] = []
+    for prepared in pending_chunks:
+        result = _chunk_result_from_batch_line(
+            context=context,
+            prepared=prepared,
+            batch_id=batch_result.batch_id,
+            line=batch_result.output_lines.get(prepared.chunk.chunk_id),
+            error_line=batch_result.error_lines.get(prepared.chunk.chunk_id),
+            claim_errors=claim_errors,
+            side_effect_files=side_effect_files,
+        )
+        if result is not None:
+            results[prepared.chunk.chunk_id] = result
+    return results, [*raw_files, *side_effect_files]
+
+
+def _chunk_result_from_batch_line(
+    *,
+    context: StageContext,
+    prepared: _PreparedClaimsChunk,
+    batch_id: str,
+    line: dict[str, Any] | None,
+    error_line: dict[str, Any] | None,
+    claim_errors: list[dict[str, Any]],
+    side_effect_files: list[Path],
+) -> _ChunkClaimsResult | None:
+    if line is None:
+        _log_claim_batch_miss(context, prepared=prepared, batch_id=batch_id, error_line=error_line)
+        return None
+    response = line.get("response") if isinstance(line.get("response"), dict) else {}
+    status_code = _int_or_none(response.get("status_code"))
+    raw_payload = response.get("body")
+    if line.get("error") or status_code != 200 or not isinstance(raw_payload, dict):
+        _log_claim_batch_miss(context, prepared=prepared, batch_id=batch_id, error_line=line)
+        return None
+
+    diagnostics = ProviderCallDiagnostics(
+        provider=ProviderName.OPENAI,
+        model=str(raw_payload.get("model")) if raw_payload.get("model") is not None else context.config.style_claims.model,
+        raw_output_path=str(prepared.raw_path),
+        request_id=str(response.get("request_id")) if response.get("request_id") is not None else None,
+        response_id=str(raw_payload.get("id")) if raw_payload.get("id") is not None else None,
+        transport="batch",
+        batch_id=batch_id,
+        batch_custom_id=prepared.chunk.chunk_id,
+        status_code=status_code,
+        usage=openai_responses_usage(raw_payload),
+    )
+    cached_payload = build_claims_cached_payload(
+        request_metadata=prepared.request_metadata,
+        diagnostics=diagnostics,
+        raw_payload=raw_payload,
+    )
+    try:
+        analysis = claims_result_from_cached_payload(cached_payload)
+        claims = _claims_from_payload(analysis.payload, prepared.chunk, context)
+    except (ProviderError, _RecoverableClaimsOutputError) as error:
+        _record_invalid_batch_claims(
+            context=context,
+            prepared=prepared,
+            batch_id=batch_id,
+            cached_payload=cached_payload,
+            analysis=analysis if "analysis" in locals() else None,
+            error=error,
+            claim_errors=claim_errors,
+            side_effect_files=side_effect_files,
+        )
+        return None
+
+    write_json_atomic(prepared.raw_path, cached_payload)
+    _log_claim_batch_success(context, prepared=prepared, batch_id=batch_id, analysis=analysis)
+    return _ChunkClaimsResult(
+        claims=claims,
+        raw_files=[prepared.raw_path],
+        input_tokens=analysis.usage["input_tokens"],
+        cached_input_tokens=analysis.usage["cached_input_tokens"],
+        output_tokens=analysis.usage["output_tokens"],
+        reasoning_tokens=analysis.usage["reasoning_tokens"],
+        total_tokens=analysis.usage["total_tokens"],
+        cache_hit=False,
+        diagnostics=analysis.diagnostics.with_updates(raw_output_path=str(prepared.raw_path)),
+    )
+
+
+def _record_invalid_batch_claims(
+    *,
+    context: StageContext,
+    prepared: _PreparedClaimsChunk,
+    batch_id: str,
+    cached_payload: dict[str, Any],
+    analysis: ClaimsAnalysisResult | None,
+    error: ProviderError,
+    claim_errors: list[dict[str, Any]],
+    side_effect_files: list[Path],
+) -> None:
+    raw_attempt = _next_claim_raw_attempt_number(context, prepared.chunk)
+    attempt_path = context.paths.style_claims_raw_attempt(prepared.chunk.chunk_id, raw_attempt)
+    write_json_atomic(attempt_path, cached_payload)
+    side_effect_files.append(attempt_path)
+    if isinstance(error, _RecoverableClaimsOutputError):
+        validation_errors = error.validation_errors
+        structured_errors = error.structured_errors
+        error_code = error.error_code
+    else:
+        validation_errors = [error.details or str(error)]
+        structured_errors = [
+            _validation_entry(
+                code=error.error_code,
+                message=validation_errors[0],
+                field="response",
+                preview=validation_errors[0],
+            )
+        ]
+        error_code = error.error_code
+    error_entry = _claim_error_entry(
+        context,
+        chunk=prepared.chunk,
+        attempt=1,
+        raw_attempt=raw_attempt,
+        max_retries=context.config.style_claims.max_retries,
+        error_code=error_code,
+        validation_errors=validation_errors,
+        structured_errors=structured_errors,
+        raw_output_path=attempt_path,
+        analysis=analysis,
+    )
+    claim_errors.append(error_entry)
+    _write_claim_errors(context, claim_errors)
+    _log_claim_attempt(
+        context,
+        chunk=prepared.chunk,
+        attempt=1,
+        raw_attempt=raw_attempt,
+        max_retries=context.config.style_claims.max_retries,
+        raw_output_path=attempt_path,
+        validation_errors=validation_errors,
+        error_code=error_code,
+        analysis=analysis,
+        structured_errors=structured_errors,
+    )
+    emit_stage_validation_failed(
+        context,
+        stage_name=Stage13ExtractStyleClaims.name,
+        ordinal=Stage13ExtractStyleClaims.ordinal,
+        error_code=error_code,
+        message=f"batch claims validation failed for chunk {prepared.chunk.chunk_id}",
+        validation_errors=validation_errors,
+        structured_errors=structured_errors,
+        raw_output_path=attempt_path,
+        attempt=1,
+        extra={"chunk_id": prepared.chunk.chunk_id, "batch_id": batch_id, "transport": "batch"},
+    )
 
 
 def _claims_from_payload(payload: Any, chunk: Chunk, context: StageContext) -> list[StyleClaim]:
@@ -843,6 +1195,7 @@ def _curate_claims_if_enabled(context: StageContext, claims: list[StyleClaim]) -
             claims=_renumber_claims(claims, context.job.video_id),
             raw_files=[],
             input_tokens=0,
+            cached_input_tokens=0,
             output_tokens=0,
             reasoning_tokens=0,
             total_tokens=0,
@@ -890,6 +1243,7 @@ def _curate_claims_if_enabled(context: StageContext, claims: list[StyleClaim]) -
         claims=application.claims,
         raw_files=[raw_path],
         input_tokens=analysis.usage["input_tokens"],
+        cached_input_tokens=analysis.usage["cached_input_tokens"],
         output_tokens=analysis.usage["output_tokens"],
         reasoning_tokens=analysis.usage["reasoning_tokens"],
         total_tokens=analysis.usage["total_tokens"],
@@ -967,6 +1321,8 @@ def _run_claims_curate_request(
             constraints_payload=_curate_constraints_payload(context),
             request_metadata=request_metadata,
             raw_output_path=raw_path,
+            prompt_cache_key=_prompt_cache_key_from_metadata(request_metadata),
+            prompt_cache_retention=_prompt_cache_retention_from_metadata(request_metadata),
         )
     except ProviderError as error:
         emit_provider_event(
@@ -1200,6 +1556,7 @@ def _curate_request_metadata(
         "prompt_sha256": prompt_sha,
         "max_retries": context.config.style_claims.curate.max_retries,
         "claims_count": len(claims_payload),
+        "prompt_cache": _claims_curate_prompt_cache(context, prompt_sha, len(claims_payload)).metadata,
         "input_fingerprint": _fingerprint(claims_payload),
     }
 
@@ -1273,6 +1630,7 @@ def _curate_metrics(
         "curate_invalid_decisions_count": len(application.invalid_decisions),
         "curate_missing_decisions_count": len(application.missing_decision_ids),
         "input_tokens": analysis.usage["input_tokens"],
+        "cached_input_tokens": analysis.usage["cached_input_tokens"],
         "output_tokens": analysis.usage["output_tokens"],
         "reasoning_tokens": analysis.usage["reasoning_tokens"],
         "total_tokens": analysis.usage["total_tokens"],
@@ -1431,6 +1789,7 @@ def _summary_payload(
         "retry_advisor_prompt_sha256": retry_advisor_prompt_sha,
         "max_claims_per_chunk": context.config.style_claims.max_claims_per_chunk,
         "max_retries": context.config.style_claims.max_retries,
+        "openai_runtime": _openai_runtime_metadata(context),
         "chunks_count": len(chunks),
         "claims_before_dedupe": claims_before_dedupe,
         "claims_after_exact_dedupe": claims_after_exact_dedupe,
@@ -1520,6 +1879,7 @@ def _load_cached_chunk_result(
         claims=claims,
         raw_files=[raw_path],
         input_tokens=result.usage["input_tokens"],
+        cached_input_tokens=result.usage["cached_input_tokens"],
         output_tokens=result.usage["output_tokens"],
         reasoning_tokens=result.usage["reasoning_tokens"],
         total_tokens=result.usage["total_tokens"],
@@ -1589,6 +1949,8 @@ def _extract_chunk_claims_with_retries(
                 request_metadata=request_metadata,
                 raw_output_path=attempt_path,
                 max_claims_per_chunk=context.config.style_claims.max_claims_per_chunk,
+                prompt_cache_key=_prompt_cache_key_from_metadata(request_metadata),
+                prompt_cache_retention=_prompt_cache_retention_from_metadata(request_metadata),
             )
         except ProviderError as error:
             emit_provider_event(
@@ -1665,6 +2027,7 @@ def _extract_chunk_claims_with_retries(
                     *[path for path in advisor_files if path.exists()],
                 ],
                 input_tokens=analysis.usage["input_tokens"],
+                cached_input_tokens=analysis.usage["cached_input_tokens"],
                 output_tokens=analysis.usage["output_tokens"],
                 reasoning_tokens=analysis.usage["reasoning_tokens"],
                 total_tokens=analysis.usage["total_tokens"],
@@ -1892,10 +2255,13 @@ def _build_claims_retry_advice(
         "chunk_payload": chunk_payload,
     }
     try:
+        prompt_cache = _claims_retry_advisor_prompt_cache(context, _sha256_text(system_prompt))
         advisor_payload = advisor_client.analyze_claim_errors(
             system_prompt=system_prompt,
             repair_payload=repair_payload,
             raw_output_path=raw_output_path,
+            prompt_cache_key=prompt_cache.key,
+            prompt_cache_retention=prompt_cache.retention,
         )
     except ProviderError as error:
         _log_claim_retry_advisor_failure(context, chunk=chunk, raw_output_path=raw_output_path, error=error)
@@ -1940,6 +2306,67 @@ def _write_claim_errors(context: StageContext, errors: list[dict[str, Any]]) -> 
             "errors": errors,
         },
     )
+
+
+def _log_claim_batch_success(
+    context: StageContext,
+    *,
+    prepared: _PreparedClaimsChunk,
+    batch_id: str,
+    analysis: ClaimsAnalysisResult,
+) -> None:
+    diagnostics = analysis.diagnostics
+    lines = [
+        "",
+        "[claims-batch-result]",
+        f"run_id: {context.run_id or '-'}",
+        f"batch_id: {batch_id}",
+        f"chunk_id: {prepared.chunk.chunk_id}",
+        "status: accepted",
+        f"raw_output: {prepared.raw_path}",
+        f"model: {diagnostics.model if diagnostics.model else '-'}",
+        f"request_id: {diagnostics.request_id if diagnostics.request_id else '-'}",
+        f"response_id: {diagnostics.response_id if diagnostics.response_id else '-'}",
+        f"input_tokens: {analysis.usage.get('input_tokens', 0)}",
+        f"cached_input_tokens: {analysis.usage.get('cached_input_tokens', 0)}",
+        f"output_tokens: {analysis.usage.get('output_tokens', 0)}",
+        f"reasoning_tokens: {analysis.usage.get('reasoning_tokens', 0)}",
+        "",
+    ]
+    append_text(context.paths.stage_log(Stage13ExtractStyleClaims.name), "\n".join(lines), encoding="utf-8")
+
+
+def _log_claim_batch_miss(
+    context: StageContext,
+    *,
+    prepared: _PreparedClaimsChunk,
+    batch_id: str,
+    error_line: dict[str, Any] | None,
+) -> None:
+    lines = [
+        "",
+        "[claims-batch-result]",
+        f"run_id: {context.run_id or '-'}",
+        f"batch_id: {batch_id}",
+        f"chunk_id: {prepared.chunk.chunk_id}",
+        "status: fallback_to_sync",
+        f"error_line_preview: {validation_preview(error_line) if error_line is not None else '-'}",
+        "",
+    ]
+    append_text(context.paths.stage_log(Stage13ExtractStyleClaims.name), "\n".join(lines), encoding="utf-8")
+
+
+def _log_claim_batch_failure(context: StageContext, *, error: ProviderError) -> None:
+    lines = [
+        "",
+        "[claims-batch-failed]",
+        f"run_id: {context.run_id or '-'}",
+        f"error_code: {error.error_code}",
+        f"error: {error}",
+        f"details: {error.details or '-'}",
+        "",
+    ]
+    append_text(context.paths.stage_log(Stage13ExtractStyleClaims.name), "\n".join(lines), encoding="utf-8")
 
 
 def _log_claim_attempt(
@@ -2200,8 +2627,91 @@ def _request_metadata(
         "retry_advisor_prompt_sha256": retry_advisor_prompt_sha,
         "max_claims_per_chunk": context.config.style_claims.max_claims_per_chunk,
         "max_retries": context.config.style_claims.max_retries,
+        "prompt_cache": _claims_extract_prompt_cache(context, prompt_sha).metadata,
         "input_fingerprint": _fingerprint(chunk_payload),
     }
+
+
+def _claims_extract_prompt_cache(context: StageContext, prompt_sha: str) -> _PromptCacheSettings:
+    constraints_fingerprint = _fingerprint(_constraints_payload(context))
+    return _prompt_cache_settings(
+        context,
+        namespace="claims-extract",
+        model=context.config.style_claims.model,
+        fingerprint=openai_prompt_cache_fingerprint(prompt_sha, constraints_fingerprint),
+    )
+
+
+def _claims_retry_advisor_prompt_cache(context: StageContext, prompt_sha: str) -> _PromptCacheSettings:
+    return _prompt_cache_settings(
+        context,
+        namespace="claims-retry-advisor",
+        model=context.config.style_claims.retry_advisor_model,
+        fingerprint=prompt_sha,
+    )
+
+
+def _claims_curate_prompt_cache(context: StageContext, prompt_sha: str, claims_count: int) -> _PromptCacheSettings:
+    return _prompt_cache_settings(
+        context,
+        namespace="claims-curate",
+        model=context.config.style_claims.curate.model,
+        fingerprint=openai_prompt_cache_fingerprint(prompt_sha, str(claims_count)),
+    )
+
+
+def _prompt_cache_settings(
+    context: StageContext,
+    *,
+    namespace: str,
+    model: str,
+    fingerprint: str,
+) -> _PromptCacheSettings:
+    cache_config = context.config.openai.prompt_cache
+    if not cache_config.enabled:
+        return _PromptCacheSettings(
+            metadata={"enabled": False, "key": None, "retention": None},
+            key=None,
+            retention=None,
+        )
+    key = openai_prompt_cache_key(namespace=namespace, model=model, fingerprint=fingerprint)
+    return _PromptCacheSettings(
+        metadata={"enabled": True, "key": key, "retention": cache_config.retention},
+        key=key,
+        retention=cache_config.retention,
+    )
+
+
+def _openai_runtime_metadata(context: StageContext) -> dict[str, Any]:
+    return {
+        "prompt_cache": {
+            "enabled": context.config.openai.prompt_cache.enabled,
+            "retention": context.config.openai.prompt_cache.retention,
+        },
+        "batch": {
+            "enabled": context.openai_batch_enabled,
+            "completion_window": context.config.openai.batch.completion_window,
+            "poll_interval_seconds": context.config.openai.batch.poll_interval_seconds,
+            "poll_timeout_seconds": context.config.openai.batch.poll_timeout_seconds,
+            "applies_to": ["style_claims.extract.first_attempt_cache_misses"],
+        },
+    }
+
+
+def _prompt_cache_key_from_metadata(request_metadata: dict[str, Any]) -> str | None:
+    prompt_cache = request_metadata.get("prompt_cache")
+    if not isinstance(prompt_cache, dict) or not prompt_cache.get("enabled"):
+        return None
+    key = prompt_cache.get("key")
+    return str(key) if key else None
+
+
+def _prompt_cache_retention_from_metadata(request_metadata: dict[str, Any]) -> str | None:
+    prompt_cache = request_metadata.get("prompt_cache")
+    if not isinstance(prompt_cache, dict) or not prompt_cache.get("enabled"):
+        return None
+    retention = prompt_cache.get("retention")
+    return str(retention) if retention else None
 
 
 def _constraints_payload(
@@ -2303,3 +2813,12 @@ def _fingerprint(value: object) -> str:
 
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _int_or_none(value: object) -> int | None:
+    try:
+        if value is not None:
+            return int(value)
+    except (TypeError, ValueError):
+        return None
+    return None

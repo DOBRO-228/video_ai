@@ -4,6 +4,18 @@ project:
   keep_media: false
   keep_frames: true
 
+pipeline:
+  visual_enabled: false
+
+openai:
+  prompt_cache:
+    enabled: true
+    retention: "24h"
+  batch:
+    completion_window: "24h"
+    poll_interval_seconds: 15
+    poll_timeout_seconds: null
+
 download:
   video_height: 720
   video_format: mp4
@@ -85,8 +97,8 @@ scene_detection:
   extra_sample_every_seconds: 4
   max_frames_per_scene: 8
   intra_scene_dedup: true
-  phash_max_distance: 8
-  ssim_confirm: 0.85
+  phash_max_distance: 10
+  ssim_confirm: 0.82
   min_frames_per_scene: 1
   fallback_scene_seconds: 30
   frame_quality:
@@ -117,7 +129,7 @@ vision:
   model: gemini-2.5-flash
   media_resolution: high
   thinking_level: null
-  thinking_budget: 8192
+  thinking_budget: 6000
   batch_size: 6
   # OpenAI values kept for rollback:
   # provider: openai
@@ -136,8 +148,10 @@ vision:
 
 speech_segmentation:
   provider: openai
-  model: gpt-5-mini
-  retry_advisor_model: gpt-5-mini
+  model: gpt-5.4-mini
+  reasoning_effort: medium
+  retry_advisor_model: gpt-5.4-mini
+  retry_advisor_reasoning_effort: medium
   retry_advisor_prompt_file: speech_segments_retry_advisor_ru.txt
   prompt_file: speech_segments_semantic_ru.txt
   max_segment_seconds: 60
@@ -148,8 +162,8 @@ speech_segmentation:
 chunking:
   mode: llm_speech_plan
   provider: openai
-  model: gpt-5-mini
-  retry_advisor_model: gpt-5-mini
+  model: gpt-5.4-mini
+  retry_advisor_model: gpt-5.4-mini
   retry_advisor_prompt_file: chunk_plan_retry_advisor_ru.txt
   prompt_file: chunk_plan_ru.txt
   max_words: 1000
@@ -168,8 +182,8 @@ chunking:
 
 style_claims:
   provider: openai
-  model: gpt-5-mini
-  retry_advisor_model: gpt-5-mini
+  model: gpt-5.4-mini
+  retry_advisor_model: gpt-5.4-mini
   retry_advisor_prompt_file: style_claims_retry_advisor_ru.txt
   prompt_file: style_claims_ru.txt
   max_claims_per_chunk: 5
@@ -177,7 +191,7 @@ style_claims:
   curate:
     enabled: true
     provider: openai
-    model: gpt-5-mini
+    model: gpt-5.4-mini
     prompt_file: style_claims_curate_ru.txt
     reasoning_effort: medium
     max_retries: 1

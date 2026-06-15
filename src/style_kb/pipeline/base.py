@@ -28,6 +28,7 @@ class StageContext:
     progress_callback: Callable[[str], None] | None = None
     pipeline_logger: PipelineLogger | None = None
     run_id: str | None = None
+    openai_batch_enabled: bool = False
 
 
 class StageValidationReport(StrictModel):

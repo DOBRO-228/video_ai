@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -8,7 +9,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from style_kb.clients.openai_cache import openai_prompt_cache_fingerprint, openai_prompt_cache_key
 from style_kb.clients.openai_segmenter import OpenAISegmenterClient
+from style_kb.config import default_config_path
 from style_kb.errors import ProviderError
 from style_kb.models import ProviderSource, SpeechSegment, SpeechToken
 from style_kb.pipeline.base import Stage, StageContext, StageResult
@@ -32,6 +35,7 @@ _SOFT_MAX_SEMANTIC_SECONDS = 40.0
 _SOFT_MAX_SEMANTIC_WORDS = 90
 _SOFT_MAX_SEMANTIC_SENTENCES = 4
 _NON_TERMINAL_END_CHARS = frozenset({",", ";", ":"})
+_REQUEST_METADATA_KEY = "_style_kb_request"
 _CONTINUATION_START_WORDS = frozenset(
     {
         "а",
@@ -99,7 +103,12 @@ class Stage07BuildSpeechSegments(Stage):
     ordinal = 7
 
     def input_files(self, context: StageContext) -> list:
-        return [context.paths.stt_speech_tokens, _prompt_path(context), _retry_advisor_prompt_path(context)]
+        return [
+            context.paths.stt_speech_tokens,
+            _prompt_path(context),
+            _retry_advisor_prompt_path(context),
+            default_config_path(),
+        ]
 
     def output_files(self, context: StageContext) -> list:
         return [context.paths.stt_speech_segments, context.paths.stt_speech_segments_raw]
@@ -107,7 +116,9 @@ class Stage07BuildSpeechSegments(Stage):
     def validate_outputs(self, context: StageContext) -> bool:
         if not context.paths.stt_speech_segments.exists() or not context.paths.stt_speech_segments_raw.exists():
             return False
-        read_payload(context.paths.stt_speech_segments_raw)
+        raw_payload = read_payload(context.paths.stt_speech_segments_raw)
+        if _openai_response_reasoning_effort(raw_payload) != context.config.speech_segmentation.reasoning_effort:
+            return False
 
         segments = load_speech_segments(context.paths.stt_speech_segments)
         tokens = load_speech_tokens(context.paths.stt_speech_tokens)
@@ -179,7 +190,7 @@ class Stage07BuildSpeechSegments(Stage):
             segment.model_dump(mode="json") for segment in expected_segments
         ]:
             return False
-        return not _semantic_boundary_violations(segments)
+        return not _semantic_boundary_violations(segments, tokens=tokens, units=units)
 
     def run(self, context: StageContext) -> StageResult:
         tokens = load_speech_tokens(context.paths.stt_speech_tokens)
@@ -193,10 +204,12 @@ class Stage07BuildSpeechSegments(Stage):
         client = OpenAISegmenterClient(
             openai_api_key,
             model=context.config.speech_segmentation.model,
+            reasoning_effort=context.config.speech_segmentation.reasoning_effort,
         )
         advisor_client = OpenAISegmenterClient(
             openai_api_key,
             model=context.config.speech_segmentation.retry_advisor_model,
+            reasoning_effort=context.config.speech_segmentation.retry_advisor_reasoning_effort,
         )
         segments, attempts_used, raw_attempt_paths, raw_advisor_paths, retry_feedback = _segment_with_retries(
             context=context,
@@ -227,7 +240,9 @@ class Stage07BuildSpeechSegments(Stage):
                 "openai_response_id": openai_response_id,
                 "provider": context.config.speech_segmentation.provider,
                 "model": context.config.speech_segmentation.model,
+                "reasoning_effort": context.config.speech_segmentation.reasoning_effort,
                 "retry_advisor_model": context.config.speech_segmentation.retry_advisor_model,
+                "retry_advisor_reasoning_effort": context.config.speech_segmentation.retry_advisor_reasoning_effort,
                 "accepted_attempt": attempts_used,
                 "segments_count": len(segments),
                 "semantic_units_count": len(units),
@@ -236,7 +251,7 @@ class Stage07BuildSpeechSegments(Stage):
                 "non_segmentable_unit_boundaries_count": len(units) - segmentable_unit_boundaries,
                 "duration_seconds": _distribution(durations),
                 "word_count": _distribution(words),
-                "semantic_boundary_violations": _semantic_boundary_violations(segments)[:5],
+                "semantic_boundary_violations": _semantic_boundary_violations(segments, tokens=tokens, units=units)[:5],
                 "raw_retry_advisor_output_paths": [str(path) for path in raw_advisor_paths],
                 "retry_feedback": [_feedback_payload(feedback) for feedback in retry_feedback],
             },
@@ -274,6 +289,12 @@ def _segment_with_retries(
     next_retry_instruction: str | None = None
     raw_attempt_paths: list[Path] = []
     raw_advisor_paths: list[Path] = []
+    prompt_cache_key, prompt_cache_retention = _openai_prompt_cache_settings(
+        context,
+        namespace="speech-segmentation",
+        model=context.config.speech_segmentation.model,
+        fingerprint=openai_prompt_cache_fingerprint(_sha256_text(base_prompt_text)),
+    )
     for attempt in range(1, _SEGMENTATION_MAX_ATTEMPTS + 1):
         raw_attempt_path = context.paths.stt_speech_segments_raw_attempt(attempt)
         raw_attempt_paths.append(raw_attempt_path)
@@ -289,7 +310,9 @@ def _segment_with_retries(
             constraints_payload={
                 "provider": context.config.speech_segmentation.provider,
                 "model": context.config.speech_segmentation.model,
+                "reasoning_effort": context.config.speech_segmentation.reasoning_effort,
                 "retry_advisor_model": context.config.speech_segmentation.retry_advisor_model,
+                "retry_advisor_reasoning_effort": context.config.speech_segmentation.retry_advisor_reasoning_effort,
                 "min_segment_seconds": context.config.speech_segmentation.min_segment_seconds,
                 "max_segment_seconds": context.config.speech_segmentation.max_segment_seconds,
                 "max_segment_words": context.config.speech_segmentation.max_segment_words,
@@ -307,6 +330,8 @@ def _segment_with_retries(
                 "retry_advisor_instruction": next_retry_instruction,
             },
             raw_output_path=raw_attempt_path,
+            prompt_cache_key=prompt_cache_key,
+            prompt_cache_retention=prompt_cache_retention,
         )
         try:
             segments = _segments_from_payload(payload, units, tokens, context)
@@ -355,7 +380,7 @@ def _segment_with_retries(
             continue
 
         segments = _merge_short_same_speaker_segments(segments, tokens, context)
-        violations = _semantic_boundary_violations(segments)
+        violations = _semantic_boundary_violations(segments, tokens=tokens, units=units)
         if not violations:
             copy_file_atomic(raw_attempt_path, context.paths.stt_speech_segments_raw)
             return segments, attempt, raw_attempt_paths, raw_advisor_paths, retry_feedback
@@ -613,8 +638,10 @@ def _collect_raw_segment_validation_errors(
             expected_start = unit_end_index + 1
             continue
 
+        text = _join_tokens(group)
         duration = group[-1].end - group[0].start
         words_count = _word_count_from_tokens(group)
+        sentences_count = _sentence_boundary_count(text)
         speakers = _content_speaker_identities(group)
         common_payload: dict[str, Any] = {
             "segment_index": segment_index,
@@ -624,12 +651,13 @@ def _collect_raw_segment_validation_errors(
             "end": group[-1].end,
             "duration_seconds": round(duration, 3),
             "words_count": words_count,
+            "sentences_count": sentences_count,
             "speakers": [
                 {"speaker": speaker, "speaker_role": speaker_role}
                 for speaker, speaker_role in speakers
             ],
-            "text_head": _clip_text(_join_tokens(group), limit=160),
-            "text_tail": _clip_text(_join_tokens(group)[-160:], limit=160),
+            "text_head": _clip_text(text, limit=160),
+            "text_tail": _clip_text(text[-160:], limit=160),
         }
         if duration > max_duration + _DURATION_EPSILON_SECONDS:
             errors.append(
@@ -666,6 +694,25 @@ def _collect_raw_segment_validation_errors(
                         f"has {words_count} words, exceeds max_segment_words {max_words}"
                     ),
                     "max_segment_words": max_words,
+                }
+            )
+        if (
+            duration > _SOFT_MAX_SEMANTIC_SECONDS
+            and words_count >= _SOFT_MAX_SEMANTIC_WORDS
+            and sentences_count >= _SOFT_MAX_SEMANTIC_SENTENCES
+        ):
+            errors.append(
+                {
+                    **common_payload,
+                    "code": "openai_segmenter_semantic_boundary_violation",
+                    "message": (
+                        f"segment {segment_index} range {unit_start_index}-{unit_end_index} "
+                        "is semantically too dense: "
+                        f"duration={duration:.2f}s words={words_count} sentences={sentences_count}"
+                    ),
+                    "preferred_max_segment_seconds": _SOFT_MAX_SEMANTIC_SECONDS,
+                    "preferred_max_segment_words": _SOFT_MAX_SEMANTIC_WORDS,
+                    "preferred_max_segment_sentences": _SOFT_MAX_SEMANTIC_SENTENCES,
                 }
             )
         if len(speakers) > 1:
@@ -712,7 +759,7 @@ def _collect_raw_segment_validation_errors(
                         ),
                         "boundary_unit_index": unit_end_index,
                         "boundary_reason": end_unit.boundary_reason,
-                        "text_tail": _clip_text(_join_tokens(group)[-160:], limit=160),
+                        "text_tail": _clip_text(text[-160:], limit=160),
                         "next_text_head": _clip_text(next_unit.text, limit=160),
                     }
                 )
@@ -903,6 +950,7 @@ def _build_prompt(
         "Жёсткие лимиты из блока `Ограничения сегментации` важнее идеальной смысловой границы: нельзя превышать max_segment_seconds или max_segment_words.",
         "Нельзя заканчивать сегмент на unit с can_end_segment=false. Unit с must_end_segment=true обязан быть концом сегмента.",
         "Soft semantic density rule также обязателен для финальной валидации: не оставляй сегмент, где одновременно duration_seconds > preferred_max_segment_seconds, words_count >= preferred_max_segment_words и sentences_count >= preferred_max_segment_sentences.",
+        "Если retry-feedback запрещает dense range X-Y, нельзя заменить его соседним или overlapping dense range, который всё ещё нарушает semantic density thresholds.",
         "Если semantic boundary выглядит сомнительно, сдвигай только локальную границу к ближайшему завершённому предложению.",
         "Не исправляй одну плохую границу объединением большого блока, если такой блок нарушает лимиты.",
         "Никогда не объединяй units разных speaker.",
@@ -910,8 +958,14 @@ def _build_prompt(
     return base_prompt_text.rstrip() + "\n" + "\n".join(feedback_lines)
 
 
-def _semantic_boundary_violations(segments: list[SpeechSegment]) -> list[str]:
+def _semantic_boundary_violations(
+    segments: list[SpeechSegment],
+    *,
+    tokens: list[SpeechToken] | None = None,
+    units: list[_TranscriptUnit] | None = None,
+) -> list[str]:
     violations: list[str] = []
+    unit_ranges = _segment_unit_ranges(segments, tokens=tokens, units=units)
     for index, segment in enumerate(segments, start=1):
         duration = segment.end - segment.start
         word_count = len(segment.text.split())
@@ -921,8 +975,11 @@ def _semantic_boundary_violations(segments: list[SpeechSegment]) -> list[str]:
             and word_count >= _SOFT_MAX_SEMANTIC_WORDS
             and sentence_count >= _SOFT_MAX_SEMANTIC_SENTENCES
         ):
+            unit_range = unit_ranges.get(index)
+            range_text = f" range {unit_range[0]}-{unit_range[1]}" if unit_range else ""
             violations.append(
-                f"segment {index} is semantically too dense: duration={duration:.2f}s words={word_count} sentences={sentence_count}"
+                f"segment {index}{range_text} is semantically too dense: "
+                f"duration={duration:.2f}s words={word_count} sentences={sentence_count}"
             )
 
     for index, (previous, current) in enumerate(zip(segments, segments[1:]), start=1):
@@ -946,6 +1003,33 @@ def _semantic_boundary_violations(segments: list[SpeechSegment]) -> list[str]:
                 f"prev_tail={previous.text[-60:]!r} next_head={current.text[:60]!r}"
             )
     return violations
+
+
+def _segment_unit_ranges(
+    segments: list[SpeechSegment],
+    *,
+    tokens: list[SpeechToken] | None,
+    units: list[_TranscriptUnit] | None,
+) -> dict[int, tuple[int, int]]:
+    if tokens is None or units is None:
+        return {}
+    token_start_to_unit = {
+        tokens[unit.token_start_position].token_index: unit.unit_index
+        for unit in units
+        if 0 <= unit.token_start_position < len(tokens)
+    }
+    token_end_to_unit = {
+        tokens[unit.token_end_position].token_index: unit.unit_index
+        for unit in units
+        if 0 <= unit.token_end_position < len(tokens)
+    }
+    results: dict[int, tuple[int, int]] = {}
+    for segment_index, segment in enumerate(segments, start=1):
+        unit_start_index = token_start_to_unit.get(segment.token_start_index)
+        unit_end_index = token_end_to_unit.get(segment.token_end_index)
+        if unit_start_index is not None and unit_end_index is not None:
+            results[segment_index] = (unit_start_index, unit_end_index)
+    return results
 
 
 def _semantic_structured_errors(violations: list[str]) -> list[dict[str, Any]]:
@@ -991,7 +1075,9 @@ def _build_retry_advice(
         "video_id": context.job.video_id,
         "attempt": attempt_feedback.attempt,
         "main_model": context.config.speech_segmentation.model,
+        "main_reasoning_effort": context.config.speech_segmentation.reasoning_effort,
         "retry_advisor_model": context.config.speech_segmentation.retry_advisor_model,
+        "retry_advisor_reasoning_effort": context.config.speech_segmentation.retry_advisor_reasoning_effort,
         "constraints": {
             "min_segment_seconds": context.config.speech_segmentation.min_segment_seconds,
             "max_segment_seconds": context.config.speech_segmentation.max_segment_seconds,
@@ -1021,10 +1107,18 @@ def _build_retry_advice(
         ),
     }
     try:
+        prompt_cache_key, prompt_cache_retention = _openai_prompt_cache_settings(
+            context,
+            namespace="speech-segmentation-retry-advisor",
+            model=context.config.speech_segmentation.retry_advisor_model,
+            fingerprint=openai_prompt_cache_fingerprint(_sha256_text(retry_advisor_prompt_text)),
+        )
         advisor_payload = advisor_client.analyze_segmentation_errors(
             system_prompt=retry_advisor_prompt_text,
             repair_payload=repair_payload,
             raw_output_path=raw_advice_path,
+            prompt_cache_key=prompt_cache_key,
+            prompt_cache_retention=prompt_cache_retention,
         )
     except ProviderError as error:
         _log_retry_advisor_failure(context, attempt=attempt_feedback.attempt, error=error)
@@ -1360,10 +1454,18 @@ def _structured_error_message(error: dict[str, Any]) -> str:
         details.append(f"duration={error['duration_seconds']}s")
     if error.get("words_count") is not None:
         details.append(f"words={error['words_count']}")
+    if error.get("sentences_count") is not None:
+        details.append(f"sentences={error['sentences_count']}")
     if error.get("max_segment_seconds") is not None:
         details.append(f"max_seconds={error['max_segment_seconds']}")
     if error.get("max_segment_words") is not None:
         details.append(f"max_words={error['max_segment_words']}")
+    if error.get("preferred_max_segment_seconds") is not None:
+        details.append(f"preferred_seconds={error['preferred_max_segment_seconds']}")
+    if error.get("preferred_max_segment_words") is not None:
+        details.append(f"preferred_words={error['preferred_max_segment_words']}")
+    if error.get("preferred_max_segment_sentences") is not None:
+        details.append(f"preferred_sentences={error['preferred_max_segment_sentences']}")
     if not details:
         return message
     return f"{message} ({', '.join(details)})"
@@ -1712,3 +1814,40 @@ def _clip_text(text: str, *, limit: int) -> str:
     if len(normalized) <= limit:
         return normalized
     return normalized[: limit - 3].rstrip() + "..."
+
+
+def _openai_prompt_cache_settings(
+    context: StageContext,
+    *,
+    namespace: str,
+    model: str,
+    fingerprint: str,
+) -> tuple[str | None, str | None]:
+    cache_config = context.config.openai.prompt_cache
+    if not cache_config.enabled:
+        return None, None
+    return (
+        openai_prompt_cache_key(namespace=namespace, model=model, fingerprint=fingerprint),
+        cache_config.retention,
+    )
+
+
+def _openai_response_reasoning_effort(raw_payload: dict[str, Any]) -> str | None:
+    request_metadata = raw_payload.get(_REQUEST_METADATA_KEY)
+    if isinstance(request_metadata, dict) and "reasoning_effort" in request_metadata:
+        effort = request_metadata.get("reasoning_effort")
+        if isinstance(effort, str):
+            return effort
+        return None
+
+    reasoning = raw_payload.get("reasoning")
+    if not isinstance(reasoning, dict):
+        return None
+    effort = reasoning.get("effort")
+    if not isinstance(effort, str):
+        return None
+    return effort
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()

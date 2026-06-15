@@ -74,31 +74,22 @@ class OpenAIClaimsClient:
         request_metadata: dict[str, Any],
         raw_output_path: Path,
         max_claims_per_chunk: int,
+        prompt_cache_key: str | None = None,
+        prompt_cache_retention: str | None = None,
     ) -> ClaimsAnalysisResult:
-        request_text = "\n\n".join(
-            [
-                system_prompt.strip(),
-                "Ограничения извлечения:",
-                json.dumps(constraints_payload, ensure_ascii=False, indent=2, sort_keys=True),
-                "Chunk для анализа:",
-                json.dumps(chunk_payload, ensure_ascii=False, indent=2, sort_keys=True),
-            ]
+        body = build_claims_request_body(
+            model=self.model,
+            system_prompt=system_prompt,
+            chunk_payload=chunk_payload,
+            constraints_payload=constraints_payload,
+            max_claims_per_chunk=max_claims_per_chunk,
+            prompt_cache_key=prompt_cache_key,
+            prompt_cache_retention=prompt_cache_retention,
         )
         timer = start_operation()
         try:
             response = call_with_retry(
-                lambda: self.client.responses.create(
-                    model=self.model,
-                    input=[{"role": "user", "content": [{"type": "input_text", "text": request_text}]}],
-                    text={
-                        "format": {
-                            "type": "json_schema",
-                            "name": "menswear_style_claims",
-                            "strict": True,
-                            "schema": _claim_response_schema(max_claims_per_chunk),
-                        }
-                    },
-                ),
+                lambda: self.client.responses.create(**body),
                 policy=self.retry_policy,
                 on_retry=self.on_retry,
             )
@@ -112,8 +103,11 @@ class OpenAIClaimsClient:
             timer=timer,
             raw_output_path=raw_output_path,
         )
-        raw_payload["_style_kb_diagnostics"] = diagnostics.to_dict()
-        cached_payload = {"request": request_metadata, "diagnostics": diagnostics.to_dict(), "response": raw_payload}
+        cached_payload = build_claims_cached_payload(
+            request_metadata=request_metadata,
+            diagnostics=diagnostics,
+            raw_payload=raw_payload,
+        )
         write_json_atomic(raw_output_path, cached_payload)
         return _result_from_cached_payload(cached_payload, fallback_output_text=response.output_text)
 
@@ -123,6 +117,8 @@ class OpenAIClaimsClient:
         system_prompt: str,
         repair_payload: dict[str, Any],
         raw_output_path: Path,
+        prompt_cache_key: str | None = None,
+        prompt_cache_retention: str | None = None,
     ) -> dict[str, Any]:
         request_text = "\n\n".join(
             [
@@ -131,21 +127,26 @@ class OpenAIClaimsClient:
                 json.dumps(repair_payload, ensure_ascii=False, indent=2, sort_keys=True),
             ]
         )
+        body: dict[str, Any] = {
+            "model": self.model,
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": request_text}]}],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "menswear_style_claims_retry_advice",
+                    "strict": True,
+                    "schema": CLAIMS_RETRY_ADVISOR_RESPONSE_SCHEMA,
+                }
+            },
+        }
+        if prompt_cache_key:
+            body["prompt_cache_key"] = prompt_cache_key
+        if prompt_cache_retention:
+            body["prompt_cache_retention"] = prompt_cache_retention
         timer = start_operation()
         try:
             response = call_with_retry(
-                lambda: self.client.responses.create(
-                    model=self.model,
-                    input=[{"role": "user", "content": [{"type": "input_text", "text": request_text}]}],
-                    text={
-                        "format": {
-                            "type": "json_schema",
-                            "name": "menswear_style_claims_retry_advice",
-                            "strict": True,
-                            "schema": CLAIMS_RETRY_ADVISOR_RESPONSE_SCHEMA,
-                        }
-                    },
-                ),
+                lambda: self.client.responses.create(**body),
                 policy=self.retry_policy,
                 on_retry=self.on_retry,
             )
@@ -186,7 +187,81 @@ def load_cached_claims_result(raw_output_path: Path) -> ClaimsAnalysisResult:
     return _result_from_cached_payload(read_json(raw_output_path))
 
 
-def _claim_response_schema(max_claims_per_chunk: int) -> dict[str, Any]:
+def build_claims_request_body(
+    *,
+    model: str,
+    system_prompt: str,
+    chunk_payload: dict[str, Any],
+    constraints_payload: dict[str, Any],
+    max_claims_per_chunk: int,
+    prompt_cache_key: str | None = None,
+    prompt_cache_retention: str | None = None,
+) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "model": model,
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": build_claims_request_text(
+                            system_prompt=system_prompt,
+                            chunk_payload=chunk_payload,
+                            constraints_payload=constraints_payload,
+                        ),
+                    }
+                ],
+            }
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "menswear_style_claims",
+                "strict": True,
+                "schema": claim_response_schema(max_claims_per_chunk),
+            }
+        },
+    }
+    if prompt_cache_key:
+        body["prompt_cache_key"] = prompt_cache_key
+    if prompt_cache_retention:
+        body["prompt_cache_retention"] = prompt_cache_retention
+    return body
+
+
+def build_claims_request_text(
+    *,
+    system_prompt: str,
+    chunk_payload: dict[str, Any],
+    constraints_payload: dict[str, Any],
+) -> str:
+    return "\n\n".join(
+        [
+            system_prompt.strip(),
+            "Ограничения извлечения:",
+            json.dumps(constraints_payload, ensure_ascii=False, indent=2, sort_keys=True),
+            "Chunk для анализа:",
+            json.dumps(chunk_payload, ensure_ascii=False, indent=2, sort_keys=True),
+        ]
+    )
+
+
+def build_claims_cached_payload(
+    *,
+    request_metadata: dict[str, Any],
+    diagnostics: ProviderCallDiagnostics,
+    raw_payload: dict[str, Any],
+) -> dict[str, Any]:
+    raw_payload["_style_kb_diagnostics"] = diagnostics.to_dict()
+    return {"request": request_metadata, "diagnostics": diagnostics.to_dict(), "response": raw_payload}
+
+
+def claims_result_from_cached_payload(cached_payload: dict[str, Any]) -> ClaimsAnalysisResult:
+    return _result_from_cached_payload(cached_payload)
+
+
+def claim_response_schema(max_claims_per_chunk: int) -> dict[str, Any]:
     return {
         "type": "object",
         "additionalProperties": False,

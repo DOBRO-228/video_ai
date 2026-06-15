@@ -6,6 +6,8 @@ Extract representative frame images for each detected scene. These frames are th
 
 ## How It Works
 
+When `pipeline.visual_enabled=false` (the default audio-only mode), the pipeline skips this stage by config. Audio-only jobs do not create `frames/frame_refs.jsonl`, frame JPGs, or a frame extraction report.
+
 The current implementation uses adaptive timestamp planning. Scenes up to 4 seconds use one middle keyframe, scenes up to 8 seconds use two keyframes, and longer scenes use at least `scene_detection.images_per_scene` keyframes. Long scenes increase the target count from `ceil(scene.duration / scene_detection.extra_sample_every_seconds)`, capped by `scene_detection.max_frames_per_scene`. Timestamps are distributed inside the scene, clamped inside scene bounds, and deduplicated.
 
 When `scene_detection.keyframe_edge_inset_seconds > 0` and the scene is long enough, planned timestamps are clamped to `[scene.start + inset, scene.end - inset]`. This keeps representative frames away from hard scene boundaries. If frame quality probing is enabled, probe timestamps are clamped to the same inset bounds so the `±probe_window_seconds` window cannot select a boundary frame that the planned timestamp avoided.
@@ -14,7 +16,7 @@ Each candidate frame is extracted from the proxy video with ffmpeg. When `scene_
 
 Intra-scene duplicate filtering then decides which selected frames are included in `FrameRef` records for stage 10. Dropped duplicate or quality-rejected files remain on disk when they are canonical selected frames and are recorded in `frames/frame_extraction_report.json` for dashboard review. The stage also writes `logs/09_extract_keyframes.jsonl`.
 
-Default duplicate filtering is intentionally moderately aggressive: `phash_max_distance=8` and `ssim_confirm=0.85`. This treats frames as duplicates when their perceptual hashes are close and SSIM confirms high structural similarity. On `qxXRWoSYf7I`, adaptive planning with `images_per_scene=4`, `extra_sample_every_seconds=4`, and `max_frames_per_scene=8` plans 322 candidate frames across 75 scenes before dedup, reducing the stage 10 frame evidence upper bound while preserving at least one frame per scene.
+Default duplicate filtering is intentionally less conservative: `phash_max_distance=10` and `ssim_confirm=0.82`. This treats frames as duplicates when their perceptual hashes are close and SSIM still confirms structural similarity. On `qxXRWoSYf7I`, adaptive planning with `images_per_scene=4`, `extra_sample_every_seconds=4`, and `max_frames_per_scene=8` plans 322 candidate frames across 75 scenes before dedup. Offline replay against the extracted frames estimates roughly 207 kept frames and 115 dedup drops with these thresholds, reducing the stage 10 frame evidence upper bound while preserving at least one frame per scene.
 
 The hardening contract from `PLAN_08_09_stages.md` is stricter than the current implementation. When changing this stage, move toward the target behavior below.
 
@@ -72,6 +74,7 @@ Planned skip validation should reject stale, partial, corrupt, or config/media/s
 - Planned timestamp planning should be separated from extraction so it can be unit tested without ffmpeg. Unit tests are not currently part of the requested implementation, so A/B and dashboard review are the verification path.
 - Adaptive sampling bounds candidate frames by scene duration; duplicate filtering then reduces near-identical frames before stage 10.
 - `frame_refs.jsonl` is the canonical visual evidence input for stage 10 and contains only frames that passed dedup.
+- Audio-only jobs must not require or synthesize empty frame refs.
 - Dropped duplicate and quality-rejected frames are diagnostic/review data only. They must not be treated as KB evidence in timeline, chunk, claim, or export paths.
 - Loosening duplicate filtering means increasing `phash_max_distance` and/or lowering `ssim_confirm`; this drops more near-duplicate frames before stage 10.
 - Frame counts adapt to scene duration: very short scenes use one middle frame; medium scenes use two frames; long scenes include extra samples but never exceed `max_frames_per_scene`.

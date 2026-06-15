@@ -255,6 +255,7 @@ class ChunkPlanItem(StrictModel):
 
 class ChunkPlan(StrictModel):
     video_id: str
+    visual_enabled: bool = True
     provider: str
     model: str
     retry_advisor_model: str

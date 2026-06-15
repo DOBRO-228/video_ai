@@ -263,6 +263,42 @@ class StateRepository:
             raise KeyError((job_id, stage_name))
         return stage
 
+    def mark_stage_skipped(
+        self,
+        *,
+        job_id: str,
+        stage_name: str,
+        input_files: list[str],
+        output_files: list[str],
+        remote_refs: dict[str, Any],
+        metrics: dict[str, Any],
+    ) -> StageStatus:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE stages
+                SET status = ?, finished_at = ?, input_files = ?, output_files = ?,
+                    remote_refs = ?, metrics = ?, error_code = ?, error_message = ?
+                WHERE job_id = ? AND stage_name = ?
+                """,
+                (
+                    StageState.SKIPPED.value,
+                    _to_iso(utc_now()),
+                    _json_dump(input_files),
+                    _json_dump(output_files),
+                    _json_dump(remote_refs),
+                    _json_dump(metrics),
+                    None,
+                    None,
+                    job_id,
+                    stage_name,
+                ),
+            )
+        stage = self.get_stage(job_id, stage_name)
+        if stage is None:
+            raise KeyError((job_id, stage_name))
+        return stage
+
     def mark_stage_failed(
         self,
         *,

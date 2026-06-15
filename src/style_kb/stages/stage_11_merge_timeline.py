@@ -4,7 +4,20 @@ import re
 
 from style_kb.clients.media import duration_seconds
 from style_kb.errors import MediaToolError, StageExecutionError
-from style_kb.models import Scene, SourceRef, SpeechSegment, SpeechToken, SpeechTurn, TimelineEvent, VideoInfo, VisualEvent
+from style_kb.models import (
+    ConfidenceLevel,
+    PresenterContext,
+    PresenterRelevance,
+    PresenterRole,
+    Scene,
+    SourceRef,
+    SpeechSegment,
+    SpeechToken,
+    SpeechTurn,
+    TimelineEvent,
+    VideoInfo,
+    VisualEvent,
+)
 from style_kb.pipeline.base import Stage, StageContext, StageResult
 from style_kb.stages.common import (
     load_scenes,
@@ -31,15 +44,21 @@ class Stage11MergeTimeline(Stage):
     ordinal = 11
 
     def input_files(self, context: StageContext) -> list:
-        return [
+        inputs = [
             context.paths.metadata_video_info,
             context.paths.stt_speech_tokens,
             context.paths.stt_speech_segments,
-            context.paths.visual_events_jsonl,
-            context.paths.scenes_jsonl,
             context.paths.downloads_audio_ffprobe,
-            context.paths.downloads_video_ffprobe,
         ]
+        if context.config.pipeline.visual_enabled:
+            inputs.extend(
+                [
+                    context.paths.visual_events_jsonl,
+                    context.paths.scenes_jsonl,
+                    context.paths.downloads_video_ffprobe,
+                ]
+            )
+        return inputs
 
     def output_files(self, context: StageContext) -> list:
         return [context.paths.timeline_events_jsonl, context.paths.timeline_media_durations]
@@ -68,8 +87,8 @@ class Stage11MergeTimeline(Stage):
 
     def run(self, context: StageContext) -> StageResult:
         media_durations = _build_media_durations(context)
-        scenes = load_scenes(context.paths.scenes_jsonl)
-        visual_events = load_visual_events(context.paths.visual_events_jsonl)
+        scenes = load_scenes(context.paths.scenes_jsonl) if context.config.pipeline.visual_enabled else []
+        visual_events = load_visual_events(context.paths.visual_events_jsonl) if context.config.pipeline.visual_enabled else []
         speech_segments = load_speech_segments(context.paths.stt_speech_segments)
         speech_tokens = load_speech_tokens(context.paths.stt_speech_tokens)
         append_stage_summary(
@@ -78,6 +97,7 @@ class Stage11MergeTimeline(Stage):
             "timeline-merge-preflight",
             {
                 "media_durations": media_durations,
+                "visual_enabled": context.config.pipeline.visual_enabled,
                 "duration_mismatch_limit_seconds": _DURATION_MISMATCH_LIMIT_SECONDS,
                 "scenes_count": len(scenes),
                 "visual_events_count": len(visual_events),
@@ -96,6 +116,7 @@ class Stage11MergeTimeline(Stage):
             "timeline-merge-summary",
             {
                 "media_durations": media_durations,
+                "visual_enabled": context.config.pipeline.visual_enabled,
                 "duration_mismatch_limit_seconds": _DURATION_MISMATCH_LIMIT_SECONDS,
                 "scenes_count": len(scenes),
                 "visual_events_count": len(visual_events),
@@ -111,6 +132,7 @@ class Stage11MergeTimeline(Stage):
             metrics={
                 "timeline_events_count": len(timeline_events),
                 "audio_video_duration_abs": media_durations["audio_video_duration_abs"],
+                "visual_enabled": context.config.pipeline.visual_enabled,
                 "scenes_count": len(scenes),
                 "visual_events_count": len(visual_events),
                 "speech_segments_count": len(speech_segments),
@@ -130,6 +152,14 @@ def _build_timeline_events(context: StageContext, *, media_durations: dict) -> l
 
     speech_tokens = load_speech_tokens(context.paths.stt_speech_tokens)
     speech_segments = load_speech_segments(context.paths.stt_speech_segments)
+    if not context.config.pipeline.visual_enabled:
+        return _build_audio_timeline_events(
+            context=context,
+            video_info=video_info,
+            speech_segments=speech_segments,
+            speech_tokens=speech_tokens,
+        )
+
     visual_events = {event.scene_id: event for event in load_visual_events(context.paths.visual_events_jsonl)}
     scenes = load_scenes(context.paths.scenes_jsonl)
     token_positions = {token.token_index: index for index, token in enumerate(speech_tokens)}
@@ -162,7 +192,11 @@ def _build_timeline_events(context: StageContext, *, media_durations: dict) -> l
 def _build_media_durations(context: StageContext) -> dict:
     video_info = load_video_info(context.paths.metadata_video_info)
     audio_duration = duration_seconds(read_payload(context.paths.downloads_audio_ffprobe))
-    video_duration = duration_seconds(read_payload(context.paths.downloads_video_ffprobe))
+    video_duration = (
+        duration_seconds(read_payload(context.paths.downloads_video_ffprobe))
+        if context.config.pipeline.visual_enabled
+        else video_info.duration
+    )
     audio_video_duration_abs = round(abs(audio_duration - video_duration), 4)
     if audio_video_duration_abs > _DURATION_MISMATCH_LIMIT_SECONDS:
         raise MediaToolError("audio/video duration mismatch exceeds 1.0s", error_code="audio_video_duration_mismatch")
@@ -186,7 +220,9 @@ def _missing_visual_event_details(scene_id: str, scenes: list[Scene], visual_eve
 
 
 def _expected_media_durations(context: StageContext, existing_media_durations: dict) -> dict:
-    if context.paths.downloads_audio_ffprobe.exists() and context.paths.downloads_video_ffprobe.exists():
+    if context.config.pipeline.visual_enabled and context.paths.downloads_audio_ffprobe.exists() and context.paths.downloads_video_ffprobe.exists():
+        return _build_media_durations(context)
+    if not context.config.pipeline.visual_enabled and context.paths.downloads_audio_ffprobe.exists():
         return _build_media_durations(context)
     return existing_media_durations
 
@@ -267,6 +303,84 @@ def _build_scene_timeline_event(
         scene_id=scene.scene_id,
         speech_segment_ids=scene_segment_ids,
         source_refs=source_refs,
+    )
+
+
+def _build_audio_timeline_events(
+    *,
+    context: StageContext,
+    video_info: VideoInfo,
+    speech_segments: list[SpeechSegment],
+    speech_tokens: list[SpeechToken],
+) -> list[TimelineEvent]:
+    token_positions = {token.token_index: index for index, token in enumerate(speech_tokens)}
+    return [
+        _build_audio_timeline_event(
+            context=context,
+            video_info=video_info,
+            segment=segment,
+            speech_tokens=speech_tokens,
+            token_positions=token_positions,
+        )
+        for segment in speech_segments
+    ]
+
+
+def _build_audio_timeline_event(
+    *,
+    context: StageContext,
+    video_info: VideoInfo,
+    segment: SpeechSegment,
+    speech_tokens: list[SpeechToken],
+    token_positions: dict[int, int],
+) -> TimelineEvent:
+    start_position = token_positions.get(segment.token_start_index)
+    end_position = token_positions.get(segment.token_end_index)
+    if start_position is None or end_position is None or start_position > end_position:
+        raise StageExecutionError(
+            f"invalid token range for segment {segment.segment_id}",
+            error_code="timeline_segment_token_range_invalid",
+        )
+    segment_tokens = speech_tokens[start_position : end_position + 1]
+    segment_ids = [segment.segment_id] * len(segment_tokens)
+    source_ref = youtube_source_ref(
+        context.job.video_id,
+        segment.start,
+        segment.end,
+        title=video_info.title,
+        modality="audio",
+    )
+    return TimelineEvent(
+        event_id=timeline_event_id(context.job.video_id, segment.start, segment.end),
+        video_id=context.job.video_id,
+        title=video_info.title,
+        channel=video_info.channel,
+        presenter_context=_empty_presenter_context(),
+        start=segment.start,
+        end=segment.end,
+        timestamp_url=build_timestamp_url(context.job.video_id, segment.start),
+        speech_text=_join_tokens(segment_tokens) or segment.text,
+        speech_turns=_build_speech_turns(context.job.video_id, segment_tokens, segment_ids),
+        visual_summary="",
+        on_screen_text=[],
+        items=[],
+        topics=[],
+        scene_id=segment.segment_id,
+        speech_segment_ids=[segment.segment_id],
+        source_refs=[source_ref],
+    )
+
+
+def _empty_presenter_context() -> PresenterContext:
+    return PresenterContext(
+        present=False,
+        role=PresenterRole.NONE,
+        is_recurring=False,
+        relevance=PresenterRelevance.NONE,
+        baseline_summary="",
+        scene_deltas=[],
+        narrative_brief="",
+        confidence=ConfidenceLevel.LOW,
     )
 
 

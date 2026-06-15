@@ -6,6 +6,8 @@ Detect visual scene boundaries in the proxy video and produce the `Scene` object
 
 ## How It Works
 
+When `pipeline.visual_enabled=false` (the default audio-only mode), the pipeline skips this stage by config. Audio-only timeline events are built from speech segments in stage 11, so `scenes/scenes.jsonl` is not required.
+
 The current implementation opens the proxy video with PySceneDetect and uses `AdaptiveDetector`. The configured `scene_detection.min_scene_len_seconds` is converted to frames using ffprobe FPS. Only `scene_detection.detector: adaptive` is supported; other detector values fail fast.
 
 Detected scenes are normalized into frame-boundary ranges. If PySceneDetect returns no scenes, the stage emits bounded fallback ranges using `scene_detection.fallback_scene_seconds`.
@@ -54,6 +56,7 @@ This intentionally invalidates older jobs that only have `scenes.jsonl`. Boundar
 - Planned scene validation should stay lightweight but strict enough to catch corrupt/stale artifacts: non-empty scenes, matching `video_id`, contiguous indexes, `start < end`, sane duration, sorted ranges, no obvious overlaps, and coverage close to proxy duration.
 - Fallback splitting improves timeline/chunk granularity but can increase stage 10 provider requests. Pair it with stage 09 duplicate filtering and, when needed, conservative stage 10 duplicate visual-analysis reuse.
 - Scene timestamps drive keyframes, visual events, timeline events, and chunk grouping.
+- In audio-only mode, speech segment timestamps drive timeline and chunk grounding instead.
 - Scene ids are index-based. Palette boundary adjustment preserves the number of scenes but can change start/end timestamps, so downstream stages must read current reports/refs rather than directory glob leftovers.
 - Do not introduce embeddings, vector stores, CLIP/open-clip/torch, or heavy ML dependencies for this MVP work.
 

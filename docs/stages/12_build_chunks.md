@@ -6,11 +6,15 @@ Create RAG-oriented multimodal chunks from semantic speech segments plus timelin
 
 ## How It Works
 
-The stage uses an OpenAI structured-output chunk planner. The model receives compact multimodal planning input:
+The stage uses an OpenAI structured-output chunk planner. The model receives compact planning input:
 
 - semantic `SpeechSegment` objects as the primary units;
 - overlapping `TimelineEvent` ids;
-- compact scrubbed visual hints such as style evidence text, visual summary, on-screen text, topics, items, and presenter relevance.
+- when `pipeline.visual_enabled=true`: compact scrubbed visual hints such as style evidence text, visual summary, on-screen text, topics, items, and presenter relevance.
+
+OpenAI planner and retry-advisor requests use the configured prompt-cache settings. The stage passes stable `prompt_cache_key` values for shared planner/retry-advisor prefixes; provider-reported cached token counts are diagnostic only and do not affect validation or skip behavior.
+
+When `pipeline.visual_enabled=false`, planner input sets `visual_enabled=false` and sends no visual hints. Final chunks have empty `visual_text`, empty `on_screen_text`, no visual entities, `modality=["audio"]` when speech is present, and audio/YouTube source refs only.
 
 The model returns only a chunk plan: contiguous `speech_segment_ids`, a short title, boundary reason, topics, and notes. Python then validates the plan and materializes final `Chunk` objects deterministically.
 
@@ -30,6 +34,7 @@ Each planner window has a raw cache keyed by prompt/config/window/input fingerpr
 - `src/style_kb/prompts/chunk_plan_ru.txt`
 - `src/style_kb/prompts/chunk_plan_retry_advisor_ru.txt`
 - `chunking.*` config values
+- `openai.prompt_cache.*` config values
 
 ## Outputs
 
@@ -55,8 +60,9 @@ The stage can be skipped only when `chunk_plan.json` matches current config/prom
 - Planner metadata limits such as title length, boundary reason length, notes length, topic length, and topic count come from `chunking.*` config values.
 - Skip validation materializes expected chunks once and compares that deterministic result with `chunks.jsonl`.
 - Chunk time ranges are based on speech segment ranges, not full visual scene boundaries.
-- Visual evidence is attached by overlap, or by nearby distance within `visual_attach_seconds` when needed.
+- Visual evidence is attached by overlap, or by nearby distance within `visual_attach_seconds` when visuals are enabled.
 - Planner input and final chunks must use only scrubbed style evidence. Diagnostic fields such as stage 10 `presentation_context` and raw scene outputs are never planner evidence.
+- Audio-only chunk plans include `visual_enabled=false` in plan/cache metadata so old visual-informed plans are not reused.
 - Offscreen questions should stay with nearby host answers when they form one QA exchange.
 - A QA split that cannot be merged without exceeding hard chunk limits is allowed only with a warning in `chunk_plan_warnings.json`, chunk plan notes, stage log, and console progress.
 - `title`, `channel`, and canonical video URL come from `metadata/video_info.json`, not from a best-effort timeline fallback.

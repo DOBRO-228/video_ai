@@ -244,9 +244,24 @@ button {
   background: var(--surface-2);
 }
 
+.job-item.human-reviewed {
+  border-color: rgba(114, 212, 129, 0.62);
+  background: rgba(27, 51, 34, 0.58);
+  box-shadow: inset 4px 0 0 var(--ok);
+}
+
+.job-item.human-reviewed:hover {
+  background: var(--ok-weak);
+}
+
 .job-item.active {
   border-color: var(--teal);
   background: var(--teal-weak);
+}
+
+.job-item.human-reviewed.active {
+  border-color: var(--ok);
+  background: var(--ok-weak);
 }
 
 .job-title {
@@ -270,8 +285,8 @@ button {
   border-bottom: 1px solid var(--line);
   padding: 16px 18px 14px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 16px;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
   align-items: start;
 }
 
@@ -291,7 +306,34 @@ button {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  justify-content: flex-end;
+  justify-content: flex-start;
+}
+
+.review-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 32px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  padding: 5px 9px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+  user-select: none;
+}
+
+.review-toggle input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--ok);
+}
+
+.review-toggle.reviewed {
+  border-color: var(--ok);
+  background: var(--ok-weak);
+  color: var(--ok);
 }
 
 .tabs {
@@ -386,6 +428,17 @@ button {
 .button:hover {
   border-color: var(--teal);
   color: var(--teal);
+}
+
+.button-danger {
+  border-color: var(--danger);
+  background: var(--danger-weak);
+  color: var(--danger);
+}
+
+.button-danger:hover {
+  border-color: var(--danger);
+  color: var(--text);
 }
 
 .button-small {
@@ -1177,6 +1230,7 @@ document.addEventListener('DOMContentLoaded', () => {
   els.refreshBtn.addEventListener('click', () => loadSummary({ keepSelection: true }));
   els.jobSearch.addEventListener('input', renderJobList);
   els.jobList.addEventListener('click', onJobListClick);
+  els.jobHeader.addEventListener('change', onJobHeaderChange);
   els.tabs.addEventListener('click', onTabClick);
   els.content.addEventListener('click', onContentClick);
   els.content.addEventListener('input', onContentInput);
@@ -1353,10 +1407,11 @@ function renderJobList() {
   }
 
   els.jobList.innerHTML = jobs.map((job) => `
-    <button class="job-item ${job.job_id === state.selectedJobId ? 'active' : ''}" type="button" data-job-id="${attr(job.job_id)}">
+    <button class="job-item ${job.job_id === state.selectedJobId ? 'active' : ''} ${job.human_reviewed ? 'human-reviewed' : ''}" type="button" data-job-id="${attr(job.job_id)}">
       <span class="job-title">${escapeHtml(job.title || job.job_id)}</span>
       <span class="job-meta">
         ${statusPill(job.status)}
+        ${job.human_reviewed ? statusPill('проверено', 'status ok') : ''}
         <span>${escapeHtml(job.channel || 'channel unknown')}</span>
         <span>${formatDuration(job.duration)}</span>
         <span>${escapeHtml(job.job_id)}</span>
@@ -1379,6 +1434,12 @@ function onJobListClick(event) {
   const item = event.target.closest('[data-job-id]');
   if (!item) return;
   selectJob(item.dataset.jobId);
+}
+
+function onJobHeaderChange(event) {
+  const control = event.target.closest('[data-action="toggle-human-review"]');
+  if (!control) return;
+  updateHumanReview(control.checked);
 }
 
 function onTabClick(event) {
@@ -1404,6 +1465,7 @@ function renderJobHeader() {
   const counts = state.job.derived?.counts || {};
   const title = video.title || job.title || job.job_id;
   const url = video.url || job.url || '';
+  const humanReviewed = Boolean(job.human_reviewed);
   els.jobHeader.innerHTML = `
     <div>
       <h2>${escapeHtml(title)}</h2>
@@ -1416,6 +1478,10 @@ function renderJobHeader() {
       <span class="chip rust">${num(counts.chunks)} chunks</span>
       <span class="chip indigo">${num(counts.style_claims)} claims</span>
       <span class="chip gold">${num(counts.frame_refs)} frames</span>
+      <label class="review-toggle ${humanReviewed ? 'reviewed' : ''}">
+        <input type="checkbox" data-action="toggle-human-review" ${humanReviewed ? 'checked' : ''}>
+        <span>Проверено человеком</span>
+      </label>
     </div>
   `;
 }
@@ -1673,6 +1739,7 @@ function claimCard(claim) {
           ${statusPill(claim.claim_type, 'status unknown')}
           ${statusPill(claim.confidence)}
           <button class="button button-small" type="button" data-action="edit-claim" data-claim-id="${attr(claim.claim_id)}">Править Claim</button>
+          <button class="button button-small button-danger" type="button" data-action="delete-claim" data-claim-id="${attr(claim.claim_id)}">Удалить</button>
         </div>
       </div>
       ${itemIssuesBlock(issueRefs)}
@@ -1975,7 +2042,7 @@ function onContentClick(event) {
   renderInspector();
 }
 
-function handleActionClick(action) {
+async function handleActionClick(action) {
   if (action.dataset.action === 'edit-claim') {
     state.selection = { kind: 'claim', id: action.dataset.claimId };
     state.editingClaimId = action.dataset.claimId;
@@ -1985,6 +2052,73 @@ function handleActionClick(action) {
   if (action.dataset.action === 'cancel-claim-edit') {
     state.editingClaimId = null;
     renderInspector();
+    return;
+  }
+  if (action.dataset.action === 'delete-claim') {
+    await deleteClaim(action.dataset.claimId);
+  }
+}
+
+async function updateHumanReview(humanReviewed) {
+  if (!state.selectedJobId) return;
+  const previous = Boolean(state.job?.job?.human_reviewed);
+  try {
+    const response = await fetch(`/api/jobs/${encodeURIComponent(state.selectedJobId)}/human-review`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ human_reviewed: Boolean(humanReviewed) })
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.message || payload.error || `human review update failed: ${response.status}`);
+    state.job = payload;
+    state.index = buildIndex(state.job);
+    updateSummaryJob(payload.job || {});
+    renderJobList();
+    renderJobHeader();
+    renderTab();
+    renderInspector();
+    showToast(humanReviewed ? 'Job отмечена как проверенная' : 'Отметка проверки снята');
+  } catch (error) {
+    if (state.job?.job) state.job.job.human_reviewed = previous;
+    renderJobHeader();
+    showToast(error.message);
+  }
+}
+
+function updateSummaryJob(job) {
+  if (!state.summary?.jobs || !job.job_id) return;
+  const index = state.summary.jobs.findIndex((item) => item.job_id === job.job_id);
+  if (index >= 0) {
+    state.summary.jobs[index] = { ...state.summary.jobs[index], ...job };
+  }
+}
+
+async function deleteClaim(claimId) {
+  if (!claimId || !state.selectedJobId) return;
+  const claim = state.index.claimsById.get(claimId);
+  const label = claim?.subject || claim?.claim || claimId;
+  const confirmed = window.confirm(`Удалить Claim "${truncate(label, 90)}" из текущего набора?`);
+  if (!confirmed) return;
+  try {
+    const response = await fetch(`/api/jobs/${encodeURIComponent(state.selectedJobId)}/claims/${encodeURIComponent(claimId)}`, {
+      method: 'DELETE'
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.message || payload.error || `claim delete failed: ${response.status}`);
+    state.job = payload;
+    state.index = buildIndex(state.job);
+    if (state.selection?.kind === 'claim' && state.selection.id === claimId) {
+      state.selection = null;
+    }
+    if (state.editingClaimId === claimId) {
+      state.editingClaimId = null;
+    }
+    renderJobHeader();
+    renderTab();
+    renderInspector();
+    showToast('Claim удалён из текущего набора');
+  } catch (error) {
+    showToast(error.message);
   }
 }
 
@@ -2196,6 +2330,7 @@ function claimInspectorSummary(item) {
       ${statusPill(item.claim_type, 'status unknown')}
       ${statusPill(item.confidence)}
       ${isEditing ? '' : `<button class="button button-small" type="button" data-action="edit-claim" data-claim-id="${attr(item.claim_id)}">Править Claim</button>`}
+      <button class="button button-small button-danger" type="button" data-action="delete-claim" data-claim-id="${attr(item.claim_id)}">Удалить</button>
     </div>
     ${isEditing ? claimEditForm(item) : claimReadSummary(item, original, history)}
   `;
@@ -2237,6 +2372,7 @@ function claimEditForm(claim) {
       ${textareaField('evidence', 'Evidence', joinLines(claim.evidence), 5)}
       ${textareaField('topics', 'Topics', joinLines(claim.topics), 4)}
       <div class="form-actions">
+        <button class="button button-small button-danger" type="button" data-action="delete-claim" data-claim-id="${attr(claim.claim_id)}">Удалить</button>
         <button class="button button-small" type="button" data-action="cancel-claim-edit">Отмена</button>
         <button class="button button-small" type="submit">Сохранить</button>
       </div>

@@ -5,7 +5,14 @@ from pathlib import Path
 
 from style_kb.export.obsidian import render_obsidian_export
 from style_kb.pipeline.base import Stage, StageContext, StageResult
-from style_kb.stages.common import load_chunks, load_frame_refs, load_style_claims, load_timeline_events, load_video_info
+from style_kb.stages.common import (
+    effective_style_claims_path,
+    load_chunks,
+    load_effective_style_claims,
+    load_frame_refs,
+    load_timeline_events,
+    load_video_info,
+)
 
 
 class Stage15ExportObsidian(Stage):
@@ -13,13 +20,15 @@ class Stage15ExportObsidian(Stage):
     ordinal = 15
 
     def input_files(self, context: StageContext) -> list:
-        return [
+        inputs = [
             context.paths.metadata_video_info,
             context.paths.timeline_events_jsonl,
             context.paths.chunks_jsonl,
-            context.paths.style_claims_jsonl,
-            context.paths.frame_refs_jsonl,
+            effective_style_claims_path(context),
         ]
+        if context.config.pipeline.visual_enabled:
+            inputs.append(context.paths.frame_refs_jsonl)
+        return inputs
 
     def output_files(self, context: StageContext) -> list:
         outputs = [context.paths.obsidian_index]
@@ -40,12 +49,12 @@ class Stage15ExportObsidian(Stage):
         video = load_video_info(context.paths.metadata_video_info)
         timeline_events = load_timeline_events(context.paths.timeline_events_jsonl)
         chunks = load_chunks(context.paths.chunks_jsonl)
-        style_claims = load_style_claims(context.paths.style_claims_jsonl)
-        frame_refs = load_frame_refs(context.paths.frame_refs_jsonl)
+        style_claims = load_effective_style_claims(context)
+        frame_refs = load_frame_refs(context.paths.frame_refs_jsonl) if context.config.pipeline.visual_enabled else []
         frame_map: dict[str, list[str]] = defaultdict(list)
         video_note_path = context.paths.obsidian_video_note(context.job.video_id)
 
-        if context.config.project.keep_frames:
+        if context.config.pipeline.visual_enabled and context.config.project.keep_frames:
             for frame in frame_refs:
                 frame_path = context.paths.job_dir / frame.path
                 relative_link = frame_path.relative_to(context.paths.job_dir).as_posix()

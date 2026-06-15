@@ -6,15 +6,17 @@ Describe visual content for every scene and produce structured `VisualEvent` obj
 
 ## How It Works
 
+When `pipeline.visual_enabled=false` (the default audio-only mode), the pipeline skips this stage by config. No presenter profile, raw vision cache, or `visual/visual_events.jsonl` is required, and downstream stages must not treat stale visual artifacts as current evidence.
+
 The stage loads scenes, frame refs, and nearby speech segments. It first builds or reuses a presenter profile from representative frames when `vision.presenter_bootstrap_enabled=true`. The scene prompt is then composed from `visual_menswear_ru.txt` plus the serialized presenter profile.
 
-Scene analysis runs through the configured vision provider client with structured JSON output. The current default is `vision.provider=gemini`, `vision.model=gemini-2.5-flash`, `vision.media_resolution=high`, `vision.thinking_level=null`, and `vision.thinking_budget=8192`. OpenAI remains implemented and can be re-enabled in `default.yaml` as a rollback path. There is no automatic provider fallback. A provider/API error fails the stage and the job should be resumed after fixing the environment or provider issue.
+Scene analysis runs through the configured vision provider client with structured JSON output. The current default is `vision.provider=gemini`, `vision.model=gemini-3-flash-preview`, `vision.media_resolution=high`, `vision.thinking_level=medium`, and `vision.thinking_budget=null`. OpenAI remains implemented and can be re-enabled in `default.yaml` as a rollback path. There is no automatic provider fallback. A provider/API error fails the stage and the job should be resumed after fixing the environment or provider issue.
 
 Requests are parallelized with `vision.batch_size`, with a provider-specific cap of 2 concurrent scene requests for Gemini. Each request receives only the selected still frames for that scene plus a structured transcript context JSON: `previous_context`, `current_scene_context`, and `next_context`. `current_scene_context` contains speech segments that overlap the scene; adjacent context is boundary orientation only and must not be treated as visual evidence. Raw scene responses are cached under `visual/raw/` and invalidated when prompt inputs, `presenter_profile.json`, provider, model, media/detail settings, thinking level/budget, or output schema change.
 
 Gemini provider requests use exponential backoff for retryable provider failures such as 429 and 5xx responses. Retries are logged to the stage log and pipeline log, and the next retry delay is printed to console progress output.
 
-Token usage is parsed by provider and model. OpenAI vision responses use the OpenAI Responses API `usage` fields. The active Gemini default, `gemini-2.5-flash`, uses Gemini `usage_metadata`; when Gemini omits `total_token_count`, stage metrics and console progress use the sum of known reported counts such as candidate and thinking tokens. If Gemini omits `prompt_token_count`, `input_tokens` remains `0` rather than being guessed.
+Token usage is parsed by provider and model. OpenAI vision responses use the OpenAI Responses API `usage` fields. The active Gemini default, `gemini-3-flash-preview`, uses Gemini `usage_metadata`; when Gemini omits `total_token_count`, stage metrics and console progress use the sum of known reported counts such as candidate and thinking tokens. If Gemini omits `prompt_token_count`, `input_tokens` remains `0` rather than being guessed.
 
 Stage 08/09 changes can alter scene boundaries, frame counts, selected timestamps, and visual signatures. Such changes should intentionally invalidate stale stage 10 raw/final artifacts when request shape or prompt evidence changes.
 
@@ -63,6 +65,7 @@ The stage can be skipped when `visual_events.jsonl` and `presenter_profile.json`
 - Recurring presenter baseline should not pollute scene-specific summary/items/topics for any presenter relevance, including `primary_example`, but this is a quality signal rather than a stage-failing condition.
 - `items` and `style_topics` must stay useful for menswear knowledge retrieval; technical presentation labels must not reach final timeline or chunk topics/entities.
 - `visual/raw/*` files are diagnostic/cache artifacts. They are retained for reuse and post-mortem analysis, but must not be imported into a future KB or read as style knowledge by agents.
+- Audio-only jobs should not create placeholder visual events; absence of this stage's artifacts is expected when `pipeline.visual_enabled=false`.
 - Baseline leakage summary metrics must be logged in `logs/10_describe_visuals.log`; technical presentation leakage retries and accepted warnings must be logged with scene id, fields, matched markers, and raw attempt paths.
 - Planned duplicate visual-analysis reuse for fallback/static scene windows must be conservative. Reuse only when visual signatures/frame sets are near-identical and transcript context is not materially different. Materialize separate `VisualEvent` objects for each scene, preserving each scene's own `scene_id`, time range, timestamp URL, and source refs.
 - If duplicate visual-analysis reuse is added, metrics must distinguish provider requests from materialized visual events.

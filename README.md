@@ -15,6 +15,13 @@ style-kb ingest "https://www.youtube.com/watch?v=VIDEO_ID" 9
 style-kb resume VIDEO_ID 9
 ```
 
+To use the OpenAI Batch API for eligible claim-extraction requests in the current run, pass `--batch`:
+
+```bash
+style-kb ingest "https://www.youtube.com/watch?v=VIDEO_ID" --batch
+style-kb resume VIDEO_ID --batch
+```
+
 API keys are loaded from `.env` or the environment:
 
 - `SONIOX_API_KEY` for speech transcription.

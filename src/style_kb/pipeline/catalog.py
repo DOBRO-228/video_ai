@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from style_kb.config.models import AppConfig
 from style_kb.pipeline.base import Stage
 from style_kb.stages.stage_01_metadata import Stage01Metadata
 from style_kb.stages.stage_02_download_audio import Stage02DownloadAudio
@@ -18,6 +19,13 @@ from style_kb.stages.stage_14_export_jsonl import Stage14ExportJsonl
 from style_kb.stages.stage_15_export_obsidian import Stage15ExportObsidian
 from style_kb.stages.stage_16_quality_report import Stage16QualityReport
 from style_kb.stages.stage_17_cleanup import Stage17Cleanup
+
+VISUAL_STAGE_NAMES = {
+    "03_download_video_proxy",
+    "08_detect_scenes",
+    "09_extract_keyframes",
+    "10_describe_visuals",
+}
 
 STAGES: list[type[Stage]] = [
     Stage01Metadata,
@@ -38,3 +46,7 @@ STAGES: list[type[Stage]] = [
     Stage16QualityReport,
     Stage17Cleanup,
 ]
+
+
+def stage_disabled_by_config(stage_name: str, config: AppConfig) -> bool:
+    return stage_name in VISUAL_STAGE_NAMES and not config.pipeline.visual_enabled

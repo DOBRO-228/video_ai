@@ -44,6 +44,8 @@ SEGMENT_RETRY_ADVISOR_RESPONSE_SCHEMA: dict[str, Any] = {
     "required": ["error_summary", "repair_instruction", "hard_rules"],
 }
 
+_REQUEST_METADATA_KEY = "_style_kb_request"
+
 
 class OpenAISegmenterClient:
     def __init__(
@@ -51,6 +53,7 @@ class OpenAISegmenterClient:
         api_key: str | None,
         *,
         model: str,
+        reasoning_effort: str | None = None,
         retry_policy: RetryPolicy | None = None,
         on_retry: OnRetry | None = None,
     ) -> None:
@@ -61,6 +64,7 @@ class OpenAISegmenterClient:
             )
         self.client = OpenAI(api_key=api_key, max_retries=0)
         self.model = model
+        self.reasoning_effort = reasoning_effort
         self.retry_policy = retry_policy or RetryPolicy()
         self.on_retry = on_retry
 
@@ -72,6 +76,8 @@ class OpenAISegmenterClient:
         units_payload: list[dict[str, Any]],
         constraints_payload: dict[str, Any],
         raw_output_path: Path,
+        prompt_cache_key: str | None = None,
+        prompt_cache_retention: str | None = None,
     ) -> dict[str, Any]:
         request_text = "\n\n".join(
             [
@@ -84,20 +90,27 @@ class OpenAISegmenterClient:
                 json.dumps(units_payload, ensure_ascii=False, indent=2),
             ]
         )
+        body: dict[str, Any] = {
+            "model": self.model,
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": request_text}]}],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "semantic_speech_segments",
+                    "strict": True,
+                    "schema": SEGMENT_RESPONSE_SCHEMA,
+                }
+            },
+        }
+        if prompt_cache_key:
+            body["prompt_cache_key"] = prompt_cache_key
+        if prompt_cache_retention:
+            body["prompt_cache_retention"] = prompt_cache_retention
+        if self.reasoning_effort:
+            body["reasoning"] = {"effort": self.reasoning_effort}
         try:
             response = call_with_retry(
-                lambda: self.client.responses.create(
-                    model=self.model,
-                    input=[{"role": "user", "content": [{"type": "input_text", "text": request_text}]}],
-                    text={
-                        "format": {
-                            "type": "json_schema",
-                            "name": "semantic_speech_segments",
-                            "strict": True,
-                            "schema": SEGMENT_RESPONSE_SCHEMA,
-                        }
-                    },
-                ),
+                lambda: self.client.responses.create(**body),
                 policy=self.retry_policy,
                 on_retry=self.on_retry,
             )
@@ -105,6 +118,12 @@ class OpenAISegmenterClient:
             raise ProviderError(str(error), error_code="openai_segmenter_failed", details=str(error)) from error
 
         raw_payload = response.model_dump(mode="json")
+        raw_payload[_REQUEST_METADATA_KEY] = {
+            "model": self.model,
+            "reasoning_effort": self.reasoning_effort,
+            "prompt_cache_key": prompt_cache_key,
+            "prompt_cache_retention": prompt_cache_retention,
+        }
         write_json_atomic(raw_output_path, raw_payload)
 
         try:
@@ -122,6 +141,8 @@ class OpenAISegmenterClient:
         system_prompt: str,
         repair_payload: dict[str, Any],
         raw_output_path: Path,
+        prompt_cache_key: str | None = None,
+        prompt_cache_retention: str | None = None,
     ) -> dict[str, Any]:
         request_text = "\n\n".join(
             [
@@ -130,20 +151,27 @@ class OpenAISegmenterClient:
                 json.dumps(repair_payload, ensure_ascii=False, indent=2, sort_keys=True),
             ]
         )
+        body: dict[str, Any] = {
+            "model": self.model,
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": request_text}]}],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "semantic_speech_retry_advice",
+                    "strict": True,
+                    "schema": SEGMENT_RETRY_ADVISOR_RESPONSE_SCHEMA,
+                }
+            },
+        }
+        if prompt_cache_key:
+            body["prompt_cache_key"] = prompt_cache_key
+        if prompt_cache_retention:
+            body["prompt_cache_retention"] = prompt_cache_retention
+        if self.reasoning_effort:
+            body["reasoning"] = {"effort": self.reasoning_effort}
         try:
             response = call_with_retry(
-                lambda: self.client.responses.create(
-                    model=self.model,
-                    input=[{"role": "user", "content": [{"type": "input_text", "text": request_text}]}],
-                    text={
-                        "format": {
-                            "type": "json_schema",
-                            "name": "semantic_speech_retry_advice",
-                            "strict": True,
-                            "schema": SEGMENT_RETRY_ADVISOR_RESPONSE_SCHEMA,
-                        }
-                    },
-                ),
+                lambda: self.client.responses.create(**body),
                 policy=self.retry_policy,
                 on_retry=self.on_retry,
             )
@@ -155,10 +183,16 @@ class OpenAISegmenterClient:
             ) from error
 
         raw_payload = response.model_dump(mode="json")
+        request_metadata = {
+            "model": self.model,
+            "reasoning_effort": self.reasoning_effort,
+            "prompt_cache_key": prompt_cache_key,
+            "prompt_cache_retention": prompt_cache_retention,
+        }
         write_json_atomic(
             raw_output_path,
             {
-                "request": repair_payload,
+                "request": {**repair_payload, _REQUEST_METADATA_KEY: request_metadata},
                 "response": raw_payload,
             },
         )

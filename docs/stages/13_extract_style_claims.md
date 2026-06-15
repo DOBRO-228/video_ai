@@ -6,7 +6,9 @@ Extract canonical structured style knowledge from deterministic chunks. This sta
 
 ## How It Works
 
-The stage sends one chunk at a time to OpenAI structured output using `style_claims_ru.txt`. Each response may contain `0..style_claims.max_claims_per_chunk` claims. Raw responses are cached per chunk under `claims/raw/` with a request fingerprint that includes the chunk payload, prompt hash, model, retry count, and claim settings.
+The stage sends chunks to OpenAI structured output using `style_claims_ru.txt`. Each response may contain `0..style_claims.max_claims_per_chunk` claims. Raw responses are cached per chunk under `claims/raw/` with a request fingerprint that includes the chunk payload, prompt hash, model, retry count, prompt-cache settings, and claim settings.
+
+By default, cache-miss chunks are requested synchronously. When the current CLI run uses `--batch`, first-attempt cache-miss extraction requests are submitted through the OpenAI Batch API with endpoint `/v1/responses`. The batch input, manifest, output, and error files are durable artifacts under `claims/raw/`. If a batch response is missing, has an API error, or fails deterministic claim validation, that raw response is preserved as an attempt artifact and the chunk falls back to the existing synchronous retry-advisor/retry flow. Batch is a transport/cost mode only; it is not part of semantic skip validation.
 
 Provider output is validated before it can become a cache hit or a final artifact. If a chunk response contains service metadata as style knowledge, technical identifiers in user-facing fields, invalid enums, missing required text, malformed JSON, or too many claims, the stage keeps the attempt raw output at `claims/raw/{chunk_id}_attempt_{attempt}.json`, logs the validation error, records it in `claims/style_claims_errors.json`, emits progress, and retries up to `style_claims.max_retries`. A first successful attempt is written to the canonical per-chunk raw cache only; an identical successful attempt file is removed to avoid duplicate raw artifacts.
 
@@ -26,6 +28,8 @@ When `style_claims.curate.enabled` is true, a single post-deduplication curation
 - `src/style_kb/prompts/style_claims_retry_advisor_ru.txt`
 - `src/style_kb/prompts/style_claims_curate_ru.txt` when curation is enabled
 - `style_claims.*` config values
+- `openai.prompt_cache.*` and `openai.batch.*` config values
+- current run `--batch` flag
 - `OPENAI_API_KEY`
 
 ## Outputs
@@ -37,6 +41,10 @@ When `style_claims.curate.enabled` is true, a single post-deduplication curation
 - `claims/raw/curate.json` when curation is enabled
 - `claims/raw/{chunk_id}_attempt_{attempt}.json` for invalid or regenerated API attempts
 - `claims/raw/{chunk_id}_retry_advice_attempt_{attempt}.json` for retry-advisor calls after failed attempts
+- `claims/raw/batch_extract_input.jsonl` when `--batch` submits extraction requests
+- `claims/raw/batch_extract_manifest.json` when `--batch` submits or resumes a batch
+- `claims/raw/batch_extract_output.jsonl` when a batch output file is downloaded
+- `claims/raw/batch_extract_errors.jsonl` when the provider returns a batch error file
 - `claims/style_claims_errors.json` while invalid attempts or a final retry failure exist
 
 ## Skip Validation
@@ -55,7 +63,7 @@ The stage can be skipped when `style_claims.jsonl` parses as `StyleClaim`, `styl
 - Retry-advisor outputs are diagnostic prompt guidance only. They are not claims and must not be imported into the KB.
 - Claims must remain normalized Russian knowledge objects with timestamp/source grounding.
 - Curation intentionally does not auto-split or auto-rewrite canonical claims in the MVP. Those suggestions are collected for later analysis across multiple jobs.
-- Do not add CLI controls for claim extraction.
+- `--batch` is the only CLI execution switch for claim extraction. Do not add CLI controls for provider, model, prompt, chunking, quality, output path, or partial extraction behavior.
 
 ## Related Code
 

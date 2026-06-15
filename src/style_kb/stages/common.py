@@ -61,6 +61,17 @@ def load_style_claims(path: Path) -> list[StyleClaim]:
     return read_models_jsonl(path, StyleClaim)
 
 
+def effective_style_claims_path(context: StageContext) -> Path:
+    current_path = context.paths.style_claims_current_jsonl
+    if current_path.exists():
+        return current_path
+    return context.paths.style_claims_jsonl
+
+
+def load_effective_style_claims(context: StageContext) -> list[StyleClaim]:
+    return load_style_claims(effective_style_claims_path(context))
+
+
 def youtube_source_ref(video_id: str, start: float, end: float, *, title: str | None = None, modality: str | None = None) -> SourceRef:
     return SourceRef(
         type="youtube",
