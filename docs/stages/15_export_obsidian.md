@@ -14,6 +14,10 @@ When `speech_turns` are available, video notes render speaker-aware dialogue ins
 Style claims are rendered in the video note and in their corresponding chunk notes.
 Markdown is a human navigation view. JSONL remains the machine-readable source for importers.
 
+Before rendering, stage 15 removes only stale stage-owned chunk notes matching
+`exports/obsidian/chunks/{chunk_id}.md` for chunk ids no longer present in
+`chunks/chunks.jsonl`. It does not delete unrelated files.
+
 ## Inputs
 
 - `metadata/video_info.json`
@@ -32,13 +36,18 @@ Markdown is a human navigation view. JSONL remains the machine-readable source f
 
 ## Skip Validation
 
-The stage can be skipped when the index note, video note, and every expected chunk note exist.
+The stage can be skipped when the index note, video note, and every expected chunk note
+exist, there are no extra stage-owned chunk notes for stale chunk ids, and the outputs are
+current relative to metadata, timeline events, chunks, effective style claims, and frame
+refs when visuals are enabled.
 
 ## Important Notes
 
 - Obsidian notes are presentation exports, not canonical data.
 - Do not import Obsidian notes into the same KB/RAG index as JSONL chunks; use the JSONL manifest allowlist for machine ingestion.
 - Canonical LLM claim data remains `claims/style_claims.jsonl`; dashboard manual edits/deletes are read from the materialized `claims/style_claims_current.jsonl` overlay when present. Markdown should not become the source of truth.
+- Dashboard edits may re-render existing Obsidian surfaces after the job is complete. They
+  use the same renderer and the same stale-note cleanup scope.
 - Keep presenter blocks conditional so recurring background presenter descriptions do not spam notes.
 - Keep speaker role labels human-readable in Russian: `Ведущий` and `Закадровый вопрос`.
 - Frame links should remain relative to the job export layout when visual artifacts exist.

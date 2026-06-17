@@ -10,6 +10,16 @@ The stage copies canonical internal artifacts into `exports/jsonl/` using the ex
 
 For style claims, the stage exports `claims/style_claims_current.jsonl` when the dashboard has materialized manual edits/deletes. If that overlay does not exist, it falls back to the original LLM artifact at `claims/style_claims.jsonl`.
 
+`manifest.json` records the effective claim source:
+
+- `style_claims_source`
+- `style_claims_sha256`
+- `style_claims_count`
+
+Stage 14 owns full manifest generation. Dashboard edits and the `refresh_kb_exports`
+maintenance command patch only these claim-owned manifest fields and preserve unrelated
+manifest metadata.
+
 When `pipeline.visual_enabled=false`, the bundle omits `scenes.jsonl`, `frame_refs.jsonl`, and `visual_events.jsonl`, removes stale copies of those files from previous visual runs, and writes `manifest.visual_enabled=false`.
 
 ## Inputs
@@ -43,7 +53,7 @@ When `pipeline.visual_enabled=false`, the bundle omits `scenes.jsonl`, `frame_re
 
 ## Skip Validation
 
-The stage can be skipped when every expected exported JSONL file exists, including `speaker_diarization.jsonl`, `chunk_plan.jsonl`, and `style_claims.jsonl`, and `manifest.json` exists. The manifest must match the current `pipeline.visual_enabled` value and must include or omit the visual export filenames accordingly. The effective style-claims input participates in freshness checks, so newer dashboard edits/deletes invalidate the export. In audio-only mode, stale visual export files make the stage rebuild so they can be removed.
+The stage can be skipped when every expected exported JSONL file exists, including `speaker_diarization.jsonl`, `chunk_plan.jsonl`, and `style_claims.jsonl`, and `manifest.json` exists. The exported `style_claims.jsonl` must match the effective claims exactly after parsed JSONL comparison. The manifest must match the current `pipeline.visual_enabled` value, must include or omit the visual export filenames accordingly, and must record the current effective style-claims source/count/fingerprint. The effective style-claims input participates in freshness checks, so newer dashboard edits/deletes invalidate the export. In audio-only mode, stale visual export files make the stage rebuild so they can be removed.
 
 ## Important Notes
 

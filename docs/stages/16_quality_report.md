@@ -35,7 +35,15 @@ Planned stage 08/09 hardening may add scene/keyframe quality metrics and warning
 
 ## Skip Validation
 
-The stage can be skipped when `quality_report.json` exists and parses as `QualityReport`.
+The stage can be skipped when `quality_report.json` exists, parses as `QualityReport`, has
+the current job/video ids, and its stage counts match current canonical artifacts. The
+`style_claims` count is computed from effective claims:
+
+1. `claims/style_claims_current.jsonl` when present;
+2. otherwise `claims/style_claims.jsonl`.
+
+The report must also be current relative to media durations, speech/timeline/chunk
+artifacts, effective style claims, and visual artifacts when visuals are enabled.
 
 ## Important Notes
 
@@ -53,6 +61,8 @@ The stage can be skipped when `quality_report.json` exists and parses as `Qualit
 - Speaker count is not fixed. Quality report warns only when diarization is enabled but no speaker labels are detected.
 - Empty style claims are a warning, not a hard failure, because some chunks may contain only service or promotional content.
 - Dashboard-deleted claims are excluded from claim-aware quality counts after `style_claims_current.jsonl` exists.
+- Dashboard edits do not refresh this report immediately. Dashboard/API payloads should
+  show the report as stale when it predates the current claim overlay.
 
 ## Related Code
 

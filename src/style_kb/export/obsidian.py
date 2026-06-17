@@ -20,6 +20,7 @@ def render_obsidian_export(
     video_note_path: Path,
     chunk_note_paths: dict[str, Path],
     event_frame_links: dict[str, list[str]],
+    write_if_changed: bool = False,
 ) -> list[Path]:
     env = Environment(loader=FileSystemLoader(str(templates_dir)), autoescape=False, trim_blocks=True, lstrip_blocks=True)
     index_template = env.get_template("index.md.j2")
@@ -30,7 +31,7 @@ def render_obsidian_export(
         claims_by_chunk.setdefault(claim.chunk_id, []).append(claim)
 
     index_rendered = index_template.render(title=index_title, video=video, chunks=chunks)
-    write_text_atomic(obsidian_index_path, index_rendered.rstrip() + "\n")
+    _write_rendered_text(obsidian_index_path, index_rendered.rstrip() + "\n", write_if_changed=write_if_changed)
 
     video_rendered = video_template.render(
         video=video,
@@ -39,15 +40,25 @@ def render_obsidian_export(
         event_frame_links=event_frame_links,
         speech_turn_label=_speech_turn_label,
     )
-    write_text_atomic(video_note_path, video_rendered.rstrip() + "\n")
+    _write_rendered_text(video_note_path, video_rendered.rstrip() + "\n", write_if_changed=write_if_changed)
 
     outputs = [obsidian_index_path, video_note_path]
     for chunk in chunks:
         path = chunk_note_paths[chunk.chunk_id]
         rendered = chunk_template.render(chunk=chunk, style_claims=claims_by_chunk.get(chunk.chunk_id, []))
-        write_text_atomic(path, rendered.rstrip() + "\n")
+        _write_rendered_text(path, rendered.rstrip() + "\n", write_if_changed=write_if_changed)
         outputs.append(path)
     return outputs
+
+
+def _write_rendered_text(path: Path, payload: str, *, write_if_changed: bool) -> None:
+    if write_if_changed and path.exists():
+        try:
+            if path.read_text(encoding="utf-8") == payload:
+                return
+        except Exception:
+            pass
+    write_text_atomic(path, payload)
 
 
 def _speech_turn_label(turn: SpeechTurn) -> str:

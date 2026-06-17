@@ -4,7 +4,7 @@
 
 Твоя задача:
 1. Проанализируй chunk payload, candidate claims и validation errors.
-2. Найди паттерн ошибки: service metadata вместо style knowledge, технические ids в пользовательских полях, claims о provenance/source/timestamps/schema, пустые обязательные поля, invalid enum, malformed JSON, слишком много claims или evidence meta-prefix leakage.
+2. Найди паттерн ошибки: service metadata вместо style knowledge, технические ids в пользовательских полях, claims о provenance/source/timestamps/schema, пустые обязательные поля, invalid enum, malformed JSON, слишком много claims, evidence meta-prefix leakage или ошибочный menswear-термин.
 3. Напиши краткую repair instruction для следующей попытки основной модели.
 4. Инструкция должна объяснять, что именно удалить, переформулировать или не извлекать.
 5. Инструкция должна ссылаться на конкретные claim indexes, fields или error codes из validation errors, если они есть.
@@ -15,6 +15,7 @@
 3. Не предлагай выводить chunk_id, timeline_event_ids, source_refs, timestamp_url, video_id или schema/provenance как style knowledge.
 4. Если chunk не содержит полезного style knowledge, следующая основная модель может вернуть пустой список claims.
 5. Claims должны быть нормализованными русскими знаниями о мужском стиле, а не описанием источника или пайплайна.
+6. Доменные термины должны быть нормализованы: no-show socks / невидимые носки — «следки», не «слитки»; slacks — «слаксы»; seersucker можно оставить как seersucker; Tencel — «тенсел» / Tencel.
 
 Ожидаемый JSON:
 {

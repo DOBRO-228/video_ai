@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -97,7 +98,7 @@ def validate_job_id(job_id: str) -> str:
 def ensure_job_not_running(db_path: Path, job_id: str) -> None:
     if not db_path.exists():
         return
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection:
         connection.row_factory = sqlite3.Row
         row = connection.execute(
             "SELECT status, lock_pid FROM jobs WHERE job_id = ?",
@@ -114,13 +115,13 @@ def delete_job_rows(db_path: Path, job_id: str) -> tuple[int, int]:
     if not db_path.exists():
         return 0, 0
 
-    with sqlite3.connect(db_path) as connection:
-        connection.execute("PRAGMA foreign_keys=ON;")
-        stage_cursor = connection.execute("DELETE FROM stages WHERE job_id = ?", (job_id,))
-        job_cursor = connection.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
-        deleted_stage_rows = stage_cursor.rowcount if stage_cursor.rowcount is not None else 0
-        deleted_job_rows = job_cursor.rowcount if job_cursor.rowcount is not None else 0
-        connection.commit()
+    with closing(sqlite3.connect(db_path)) as connection:
+        with connection:
+            connection.execute("PRAGMA foreign_keys=ON;")
+            stage_cursor = connection.execute("DELETE FROM stages WHERE job_id = ?", (job_id,))
+            job_cursor = connection.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
+            deleted_stage_rows = stage_cursor.rowcount if stage_cursor.rowcount is not None else 0
+            deleted_job_rows = job_cursor.rowcount if job_cursor.rowcount is not None else 0
         connection.execute("PRAGMA wal_checkpoint(TRUNCATE);")
     return deleted_stage_rows, deleted_job_rows
 

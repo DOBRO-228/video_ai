@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from style_kb.utils.files import copy_file_atomic, read_json, write_json_atomic, write_jsonl_atomic
+from style_kb.stages.common import effective_style_claims_fingerprint
+from style_kb.utils.files import copy_file_atomic, read_json, read_jsonl, write_json_atomic, write_jsonl_atomic
 
 
 def export_jsonl_bundle(
@@ -20,6 +21,7 @@ def export_jsonl_bundle(
     style_claims_path: Path,
     export_dir: Path,
     visual_enabled: bool,
+    job_dir: Path | None = None,
 ) -> list[Path]:
     export_dir.mkdir(parents=True, exist_ok=True)
     outputs = [
@@ -54,12 +56,66 @@ def export_jsonl_bundle(
     copy_file_atomic(timeline_events_path, outputs[next_index])
     copy_file_atomic(chunks_path, outputs[next_index + 1])
     write_jsonl_atomic(outputs[next_index + 2], [read_json(chunk_plan_path)])
-    copy_file_atomic(style_claims_path, outputs[next_index + 3])
-    write_json_atomic(outputs[next_index + 4], _export_manifest(visual_enabled=visual_enabled))
+    write_style_claims_export(export_dir, read_jsonl(style_claims_path))
+    write_json_atomic(
+        outputs[next_index + 4],
+        _export_manifest(
+            visual_enabled=visual_enabled,
+            style_claims_metadata=style_claims_manifest_metadata(style_claims_path, job_dir=job_dir),
+        ),
+    )
     return outputs
 
 
-def _export_manifest(*, visual_enabled: bool) -> dict:
+def write_style_claims_export(export_dir: Path, rows: list[dict]) -> Path:
+    output_path = export_dir / "style_claims.jsonl"
+    write_jsonl_atomic(output_path, rows)
+    return output_path
+
+
+def patch_style_claims_manifest_metadata(
+    *,
+    manifest_path: Path,
+    style_claims_path: Path,
+    job_dir: Path,
+) -> dict:
+    manifest = read_json(manifest_path)
+    if not isinstance(manifest, dict):
+        raise ValueError(f"manifest must be a JSON object: {manifest_path}")
+    patched = {
+        **manifest,
+        **style_claims_manifest_metadata(style_claims_path, job_dir=job_dir),
+    }
+    write_json_atomic(manifest_path, patched)
+    return patched
+
+
+def style_claims_manifest_metadata(style_claims_path: Path, *, job_dir: Path | None) -> dict:
+    return {
+        "style_claims_source": _relative_source_path(style_claims_path, job_dir=job_dir),
+        "style_claims_sha256": effective_style_claims_fingerprint(style_claims_path),
+        "style_claims_count": len(read_jsonl(style_claims_path)),
+    }
+
+
+def manifest_claim_metadata_matches(manifest: dict, style_claims_path: Path, *, job_dir: Path | None) -> bool:
+    try:
+        expected = style_claims_manifest_metadata(style_claims_path, job_dir=job_dir)
+    except Exception:
+        return False
+    return all(manifest.get(key) == value for key, value in expected.items())
+
+
+def _relative_source_path(style_claims_path: Path, *, job_dir: Path | None) -> str:
+    if job_dir is None:
+        return style_claims_path.as_posix()
+    try:
+        return style_claims_path.relative_to(job_dir).as_posix()
+    except ValueError:
+        return style_claims_path.as_posix()
+
+
+def _export_manifest(*, visual_enabled: bool, style_claims_metadata: dict | None = None) -> dict:
     files = [
         _manifest_entry("video_info.jsonl", role="audit"),
         _manifest_entry("speaker_diarization.jsonl", role="audit"),
@@ -82,13 +138,16 @@ def _export_manifest(*, visual_enabled: bool) -> dict:
             _manifest_entry("style_claims.jsonl", role="knowledge", kb_import=True),
         ]
     )
-    return {
+    manifest = {
         "schema_version": 1,
         "source_of_truth": "jsonl",
         "visual_enabled": visual_enabled,
         "kb_import_allowlist": ["chunks.jsonl", "style_claims.jsonl"],
         "files": files,
     }
+    if style_claims_metadata:
+        manifest.update(style_claims_metadata)
+    return manifest
 
 
 def _manifest_entry(filename: str, *, role: str, kb_import: bool = False) -> dict:

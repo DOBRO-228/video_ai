@@ -16,6 +16,12 @@ When a per-chunk extraction attempt fails validation and another retry remains, 
 
 After all chunk responses are loaded, the stage performs deterministic cleanup of obvious presentation artifacts in user-facing fields, including evidence source prefixes such as `В chunk:`/`On-screen:` and Latin homoglyphs inside Cyrillic words. It does not enforce a closed `applies_to` taxonomy; the summary records observed `applies_to` counts so a stable vocabulary can be chosen later from real jobs.
 
+The cleanup/validation path also guards a small domain-term table. Known low-risk terms are
+normalized in user-facing claim fields, for example `слагсы` -> `слаксы`, `серсакер` ->
+`seersucker`, and `тенсил` -> `тенсел`. The known STT error `слитки` is allowed to be
+repaired to `следки` only in a no-show-sock context; otherwise the provider response fails
+validation instead of becoming a high-confidence style claim.
+
 The stage then performs deterministic exact deduplication by `(claim_type, subject, claim)`. Duplicate claims keep the earliest primary chunk and merge timeline/source/evidence/topic provenance.
 
 When `style_claims.curate.enabled` is true, a single post-deduplication curation request is sent using `style_claims_curate_ru.txt` with the configured `style_claims.curate.reasoning_effort` value. The curator is decisions-only: it may mark safe semantic duplicates, revise confidence, and flag split/rewrite/`applies_to` notes for audit. It must not generate new claims or rewrite canonical claim text. Python applies only safe decisions: valid same-`claim_type` semantic merges and confidence revisions. Split suggestions, rewrite suggestions, confidence reasons, and `applies_to` notes remain audit-only.
@@ -49,7 +55,7 @@ When `style_claims.curate.enabled` is true, a single post-deduplication curation
 
 ## Skip Validation
 
-The stage can be skipped when `style_claims.jsonl` parses as `StyleClaim`, `style_claims_raw.json` matches the current provider/model/prompt hash/max-claims/max-retries and curation config/reasoning effort/prompt hash, required curation audit artifacts exist when enabled, claim ids are deterministic, each claim is grounded to known chunks/timeline events, no exact duplicate claims remain, and no user-facing claim field leaks service metadata, technical ids, or evidence meta-prefixes.
+The stage can be skipped when `style_claims.jsonl` parses as `StyleClaim`, `style_claims_raw.json` matches the current provider/model/prompt hash/max-claims/max-retries and curation config/reasoning effort/prompt hash, required curation audit artifacts exist when enabled, claim ids are deterministic, each claim is grounded to known chunks/timeline events, no exact duplicate claims remain, and no user-facing claim field leaks service metadata, technical ids, evidence meta-prefixes, or unnormalized guarded domain terms.
 
 ## Important Notes
 
@@ -62,6 +68,10 @@ The stage can be skipped when `style_claims.jsonl` parses as `StyleClaim`, `styl
 - Python attaches `chunk_id`, `timeline_event_ids`, `timestamp_url`, and `source_refs` to accepted claims. The model must not output those as claim content.
 - Retry-advisor outputs are diagnostic prompt guidance only. They are not claims and must not be imported into the KB.
 - Claims must remain normalized Russian knowledge objects with timestamp/source grounding.
+- Dashboard overlays are terminal post-pipeline edits. If `claims/style_claims_current.jsonl`
+  or a non-empty `claims/style_claims_manual_edits.jsonl` exists, `resume` must not re-run
+  this stage. The runner fails before mutating stage 13 outputs because `_renumber_claims`
+  can orphan dashboard edits.
 - Curation intentionally does not auto-split or auto-rewrite canonical claims in the MVP. Those suggestions are collected for later analysis across multiple jobs.
 - `--batch` is the only CLI execution switch for claim extraction. Do not add CLI controls for provider, model, prompt, chunking, quality, output path, or partial extraction behavior.
 

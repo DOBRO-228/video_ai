@@ -185,6 +185,7 @@ class Stage12BuildChunks(Stage):
         if context.paths.chunk_plan_errors.exists():
             context.paths.chunk_plan_errors.unlink()
         _write_or_clear_plan_warnings(context, validated_plan.warnings)
+        redundancy_metrics = _combined_text_redundancy_metrics(validated_plan.chunks)
         return StageResult(
             output_files=self.output_files(context),
             metrics={
@@ -200,6 +201,7 @@ class Stage12BuildChunks(Stage):
                 "chunk_plan_warnings_count": len(validated_plan.warnings),
                 "chunk_plan_stale_raw_removed_count": validated_plan.stale_raw_removed_count,
                 "chunk_presentation_final_chunks_count": _chunk_contamination_chunks_count(validated_plan.chunks),
+                **redundancy_metrics,
             },
         )
 
@@ -1425,6 +1427,46 @@ def _timeline_event_style_evidence_text(event: TimelineEvent) -> str:
 
 def _combined_visual_component(chunk: Chunk) -> str:
     return compact_join([chunk.presenter_brief, chunk.visual_text])
+
+
+def _combined_text_redundancy_metrics(chunks: list[Chunk]) -> dict[str, int]:
+    combined_tokens_total = 0
+    redundant_tokens_total = 0
+    chunks_with_redundancy = 0
+    max_redundancy_bps = 0
+    for chunk in chunks:
+        combined_tokens = _redundancy_tokens(chunk.combined_text)
+        if not combined_tokens:
+            continue
+        repeated_source_tokens = set(
+            _redundancy_tokens(
+                compact_join(
+                    [
+                        chunk.visual_text,
+                        "\n".join(chunk.topics),
+                        "\n".join(chunk.entities),
+                    ]
+                )
+            )
+        )
+        redundant_tokens = sum(1 for token in combined_tokens if token in repeated_source_tokens)
+        combined_tokens_total += len(combined_tokens)
+        redundant_tokens_total += redundant_tokens
+        redundancy_bps = round(redundant_tokens / len(combined_tokens) * 10000)
+        max_redundancy_bps = max(max_redundancy_bps, redundancy_bps)
+        if redundant_tokens:
+            chunks_with_redundancy += 1
+    return {
+        "combined_text_tokens_total": combined_tokens_total,
+        "combined_text_redundant_tokens_total": redundant_tokens_total,
+        "combined_text_redundancy_ratio_bps": round(redundant_tokens_total / max(combined_tokens_total, 1) * 10000),
+        "combined_text_redundancy_chunks_count": chunks_with_redundancy,
+        "combined_text_redundancy_max_chunk_ratio_bps": max_redundancy_bps,
+    }
+
+
+def _redundancy_tokens(value: str) -> list[str]:
+    return re.findall(r"[\w]+", value.casefold(), flags=re.UNICODE)
 
 
 def _planner_windows(segments: list[SpeechSegment], context: StageContext) -> list[_PlannerWindow]:

@@ -63,7 +63,17 @@ class Stage16QualityReport(Stage):
     def validate_outputs(self, context: StageContext) -> bool:
         if not context.paths.quality_report.exists():
             return False
-        return bool(QualityReport.model_validate(read_payload(context.paths.quality_report)))
+        try:
+            report = QualityReport.model_validate(read_payload(context.paths.quality_report))
+        except Exception:
+            return False
+        if report.job_id != context.job.job_id or report.video_id != context.job.video_id:
+            return False
+        try:
+            expected_counts = _expected_stage_counts(context)
+        except Exception:
+            return False
+        return all(report.stage_counts.get(key) == value for key, value in expected_counts.items())
 
     def run(self, context: StageContext) -> StageResult:
         video_info = load_video_info(context.paths.metadata_video_info)
@@ -167,6 +177,21 @@ class Stage16QualityReport(Stage):
             output_files=self.output_files(context),
             metrics={"warnings_count": len(warnings), **quality_metrics},
         )
+
+
+def _expected_stage_counts(context: StageContext) -> dict[str, int]:
+    speaker_diarization = read_model(context.paths.stt_speaker_diarization, SpeakerDiarization)
+    return {
+        "speech_tokens": len(load_speech_tokens(context.paths.stt_speech_tokens)),
+        "speakers": speaker_diarization.detected_speakers,
+        "speech_segments": len(load_speech_segments(context.paths.stt_speech_segments)),
+        "scenes": len(load_scenes(context.paths.scenes_jsonl)) if context.config.pipeline.visual_enabled else 0,
+        "frame_refs": len(load_frame_refs(context.paths.frame_refs_jsonl)) if context.config.pipeline.visual_enabled else 0,
+        "visual_events": len(load_visual_events(context.paths.visual_events_jsonl)) if context.config.pipeline.visual_enabled else 0,
+        "timeline_events": len(load_timeline_events(context.paths.timeline_events_jsonl)),
+        "chunks": len(load_chunks(context.paths.chunks_jsonl)),
+        "style_claims": len(load_effective_style_claims(context)),
+    }
 
 
 def _quality_baseline_leakage_metrics(context: StageContext, visual_events: list[VisualEvent]) -> dict[str, int]:

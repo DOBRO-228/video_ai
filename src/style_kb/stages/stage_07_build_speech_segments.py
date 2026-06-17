@@ -227,6 +227,7 @@ class Stage07BuildSpeechSegments(Stage):
         segmentable_unit_boundaries = sum(1 for unit in units if unit.can_end_segment)
         raw_payload = read_payload(context.paths.stt_speech_segments_raw)
         openai_response_id = raw_payload.get("id")
+        retry_cause_counts = _retry_cause_counts(retry_feedback)
         append_stage_summary(
             context,
             self.name,
@@ -254,6 +255,7 @@ class Stage07BuildSpeechSegments(Stage):
                 "semantic_boundary_violations": _semantic_boundary_violations(segments, tokens=tokens, units=units)[:5],
                 "raw_retry_advisor_output_paths": [str(path) for path in raw_advisor_paths],
                 "retry_feedback": [_feedback_payload(feedback) for feedback in retry_feedback],
+                "retry_cause_counts": retry_cause_counts,
             },
         )
         return StageResult(
@@ -267,12 +269,42 @@ class Stage07BuildSpeechSegments(Stage):
                 "semantic_retry_events_count": len(retry_feedback),
                 "retry_advisor_used_count": len(raw_advisor_paths),
                 "semantic_retry_resolved_count": 1 if retry_feedback else 0,
+                "semantic_retry_cause_counts": retry_cause_counts,
                 "max_segment_duration": max(durations) if durations else 0,
                 "max_segment_words": max(words) if words else 0,
                 "segmentable_unit_boundaries_count": segmentable_unit_boundaries,
                 "non_segmentable_unit_boundaries_count": len(units) - segmentable_unit_boundaries,
             },
         )
+
+
+def _retry_cause_counts(retry_feedback: list[_SegmentationAttemptFeedback]) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for feedback in retry_feedback:
+        codes = [
+            str(error.get("code"))
+            for error in feedback.structured_errors
+            if isinstance(error, dict) and error.get("code")
+        ]
+        if not codes:
+            codes = [feedback.error_code]
+        for code in codes:
+            counts[_retry_cause_for_code(code)] += 1
+    return dict(sorted(counts.items()))
+
+
+def _retry_cause_for_code(code: str) -> str:
+    if code == "openai_segmenter_words_exceeded":
+        return "words_exceeded"
+    if code in {"openai_segmenter_duration_exceeded", "openai_segmenter_duration_too_short"}:
+        return "duration_limit"
+    if code == "openai_segmenter_mixed_speakers":
+        return "mixed_speakers"
+    if code in {"openai_segmenter_semantic_boundary_failed", "openai_segmenter_semantic_boundary_violation"}:
+        return "semantic_density"
+    if code.startswith("openai_segmenter_"):
+        return "other_validation"
+    return "provider_or_unknown"
 
 
 def _segment_with_retries(

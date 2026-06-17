@@ -24,7 +24,11 @@ Units are forced to break on speaker changes. The LLM is not allowed to combine 
 
 After LLM segmentation, consecutive short segments from the same speaker are merged when the merged segment still respects max duration and max word constraints.
 
-Stage metrics include `semantic_retry_events_count`, `retry_advisor_used_count`, and `semantic_retry_resolved_count` for monitoring retry noise without adding deterministic boundary shifting.
+Stage metrics include `semantic_retry_events_count`, `retry_advisor_used_count`,
+`semantic_retry_resolved_count`, and `semantic_retry_cause_counts` for monitoring retry
+noise without adding deterministic boundary shifting. Cause counts are read-only
+diagnostics grouped by word-limit, duration-limit, mixed-speaker, semantic-density, other
+validation, and provider/unknown categories.
 
 The semantic prompt is hardened through general rules rather than accumulated per-case patches:
 

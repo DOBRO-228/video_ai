@@ -23,6 +23,7 @@ from style_kb.pipeline.catalog import STAGES, stage_disabled_by_config
 from style_kb.pipeline.paths import JobPaths
 from style_kb.state.db import initialize_database
 from style_kb.state.repository import StateRepository
+from style_kb.stages.common import dashboard_overlay_exists
 from style_kb.utils.env import load_dotenv
 from style_kb.utils.files import append_text, read_json, write_json_atomic
 from style_kb.utils.json import pretty_json
@@ -288,6 +289,16 @@ class PipelineRunner:
                             stage_status=skipped_stage,
                         )
                     continue
+
+                if stage.name == "13_extract_style_claims" and dashboard_overlay_exists(paths):
+                    raise StageExecutionError(
+                        "refusing to rebuild stage 13 because dashboard claim overlay files exist; "
+                        "rebuilding style claims can change claim_id values and orphan manual edits. "
+                        "Move or remove claims/style_claims_current.jsonl and "
+                        "claims/style_claims_manual_edits.jsonl only after explicit discard/re-review.",
+                        error_code="claims_overlay_blocks_stage13_rebuild",
+                        stage_name=stage.name,
+                    )
 
                 running_stage = self.repository.mark_stage_running(
                     job_id=job.job_id,

@@ -20,6 +20,11 @@ The model returns only a chunk plan: contiguous `speech_segment_ids`, a short ti
 
 The LLM is not allowed to generate final chunk text. Final `speech_text`, `dialogue_text`, `visual_text`, `combined_text`, `timeline_event_ids`, timestamps, and `source_refs` are built by code. During materialization, presentation/video-format wording is filtered from `visual_text`, `presenter_brief`, `topics`, `entities`, and the visual portion of `combined_text`; remaining contamination is a validation failure.
 
+The stage also records read-only `combined_text` redundancy metrics in SQLite stage
+metrics. These counters estimate how much of `combined_text` is repeated from
+`visual_text`, `topics`, and `entities`. They do not change chunk ids, chunk boundaries,
+or any stored text.
+
 When a planner attempt fails Python validation, the stage records structured errors and sends the failed candidate plan, planner input, constraints, and errors to the retry-advisor model configured in `chunking.retry_advisor_model`. The advisor returns only repair instructions, not replacement chunks. Those instructions are added to the next retry prompt for the main planner model. Final acceptance remains deterministic.
 
 Planner windows are QA-aware: a window boundary is shifted when it would split an `offscreen_questioner` segment from a nearby `host` answer. After all window plans are returned, Python also performs a deterministic safety merge for any remaining adjacent QA split, as long as hard chunk limits are still respected. If the adjacent chunks cannot be merged without violating `max_speech_segments_per_chunk` or `max_words`, the split is kept as a warning instead of failing the stage.
@@ -67,6 +72,8 @@ The stage can be skipped only when `chunk_plan.json` matches current config/prom
 - A QA split that cannot be merged without exceeding hard chunk limits is allowed only with a warning in `chunk_plan_warnings.json`, chunk plan notes, stage log, and console progress.
 - `title`, `channel`, and canonical video URL come from `metadata/video_info.json`, not from a best-effort timeline fallback.
 - Chunks preserve source refs and YouTube timestamp URLs.
+- `combined_text` redundancy metrics are diagnostic only until measured baselines justify a
+  text-shaping change.
 - `chunks/raw/*` files are diagnostic/cache artifacts. They are retained for reuse and post-mortem analysis, but must not be imported into a future KB or read as style knowledge by agents.
 
 ## Related Code

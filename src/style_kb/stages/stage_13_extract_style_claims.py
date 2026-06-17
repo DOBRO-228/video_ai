@@ -70,6 +70,7 @@ _RECOVERABLE_PROVIDER_ERROR_CODES = {
     "openai_claims_invalid_enum",
     "openai_claims_metadata_leak",
     "openai_claims_service_claim",
+    "openai_claims_domain_term",
     "openai_claims_json_parse_failed",
     "openai_claims_output_missing",
 }
@@ -157,6 +158,27 @@ _LATIN_TO_CYRILLIC_HOMOGLYPHS = str.maketrans(
     }
 )
 _MAX_TOPICS_PER_CLAIM = 8
+_DOMAIN_TERM_FIELDS = (
+    "subject",
+    "claim",
+    "rationale",
+    "conditions",
+    "applies_to",
+    "avoid",
+    "prefer",
+    "evidence",
+    "topics",
+)
+_BAD_NO_SHOW_SOCK_RE = re.compile(r"\bслитк(?:и|ов|ам|ами|ах|а)?\b", re.IGNORECASE)
+_NO_SHOW_SOCK_CONTEXT_RE = re.compile(
+    r"\b(?:невидим\w*|носк\w*|носоч\w*|следк\w*|no\s*show|лоу\s*кат|лоукат)\b",
+    re.IGNORECASE,
+)
+_DOMAIN_REPLACEMENTS = (
+    (re.compile(r"\bслагсы\b", re.IGNORECASE), "слаксы"),
+    (re.compile(r"\bсерсакер\b", re.IGNORECASE), "seersucker"),
+    (re.compile(r"\bтенсил\b", re.IGNORECASE), "тенсел"),
+)
 
 
 @dataclass(slots=True)
@@ -194,6 +216,7 @@ class _ClaimsCleanupResult:
     evidence_meta_prefix_cleaned_count: int
     homoglyph_cleaned_fields_count: int
     topics_truncated_count: int
+    domain_term_cleaned_fields_count: int
 
 
 @dataclass(slots=True)
@@ -433,6 +456,7 @@ class Stage13ExtractStyleClaims(Stage):
                 "legacy_raw_cache_removed_count": legacy_raw_cache_removed_count,
                 "claim_retry_errors_count": len(claim_errors),
                 "deterministic_cleanup_changed_claims_count": cleanup_result.changed_claims_count,
+                "domain_term_cleaned_fields_count": cleanup_result.domain_term_cleaned_fields_count,
                 "curate_merged_count": curate_result.metrics.get("curate_merged_count", 0),
                 "curate_confidence_changed_count": curate_result.metrics.get("curate_confidence_changed_count", 0),
                 "curate_split_candidates_count": curate_result.metrics.get("curate_split_candidates_count", 0),
@@ -929,6 +953,18 @@ def _raw_claim_validation_errors(
                     )
                 )
 
+    for message, field_name, preview in _domain_term_validation_errors(checked_fields, claim_index=index):
+        errors.append(message)
+        structured_errors.append(
+            _validation_entry(
+                code="openai_claims_domain_term",
+                message=message,
+                claim_index=index,
+                field=field_name,
+                preview=preview,
+            )
+        )
+
     topic_keys = [_normalize_key(topic) for topic in checked_fields["topics"] if topic.strip()]
     if topic_keys:
         service_topics_count = sum(1 for topic in topic_keys if topic in _SERVICE_TOPICS)
@@ -973,6 +1009,8 @@ def _validation_entry(
 def _claim_validation_error_code(errors: list[str]) -> str:
     if any("service subject" in error for error in errors):
         return "openai_claims_service_claim"
+    if any("domain term" in error for error in errors):
+        return "openai_claims_domain_term"
     if any("technical marker" in error or "service metadata" in error for error in errors):
         return "openai_claims_metadata_leak"
     if any("empty required field" in error for error in errors):
@@ -1101,9 +1139,11 @@ def _cleanup_claims(claims: list[StyleClaim]) -> _ClaimsCleanupResult:
     evidence_meta_prefix_cleaned_count = 0
     homoglyph_cleaned_fields_count = 0
     topics_truncated_count = 0
+    domain_term_cleaned_fields_count = 0
 
     for claim in claims:
         update: dict[str, Any] = {}
+        domain_context = _claim_domain_context(claim)
         scalar_fields = {
             "subject": claim.subject,
             "claim": claim.claim,
@@ -1111,10 +1151,13 @@ def _cleanup_claims(claims: list[StyleClaim]) -> _ClaimsCleanupResult:
         }
         for field_name, value in scalar_fields.items():
             cleaned, homoglyph_changed = _cleanup_text(value)
+            cleaned, domain_changed = _cleanup_domain_terms(cleaned, domain_context)
             if cleaned != value:
                 update[field_name] = cleaned
                 if homoglyph_changed:
                     homoglyph_cleaned_fields_count += 1
+                if domain_changed:
+                    domain_term_cleaned_fields_count += 1
 
         list_fields = {
             "conditions": claim.conditions,
@@ -1133,8 +1176,11 @@ def _cleanup_claims(claims: list[StyleClaim]) -> _ClaimsCleanupResult:
                         evidence_meta_prefix_cleaned_count += 1
                     value = stripped
                 cleaned, homoglyph_changed = _cleanup_text(value)
+                cleaned, domain_changed = _cleanup_domain_terms(cleaned, domain_context)
                 if homoglyph_changed:
                     homoglyph_cleaned_fields_count += 1
+                if domain_changed:
+                    domain_term_cleaned_fields_count += 1
                 if cleaned:
                     cleaned_values.append(cleaned)
             cleaned_values = stable_unique(cleaned_values)
@@ -1156,6 +1202,7 @@ def _cleanup_claims(claims: list[StyleClaim]) -> _ClaimsCleanupResult:
         evidence_meta_prefix_cleaned_count=evidence_meta_prefix_cleaned_count,
         homoglyph_cleaned_fields_count=homoglyph_cleaned_fields_count,
         topics_truncated_count=topics_truncated_count,
+        domain_term_cleaned_fields_count=domain_term_cleaned_fields_count,
     )
 
 
@@ -1179,6 +1226,51 @@ def _replace_cyrillic_homoglyphs(value: str) -> str:
         return token.translate(_LATIN_TO_CYRILLIC_HOMOGLYPHS)
 
     return re.sub(r"[\w-]+", replace_token, value)
+
+
+def _cleanup_domain_terms(value: str, context: str) -> tuple[str, bool]:
+    cleaned = value
+    for pattern, replacement in _DOMAIN_REPLACEMENTS:
+        cleaned = pattern.sub(lambda match: _match_case(replacement, match.group(0)), cleaned)
+    if _NO_SHOW_SOCK_CONTEXT_RE.search(context):
+        cleaned = _BAD_NO_SHOW_SOCK_RE.sub(lambda match: _match_case("следки", match.group(0)), cleaned)
+    return cleaned, cleaned != value
+
+
+def _claim_domain_context(claim: StyleClaim) -> str:
+    values: list[str] = [claim.subject, claim.claim, claim.rationale]
+    for field_name in ("conditions", "applies_to", "avoid", "prefer", "evidence", "topics"):
+        values.extend(getattr(claim, field_name))
+    return " ".join(values)
+
+
+def _domain_term_validation_errors(
+    checked_fields: dict[str, list[str]],
+    *,
+    claim_index: int,
+) -> list[tuple[str, str, str]]:
+    errors: list[tuple[str, str, str]] = []
+    context = " ".join(value for field in _DOMAIN_TERM_FIELDS for value in checked_fields.get(field, []))
+    has_no_show_context = bool(_NO_SHOW_SOCK_CONTEXT_RE.search(context))
+    for field_name in _DOMAIN_TERM_FIELDS:
+        for value in checked_fields.get(field_name, []):
+            if _BAD_NO_SHOW_SOCK_RE.search(value) and not has_no_show_context:
+                errors.append(
+                    (
+                        f"claim {claim_index} field {field_name} contains unsafe domain term 'слитки'",
+                        field_name,
+                        value,
+                    )
+                )
+    return errors
+
+
+def _match_case(replacement: str, source: str) -> str:
+    if source.isupper():
+        return replacement.upper()
+    if source[:1].isupper():
+        return replacement[:1].upper() + replacement[1:]
+    return replacement
 
 
 def _renumber_claims(claims: list[StyleClaim], video_id: str) -> list[StyleClaim]:
@@ -1799,6 +1891,7 @@ def _summary_payload(
             "evidence_meta_prefix_cleaned_count": cleanup_result.evidence_meta_prefix_cleaned_count,
             "homoglyph_cleaned_fields_count": cleanup_result.homoglyph_cleaned_fields_count,
             "topics_truncated_count": cleanup_result.topics_truncated_count,
+            "domain_term_cleaned_fields_count": cleanup_result.domain_term_cleaned_fields_count,
         },
         "applies_to_counts": dict(sorted(applies_to_counts.items())),
         "applies_to_unique_count": len(applies_to_counts),
@@ -2169,6 +2262,14 @@ def _style_claim_content_validation_errors(
                 errors.append(f"claim {index} field {field_name} contains technical marker {marker!r}")
             if field_name == "evidence" and _strip_evidence_meta_prefix(value) != value:
                 errors.append(f"claim {index} evidence contains meta prefix")
+    for message, _, _ in _domain_term_validation_errors(checked_fields, claim_index=index):
+        errors.append(message)
+    for field_name in _DOMAIN_TERM_FIELDS:
+        for value in checked_fields.get(field_name, []):
+            if _BAD_NO_SHOW_SOCK_RE.search(value):
+                errors.append(f"claim {index} field {field_name} contains unnormalized no-show sock term")
+            if any(pattern.search(value) for pattern, _ in _DOMAIN_REPLACEMENTS):
+                errors.append(f"claim {index} field {field_name} contains unnormalized domain term")
 
     topic_keys = [_normalize_key(topic) for topic in claim.topics if topic.strip()]
     if topic_keys:
@@ -2738,6 +2839,12 @@ def _constraints_payload(
             "any field value whose main subject is source, grounding, metadata, provenance, or timeline ids",
         ],
         "dedupe": "exact deterministic merge after extraction",
+        "domain_terms": {
+            "no_show_socks": "следки, not слитки",
+            "slacks": "слаксы, not слагсы",
+            "seersucker": "seersucker",
+            "tencel": "тенсел / Tencel, not тенсил",
+        },
     }
     if retry_feedback:
         payload["retry_feedback"] = retry_feedback

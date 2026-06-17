@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -20,7 +22,8 @@ from style_kb.models import (
     VisualEvent,
 )
 from style_kb.pipeline.base import StageContext
-from style_kb.utils.files import append_text, read_json
+from style_kb.pipeline.paths import JobPaths
+from style_kb.utils.files import append_text, read_json, read_jsonl
 from style_kb.utils.pydantic_io import read_model, read_models_jsonl
 from style_kb.utils.time import build_timestamp_url
 
@@ -68,8 +71,52 @@ def effective_style_claims_path(context: StageContext) -> Path:
     return context.paths.style_claims_jsonl
 
 
+def effective_style_claims_path_for_paths(paths: JobPaths) -> Path:
+    current_path = paths.style_claims_current_jsonl
+    if current_path.exists():
+        return current_path
+    return paths.style_claims_jsonl
+
+
+def dashboard_overlay_exists(paths: JobPaths) -> bool:
+    if paths.style_claims_current_jsonl.exists():
+        return True
+    if not paths.style_claims_manual_edits_jsonl.exists():
+        return False
+    try:
+        return any(True for _ in read_jsonl(paths.style_claims_manual_edits_jsonl))
+    except Exception:
+        return True
+
+
 def load_effective_style_claims(context: StageContext) -> list[StyleClaim]:
     return load_style_claims(effective_style_claims_path(context))
+
+
+def read_effective_style_claim_rows(context_or_paths: StageContext | JobPaths) -> list[dict[str, Any]]:
+    if isinstance(context_or_paths, StageContext):
+        path = effective_style_claims_path(context_or_paths)
+    else:
+        path = effective_style_claims_path_for_paths(context_or_paths)
+    rows = read_jsonl(path)
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def effective_style_claims_fingerprint(path: Path) -> str:
+    rows = read_jsonl(path)
+    normalized = "".join(_normalized_jsonl_row(row) for row in rows)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def jsonl_rows_equal(left_path: Path, right_path: Path) -> bool:
+    try:
+        return read_jsonl(left_path) == read_jsonl(right_path)
+    except Exception:
+        return False
+
+
+def _normalized_jsonl_row(row: Any) -> str:
+    return json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
 
 
 def youtube_source_ref(video_id: str, start: float, end: float, *, title: str | None = None, modality: str | None = None) -> SourceRef:

@@ -12,6 +12,7 @@ from urllib.parse import quote
 
 from style_kb.config import load_default_config
 from style_kb.pipeline.paths import JobPaths
+from style_kb.stages.common import effective_style_claims_path_for_paths, jsonl_rows_equal
 from style_kb.stages.stage_10_describe_visuals import (
     presentation_noise_markers,
     technical_visual_markers,
@@ -28,7 +29,7 @@ _MONITORED_EVENTS = {
     "subprocess_failed",
 }
 _VISUAL_FIELDS = ("visual_summary", "observations", "interpretations", "items", "style_topics", "notes")
-_CHUNK_FIELDS = ("visual_text", "presenter_brief", "topics", "entities", "combined_text")
+_CHUNK_FIELDS = ("visual_text", "presenter_brief", "topics", "entities")
 
 
 def audit_jobs(*, working_dir: Path | None = None, write_snapshot: bool = True) -> dict[str, Any]:
@@ -85,6 +86,10 @@ def _empty_snapshot(*, output_root: Path, db_path: Path) -> dict[str, Any]:
         "stale_failure_reports": [],
         "failure_history": [],
         "drift_suspicions": [],
+        "claim_export_drifts": [],
+        "quality_report_drifts": [],
+        "obsidian_drifts": [],
+        "dashboard_overlay_jobs": [],
         "top_markers": {
             "technical_visual": Counter(),
             "presentation_visual": Counter(),
@@ -192,6 +197,9 @@ def _audit_job_artifacts(
     quality_report = _read_json_or_none(paths.quality_report)
     if isinstance(quality_report, dict):
         _audit_quality_report(snapshot, job=job, stages=stages, paths=paths, quality_report=quality_report)
+    if job["status"] == "completed":
+        _audit_claim_export_drift(snapshot, job=job, paths=paths)
+        _audit_obsidian_drift(snapshot, job=job, paths=paths)
     _audit_visual_markers(snapshot, paths=paths)
     _audit_chunk_markers(snapshot, paths=paths)
 
@@ -263,6 +271,32 @@ def _audit_quality_report(
                 "path": str(paths.quality_report),
             }
         )
+    effective_claims_path = effective_style_claims_path_for_paths(paths)
+    effective_claims_count = len(_read_jsonl(effective_claims_path))
+    report_claims_count = (quality_report.get("stage_counts") or {}).get("style_claims")
+    if report_claims_count != effective_claims_count:
+        entry = {
+            "job_id": job["job_id"],
+            "kind": "quality_style_claims_count_mismatch",
+            "quality_report_count": report_claims_count,
+            "effective_claims_count": effective_claims_count,
+            "path": str(paths.quality_report),
+        }
+        snapshot["quality_report_drifts"].append(entry)
+        snapshot["drift_suspicions"].append(entry)
+    if paths.quality_report.exists() and effective_claims_path.exists():
+        report_mtime = paths.quality_report.stat().st_mtime
+        claims_mtime = effective_claims_path.stat().st_mtime
+        if report_mtime < claims_mtime:
+            entry = {
+                "job_id": job["job_id"],
+                "kind": "quality_report_older_than_effective_claims",
+                "quality_report_mtime": datetime.fromtimestamp(report_mtime, tz=UTC).isoformat(),
+                "effective_claims_mtime": datetime.fromtimestamp(claims_mtime, tz=UTC).isoformat(),
+                "path": str(paths.quality_report),
+            }
+            snapshot["quality_report_drifts"].append(entry)
+            snapshot["drift_suspicions"].append(entry)
     artifact_status = quality_report.get("status")
     if artifact_status is not None and artifact_status != job["status"]:
         snapshot["drift_suspicions"].append(
@@ -292,6 +326,83 @@ def _audit_chunk_markers(snapshot: dict[str, Any], *, paths: JobPaths) -> None:
     for row in _read_jsonl(paths.chunks_jsonl):
         for field in _CHUNK_FIELDS:
             snapshot["top_markers"]["presentation_chunks"].update(presentation_noise_markers(row.get(field)))
+        snapshot["top_markers"]["presentation_chunks"].update(
+            presentation_noise_markers(_chunk_combined_visual_component(row))
+        )
+
+
+def _audit_claim_export_drift(snapshot: dict[str, Any], *, job: sqlite3.Row, paths: JobPaths) -> None:
+    effective_claims_path = effective_style_claims_path_for_paths(paths)
+    if paths.style_claims_current_jsonl.exists():
+        snapshot["dashboard_overlay_jobs"].append(
+            {
+                "job_id": job["job_id"],
+                "effective_claims_path": str(effective_claims_path),
+            }
+        )
+    export_path = paths.export_jsonl("style_claims.jsonl")
+    if not effective_claims_path.exists() or not export_path.exists():
+        return
+    if paths.style_claims_current_jsonl.exists() and paths.style_claims_current_jsonl.stat().st_mtime > export_path.stat().st_mtime:
+        entry = {
+            "job_id": job["job_id"],
+            "kind": "style_claims_current_newer_than_jsonl_export",
+            "effective_claims_path": str(effective_claims_path),
+            "export_path": str(export_path),
+        }
+        snapshot["claim_export_drifts"].append(entry)
+        snapshot["drift_suspicions"].append(entry)
+    if not jsonl_rows_equal(effective_claims_path, export_path):
+        entry = {
+            "job_id": job["job_id"],
+            "kind": "jsonl_export_differs_from_effective_claims",
+            "effective_claims_count": len(_read_jsonl(effective_claims_path)),
+            "export_claims_count": len(_read_jsonl(export_path)),
+            "effective_claims_path": str(effective_claims_path),
+            "export_path": str(export_path),
+        }
+        snapshot["claim_export_drifts"].append(entry)
+        snapshot["drift_suspicions"].append(entry)
+
+
+def _audit_obsidian_drift(snapshot: dict[str, Any], *, job: sqlite3.Row, paths: JobPaths) -> None:
+    effective_claims_path = effective_style_claims_path_for_paths(paths)
+    if not effective_claims_path.exists():
+        return
+    claims_mtime = effective_claims_path.stat().st_mtime
+    video_note = paths.obsidian_video_note(str(job["video_id"]))
+    if video_note.exists() and video_note.stat().st_mtime < claims_mtime:
+        entry = {
+            "job_id": job["job_id"],
+            "kind": "obsidian_video_note_older_than_effective_claims",
+            "path": str(video_note),
+        }
+        snapshot["obsidian_drifts"].append(entry)
+        snapshot["drift_suspicions"].append(entry)
+    chunks = _read_jsonl(paths.chunks_jsonl)
+    expected_names = {f"{row.get('chunk_id')}.md" for row in chunks if row.get("chunk_id")}
+    chunks_dir = paths.export_obsidian_dir / "chunks"
+    existing_names = {path.name for path in chunks_dir.glob("*.md")} if chunks_dir.exists() else set()
+    missing = sorted(expected_names - existing_names)
+    extra = sorted(existing_names - expected_names)
+    if missing or extra:
+        entry = {
+            "job_id": job["job_id"],
+            "kind": "obsidian_chunk_note_set_mismatch",
+            "missing": missing,
+            "extra": extra,
+            "chunks_dir": str(chunks_dir),
+        }
+        snapshot["obsidian_drifts"].append(entry)
+        snapshot["drift_suspicions"].append(entry)
+
+
+def _chunk_combined_visual_component(row: dict[str, Any]) -> str:
+    return "\n".join(
+        str(part).strip()
+        for part in [row.get("presenter_brief"), row.get("visual_text")]
+        if str(part or "").strip()
+    )
 
 
 def _audit_pipeline_events(snapshot: dict[str, Any], *, paths: JobPaths) -> None:
@@ -476,6 +587,9 @@ def _console_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
         "provider_failures_by_status_code": snapshot.get("provider_failures_by_status_code"),
         "quality_warning_templates": snapshot.get("quality_warning_templates"),
         "stale_failure_reports": snapshot.get("stale_failure_reports"),
+        "claim_export_drifts": snapshot.get("claim_export_drifts"),
+        "quality_report_drifts": snapshot.get("quality_report_drifts"),
+        "obsidian_drifts": snapshot.get("obsidian_drifts"),
         "drift_suspicions": snapshot.get("drift_suspicions"),
         "subprocess_success_error_code_leaks_count": len(subprocess_leaks),
         "subprocess_success_error_code_leaks_sample": subprocess_leaks[:10],

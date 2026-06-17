@@ -34,9 +34,33 @@ Use this before and after pipeline changes to compare:
 - final `quality_report.json` warnings;
 - stale unresolved `failure_report.json`;
 - resolved failure history;
-- lightweight DB/artifact drift suspicion.
+- lightweight DB/artifact drift suspicion;
+- dashboard overlay jobs;
+- JSONL style-claim export drift from effective claims;
+- stale quality-report claim counts;
+- Obsidian video/chunk-note drift.
 
 Audit must stay read-only for job artifacts and SQLite state. It may write only diagnostics snapshots.
+
+## Refresh KB Exports
+
+Reconcile already-completed jobs whose dashboard claim overlay has not reached derived KB
+surfaces:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src .venv/bin/python -m style_kb.maintenance.refresh_kb_exports
+```
+
+The command iterates jobs from `mens-style-kb/jobs.sqlite3`, skips jobs that are not
+completed or have a live lock pid, and refreshes only existing surfaces:
+
+- `exports/jsonl/style_claims.jsonl`;
+- claim-owned fields in `exports/jsonl/manifest.json`;
+- human-facing Obsidian Markdown under `exports/obsidian/`.
+
+It is export-only. It never runs stage 13, never renumbers `claim_id`, and never changes
+`claims/style_claims.jsonl`, `claims/style_claims_raw.json`, or dashboard overlay files.
+It leaves `reports/quality_report.json` for an explicit pipeline rebuild/stage 16.
 
 ## Delete One Job
 

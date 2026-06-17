@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import hashlib
 import mimetypes
+import os
 import re
 import sqlite3
 import threading
-from copy import deepcopy
 from collections import Counter, deque
+from contextlib import closing
+from copy import deepcopy
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -16,6 +18,7 @@ from urllib.parse import unquote, urlparse
 
 from style_kb.config import load_default_config
 from style_kb.dashboard.assets import APP_JS, INDEX_HTML, STYLES_CSS
+from style_kb.export.claim_surfaces import ClaimSurfaceRefreshResult, refresh_existing_claim_surfaces
 from style_kb.models import ClaimType, ConfidenceLevel, StyleClaim
 from style_kb.pipeline.paths import JobPaths
 from style_kb.utils.files import write_json_atomic, write_jsonl_atomic
@@ -298,6 +301,7 @@ def job_payload(output_root: Path, job_id: str) -> dict[str, Any]:
         "pipeline_events": pipeline_events,
     }
     payload["quality_issues"] = build_quality_issues(payload)
+    payload["derived_artifacts_stale"] = derived_artifacts_stale(paths)
     payload["derived"] = derive_summary(payload)
     return payload
 
@@ -326,7 +330,7 @@ def db_jobs(output_root: Path) -> list[dict[str, Any]]:
     db_path = output_root / "jobs.sqlite3"
     if not db_path.exists():
         return []
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection:
         connection.row_factory = sqlite3.Row
         rows = connection.execute("SELECT * FROM jobs ORDER BY created_at DESC").fetchall()
     return [dict(row) for row in rows]
@@ -336,7 +340,7 @@ def get_job(output_root: Path, job_id: str) -> dict[str, Any] | None:
     db_path = output_root / "jobs.sqlite3"
     if not db_path.exists():
         return None
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection:
         connection.row_factory = sqlite3.Row
         row = connection.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
     if row is None:
@@ -348,7 +352,7 @@ def list_stages(output_root: Path, job_id: str) -> list[dict[str, Any]]:
     db_path = output_root / "jobs.sqlite3"
     if not db_path.exists():
         return []
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection:
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
             "SELECT * FROM stages WHERE job_id = ? ORDER BY ordinal ASC",
@@ -477,6 +481,62 @@ def current_claims_path(paths: JobPaths) -> Path:
     return paths.style_claims_current_jsonl
 
 
+def ensure_dashboard_claim_edit_allowed(output_root: Path, paths: JobPaths) -> None:
+    job = get_job(output_root, paths.job_id) or synthesize_job(paths)
+    status = str(job.get("status") or "").lower()
+    if status != "completed":
+        raise DashboardError(
+            "job_not_completed",
+            "dashboard claim edits are allowed only after the job is completed",
+            status=409,
+        )
+    lock_pid = int(job.get("lock_pid") or 0)
+    if lock_pid and _is_pid_alive(lock_pid):
+        raise DashboardError(
+            "job_locked",
+            f"job is locked by running pipeline process pid={lock_pid}",
+            status=409,
+        )
+
+
+def derived_artifacts_stale(paths: JobPaths) -> dict[str, Any]:
+    current_path = current_claims_path(paths) if current_claims_path(paths).exists() else paths.style_claims_jsonl
+    if not current_path.exists():
+        return {}
+    stale: dict[str, Any] = {}
+    current_mtime = current_path.stat().st_mtime
+    quality_path = paths.quality_report
+    if quality_path.exists() and quality_path.stat().st_mtime < current_mtime:
+        stale["reports/quality_report.json"] = "quality report predates effective style claims"
+    jsonl_claims_path = paths.export_jsonl("style_claims.jsonl")
+    if jsonl_claims_path.exists() and jsonl_claims_path.stat().st_mtime < current_mtime:
+        stale["exports/jsonl/style_claims.jsonl"] = "JSONL style claims export predates effective style claims"
+    manifest_path = paths.export_jsonl("manifest.json")
+    if manifest_path.exists() and manifest_path.stat().st_mtime < current_mtime:
+        stale["exports/jsonl/manifest.json"] = "JSONL manifest predates effective style claims"
+    obsidian_paths = [
+        paths.obsidian_index,
+        *sorted((paths.export_obsidian_dir / "videos").glob("*.md")),
+        *sorted((paths.export_obsidian_dir / "chunks").glob("*.md")),
+    ]
+    stale_obsidian = [path for path in obsidian_paths if path.exists() and path.stat().st_mtime < current_mtime]
+    if stale_obsidian:
+        stale["exports/obsidian"] = f"{len(stale_obsidian)} Obsidian note(s) predate effective style claims"
+    return stale
+
+
+def _is_pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def read_human_review(paths: JobPaths) -> dict[str, Any]:
     payload = read_json(paths.human_review_report)
     if not isinstance(payload, dict):
@@ -547,6 +607,7 @@ def update_claim(output_root: Path, job_id: str, claim_id: str, updates: Any) ->
     paths = JobPaths(output_root, job_id)
     if not paths.job_dir.exists():
         raise DashboardError("job_not_found", f"job not found: {job_id}", status=404)
+    ensure_dashboard_claim_edit_allowed(output_root, paths)
 
     original_claims = read_jsonl(paths.style_claims_jsonl)
     original_by_id = {claim.get("claim_id"): claim for claim in original_claims if claim.get("claim_id")}
@@ -587,10 +648,11 @@ def update_claim(output_root: Path, job_id: str, claim_id: str, updates: Any) ->
             }
             next_claim_edits = [*claim_edits, edit_record]
             write_jsonl_atomic(edits_path, next_claim_edits)
+        refresh_result = None
         if next_claim_edits:
-            write_current_claims(paths, original_claims, next_claim_edits)
+            refresh_result = write_current_claims(paths, original_claims, next_claim_edits)
 
-    return job_payload(output_root, job_id)
+    return job_payload_with_refresh_result(output_root, job_id, refresh_result)
 
 
 def delete_claim(output_root: Path, job_id: str, claim_id: str) -> dict[str, Any]:
@@ -602,6 +664,7 @@ def delete_claim(output_root: Path, job_id: str, claim_id: str) -> dict[str, Any
     paths = JobPaths(output_root, job_id)
     if not paths.job_dir.exists():
         raise DashboardError("job_not_found", f"job not found: {job_id}", status=404)
+    ensure_dashboard_claim_edit_allowed(output_root, paths)
 
     original_claims = read_jsonl(paths.style_claims_jsonl)
     original_by_id = {claim.get("claim_id"): claim for claim in original_claims if claim.get("claim_id")}
@@ -638,9 +701,9 @@ def delete_claim(output_root: Path, job_id: str, claim_id: str) -> dict[str, Any
             }
             claim_edits = [*claim_edits, edit_record]
             write_jsonl_atomic(edits_path, claim_edits)
-        write_current_claims(paths, original_claims, claim_edits)
+        refresh_result = write_current_claims(paths, original_claims, claim_edits)
 
-    return job_payload(output_root, job_id)
+    return job_payload_with_refresh_result(output_root, job_id, refresh_result)
 
 
 def claim_edit_lock(path: Path) -> threading.Lock:
@@ -747,16 +810,39 @@ def claim_delete_id(job_id: str, claim_id: str, edited_at: str, deleted_claim: d
     return f"manual_claim_delete_{short_hash(fingerprint)}"
 
 
-def write_current_claims(paths: JobPaths, original_claims: list[dict[str, Any]], claim_edits: list[dict[str, Any]]) -> None:
+def write_current_claims(
+    paths: JobPaths,
+    original_claims: list[dict[str, Any]],
+    claim_edits: list[dict[str, Any]],
+) -> ClaimSurfaceRefreshResult:
     current_claims = current_claim_rows(original_claims, claim_edits)
     write_jsonl_atomic(current_claims_path(paths), current_claims)
-    write_existing_exported_claims(paths, current_claims)
+    return refresh_existing_claim_surfaces(paths=paths, config=load_default_config())
 
 
-def write_existing_exported_claims(paths: JobPaths, current_claims: list[dict[str, Any]]) -> None:
-    exported_claims_path = paths.export_jsonl("style_claims.jsonl")
-    if exported_claims_path.exists():
-        write_jsonl_atomic(exported_claims_path, current_claims)
+def job_payload_with_refresh_result(
+    output_root: Path,
+    job_id: str,
+    refresh_result: ClaimSurfaceRefreshResult | None,
+) -> dict[str, Any]:
+    payload = job_payload(output_root, job_id)
+    if refresh_result is None:
+        return payload
+    refresh_payload = {
+        "jsonl_refreshed": refresh_result.jsonl_refreshed,
+        "jsonl_skipped": refresh_result.jsonl_skipped,
+        "manifest_refreshed": refresh_result.manifest_refreshed,
+        "obsidian_refreshed": refresh_result.obsidian_refreshed,
+        "obsidian_skipped": refresh_result.obsidian_skipped,
+        "stale_obsidian_notes_removed": refresh_result.stale_obsidian_notes_removed,
+        "errors": refresh_result.stale_payload(),
+    }
+    payload["claim_surface_refresh"] = refresh_payload
+    if refresh_result.has_errors:
+        stale = dict(payload.get("derived_artifacts_stale") or {})
+        stale.update(refresh_result.stale_payload())
+        payload["derived_artifacts_stale"] = stale
+    return payload
 
 
 def current_claim_rows(original_claims: list[dict[str, Any]], claim_edits: list[dict[str, Any]]) -> list[dict[str, Any]]:

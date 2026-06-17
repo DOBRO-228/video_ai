@@ -10,6 +10,10 @@ make dashboard
 
 The dashboard reads `src/style_kb/config/default.yaml`, opens `./mens-style-kb` by default, and serves a localhost URL. It does not modify SQLite pipeline state, the public `style-kb ingest/status/resume` CLI contract, or the original LLM-generated `claims/style_claims.jsonl` artifact. Manual dashboard state is stored as separate dashboard-managed artifacts. Ingest/resume may be run with an optional stage number, such as `style-kb ingest URL 9`, to stop after stage 09 and inspect intermediate artifacts. Ingest/resume may also use `--batch` to enable eligible OpenAI Batch API requests for that run.
 
+Dashboard claim edits are terminal post-pipeline edits. They are allowed only after the job
+is completed and no live pipeline lock is present. Run all required `resume` commands before
+editing claims in the dashboard.
+
 Job review metadata:
 
 ```text
@@ -34,7 +38,19 @@ claims/style_claims_manual_edits.jsonl
 - `style_claims_current.jsonl`: current Claims after applying all manual edits and deletes. The dashboard rebuilds this file atomically after every saved edit or delete.
 - `style_claims_manual_edits.jsonl`: append-only audit log. Each update record includes the original LLM Claim, the previous effective Claim, the updated Claim, changed fields, timestamp, and actor. Delete records use `action: delete`, keep the original and previous effective Claim, and remove the Claim only from the current dashboard/materialized overlay.
 
-The dashboard applies the audit log as an overlay when displaying Claims, then materializes the same result into `style_claims_current.jsonl`. Deleting a Claim does not rewrite `style_claims.jsonl`. If `exports/jsonl/style_claims.jsonl` already exists, the dashboard also refreshes that KB-facing export copy so deleted Claims are removed from the import allowlist artifact immediately.
+The dashboard applies the audit log as an overlay when displaying Claims, then materializes the same result into `style_claims_current.jsonl`. Deleting a Claim does not rewrite `style_claims.jsonl`.
+
+After every saved claim edit/delete, the dashboard refreshes existing claim-derived
+surfaces:
+
+- `exports/jsonl/style_claims.jsonl` and claim-owned fields in `exports/jsonl/manifest.json`
+  (`style_claims_source`, `style_claims_sha256`, `style_claims_count`);
+- the human-facing Obsidian export under `exports/obsidian/`, rendered through the same
+  stage 15 path.
+
+The dashboard does not refresh `reports/quality_report.json`; the job payload reports it
+as stale when it predates the current claim overlay. If JSONL/Obsidian refresh fails, the
+overlay remains the source of truth and the failed derived surface is reported as stale.
 
 Views:
 

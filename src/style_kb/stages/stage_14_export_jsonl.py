@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from style_kb.export.jsonl import export_jsonl_bundle
+from style_kb.export.jsonl import export_jsonl_bundle, manifest_claim_metadata_matches
 from style_kb.pipeline.base import Stage, StageContext, StageResult
-from style_kb.stages.common import effective_style_claims_path
+from style_kb.stages.common import effective_style_claims_path, jsonl_rows_equal
 from style_kb.utils.files import read_json
 
 
@@ -37,7 +37,9 @@ class Stage14ExportJsonl(Stage):
             return False
         if not all(path.exists() for path in _expected_outputs(context)):
             return False
-        return _manifest_matches_config(context)
+        exported_claims = context.paths.export_jsonl("style_claims.jsonl")
+        effective_claims = effective_style_claims_path(context)
+        return jsonl_rows_equal(exported_claims, effective_claims) and _manifest_matches_config(context)
 
     def run(self, context: StageContext) -> StageResult:
         removed_stale_visual_exports = _remove_disabled_visual_outputs(context)
@@ -55,6 +57,7 @@ class Stage14ExportJsonl(Stage):
             style_claims_path=effective_style_claims_path(context),
             export_dir=context.paths.export_jsonl_dir,
             visual_enabled=context.config.pipeline.visual_enabled,
+            job_dir=context.paths.job_dir,
         )
         return StageResult(
             output_files=outputs,
@@ -110,6 +113,8 @@ def _manifest_matches_config(context: StageContext) -> bool:
         manifest = read_json(context.paths.export_jsonl("manifest.json"))
     except Exception:
         return False
+    if not isinstance(manifest, dict):
+        return False
     if manifest.get("visual_enabled") != context.config.pipeline.visual_enabled:
         return False
     filenames = {
@@ -119,5 +124,13 @@ def _manifest_matches_config(context: StageContext) -> bool:
     }
     visual_filenames = {"scenes.jsonl", "frame_refs.jsonl", "visual_events.jsonl"}
     if context.config.pipeline.visual_enabled:
-        return visual_filenames.issubset(filenames)
-    return filenames.isdisjoint(visual_filenames)
+        visual_config_matches = visual_filenames.issubset(filenames)
+    else:
+        visual_config_matches = filenames.isdisjoint(visual_filenames)
+    if not visual_config_matches:
+        return False
+    return manifest_claim_metadata_matches(
+        manifest,
+        effective_style_claims_path(context),
+        job_dir=context.paths.job_dir,
+    )
