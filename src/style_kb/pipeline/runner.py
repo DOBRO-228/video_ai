@@ -30,6 +30,9 @@ from style_kb.utils.json import pretty_json
 from style_kb.utils.youtube import extract_video_id
 
 
+_CLAIMS_OVERLAY_BLOCKS_STAGE13_REBUILD = "claims_overlay_blocks_stage13_rebuild"
+
+
 class PipelineRunner:
     def __init__(
         self,
@@ -206,6 +209,20 @@ class PipelineRunner:
         except Exception as error:
             setup_error = self._write_setup_failure_report(paths=paths, pipeline_logger=pipeline_logger, job=job, error=error)
             raise setup_error from error
+        original_job = self.repository.get_job(job.job_id) or job
+        if self._dashboard_overlay_blocks_stage13_run(paths=paths, stop_after_stage=stop_after_stage):
+            error = StageExecutionError(
+                _claims_overlay_blocks_stage13_message(),
+                error_code=_CLAIMS_OVERLAY_BLOCKS_STAGE13_REBUILD,
+                stage_name="13_extract_style_claims",
+            )
+            self._stop_for_claims_overlay_rebuild(
+                pipeline_logger=pipeline_logger,
+                job=job,
+                original_job=original_job,
+                error=error,
+            )
+            raise error
         try:
             job = self.repository.update_job(
                 job.job_id,
@@ -292,11 +309,8 @@ class PipelineRunner:
 
                 if stage.name == "13_extract_style_claims" and dashboard_overlay_exists(paths):
                     raise StageExecutionError(
-                        "refusing to rebuild stage 13 because dashboard claim overlay files exist; "
-                        "rebuilding style claims can change claim_id values and orphan manual edits. "
-                        "Move or remove claims/style_claims_current.jsonl and "
-                        "claims/style_claims_manual_edits.jsonl only after explicit discard/re-review.",
-                        error_code="claims_overlay_blocks_stage13_rebuild",
+                        _claims_overlay_blocks_stage13_message(),
+                        error_code=_CLAIMS_OVERLAY_BLOCKS_STAGE13_REBUILD,
                         stage_name=stage.name,
                     )
 
@@ -353,6 +367,14 @@ class PipelineRunner:
         except StageExecutionError as error:
             stage_name = job.current_stage or "unknown"
             error = error.with_stage(stage_name)
+            if error.error_code == _CLAIMS_OVERLAY_BLOCKS_STAGE13_REBUILD:
+                self._stop_for_claims_overlay_rebuild(
+                    pipeline_logger=pipeline_logger,
+                    job=job,
+                    original_job=original_job,
+                    error=error,
+                )
+                raise
             failed_stage = self._safe_mark_stage_failed(
                 job_id=job.job_id,
                 stage_name=stage_name,
@@ -987,10 +1009,26 @@ class PipelineRunner:
             return
 
     def _acquire_job_lock(self, job: Job) -> None:
-        live_pid = job.lock_pid if job.lock_pid and _is_pid_alive(job.lock_pid) else None
-        if job.status == JobState.RUNNING and live_pid is not None and live_pid != os.getpid():
+        current_job = self.repository.get_job(job.job_id)
+        if current_job is None:
+            raise JobLockError(f"job not found: {job.job_id}")
+        live_pid = current_job.lock_pid if current_job.lock_pid and _is_pid_alive(current_job.lock_pid) else None
+        if live_pid is not None and live_pid != os.getpid():
             raise JobLockError(f"job is already running: {job.job_id} (pid {live_pid})")
-        self.repository.set_job_lock(job.job_id, pid=os.getpid(), acquired_at=datetime.now(tz=UTC))
+        stale_pid = current_job.lock_pid if current_job.lock_pid and live_pid is None else None
+        locked_job = self.repository.try_acquire_job_lock(
+            job.job_id,
+            pid=os.getpid(),
+            acquired_at=datetime.now(tz=UTC),
+            stale_pid=stale_pid,
+        )
+        if locked_job is not None:
+            return
+        current_job = self.repository.get_job(job.job_id)
+        live_pid = current_job.lock_pid if current_job and current_job.lock_pid and _is_pid_alive(current_job.lock_pid) else None
+        if live_pid is not None and live_pid != os.getpid():
+            raise JobLockError(f"job is already running: {job.job_id} (pid {live_pid})")
+        raise JobLockError(f"job lock could not be acquired: {job.job_id}")
 
     def _release_job_lock(self, job_id: str) -> None:
         self.repository.set_job_lock(job_id, pid=None, acquired_at=None)
@@ -1000,6 +1038,57 @@ class PipelineRunner:
             self._release_job_lock(job_id)
         except Exception:
             return
+
+    def _stop_for_claims_overlay_rebuild(
+        self,
+        *,
+        pipeline_logger: PipelineLogger,
+        job: Job,
+        original_job: Job,
+        error: StageExecutionError,
+    ) -> None:
+        try:
+            self.repository.update_job(
+                job.job_id,
+                status=original_job.status,
+                current_stage=original_job.current_stage,
+                started_at=original_job.started_at,
+                finished_at=original_job.finished_at,
+                error_code=original_job.error_code,
+                error_message=original_job.error_message,
+            )
+        finally:
+            self._release_job_lock_safely(job.job_id)
+        data = {
+            "error_code": error.error_code,
+            "reason": "dashboard claim overlay files exist",
+        }
+        pipeline_logger.emit(
+            PipelineEvent.WARNING,
+            job_id=job.job_id,
+            video_id=job.video_id,
+            stage="13_extract_style_claims",
+            ordinal=13,
+            status=original_job.status,
+            message=str(error),
+            data=data,
+        )
+        pipeline_logger.emit(
+            PipelineEvent.RUN_STOPPED,
+            job_id=job.job_id,
+            video_id=job.video_id,
+            stage="13_extract_style_claims",
+            ordinal=13,
+            status=original_job.status,
+            message="run stopped before stage 13 to preserve dashboard claim edits",
+            data=data,
+        )
+
+    @staticmethod
+    def _dashboard_overlay_blocks_stage13_run(*, paths: JobPaths, stop_after_stage: int | None) -> bool:
+        if stop_after_stage is not None and stop_after_stage < 13:
+            return False
+        return dashboard_overlay_exists(paths)
 
     def _job_has_final_outputs(self, job: Job) -> bool:
         paths = JobPaths(self.output_root, job.job_id)
@@ -1239,6 +1328,15 @@ def _stage_by_ordinal(ordinal: int) -> Stage | None:
 def _stage_ordinal(stage_name: str) -> int:
     stage = _stage_by_name(stage_name)
     return stage.ordinal if stage is not None else 0
+
+
+def _claims_overlay_blocks_stage13_message() -> str:
+    return (
+        "refusing to rebuild stage 13 because dashboard claim overlay files exist; "
+        "rebuilding style claims can change claim_id values and orphan manual edits. "
+        "Refresh derived claim surfaces or move/remove claims/style_claims_current.jsonl and "
+        "claims/style_claims_manual_edits.jsonl only after explicit discard/re-review."
+    )
 
 
 def _validate_stop_after_stage(stop_after_stage: int | None) -> None:

@@ -12,7 +12,7 @@ from urllib.parse import quote
 
 from style_kb.config import load_default_config
 from style_kb.pipeline.paths import JobPaths
-from style_kb.stages.common import effective_style_claims_path_for_paths, jsonl_rows_equal
+from style_kb.stages.common import dashboard_overlay_exists, effective_style_claims_path_for_paths, jsonl_rows_equal
 from style_kb.stages.stage_10_describe_visuals import (
     presentation_noise_markers,
     technical_visual_markers,
@@ -197,7 +197,9 @@ def _audit_job_artifacts(
     quality_report = _read_json_or_none(paths.quality_report)
     if isinstance(quality_report, dict):
         _audit_quality_report(snapshot, job=job, stages=stages, paths=paths, quality_report=quality_report)
-    if job["status"] == "completed":
+    has_dashboard_overlay = dashboard_overlay_exists(paths)
+    _audit_dashboard_overlay(snapshot, job=job, paths=paths, has_dashboard_overlay=has_dashboard_overlay)
+    if job["status"] == "completed" or has_dashboard_overlay:
         _audit_claim_export_drift(snapshot, job=job, paths=paths)
         _audit_obsidian_drift(snapshot, job=job, paths=paths)
     _audit_visual_markers(snapshot, paths=paths)
@@ -331,21 +333,36 @@ def _audit_chunk_markers(snapshot: dict[str, Any], *, paths: JobPaths) -> None:
         )
 
 
+def _audit_dashboard_overlay(
+    snapshot: dict[str, Any],
+    *,
+    job: sqlite3.Row,
+    paths: JobPaths,
+    has_dashboard_overlay: bool,
+) -> None:
+    if not has_dashboard_overlay:
+        return
+    effective_claims_path = effective_style_claims_path_for_paths(paths)
+    snapshot["dashboard_overlay_jobs"].append(
+        {
+            "job_id": job["job_id"],
+            "job_status": job["status"],
+            "style_claims_current_exists": paths.style_claims_current_jsonl.exists(),
+            "style_claims_manual_edits_exists": paths.style_claims_manual_edits_jsonl.exists(),
+            "effective_claims_path": str(effective_claims_path),
+        }
+    )
+
+
 def _audit_claim_export_drift(snapshot: dict[str, Any], *, job: sqlite3.Row, paths: JobPaths) -> None:
     effective_claims_path = effective_style_claims_path_for_paths(paths)
-    if paths.style_claims_current_jsonl.exists():
-        snapshot["dashboard_overlay_jobs"].append(
-            {
-                "job_id": job["job_id"],
-                "effective_claims_path": str(effective_claims_path),
-            }
-        )
     export_path = paths.export_jsonl("style_claims.jsonl")
     if not effective_claims_path.exists() or not export_path.exists():
         return
     if paths.style_claims_current_jsonl.exists() and paths.style_claims_current_jsonl.stat().st_mtime > export_path.stat().st_mtime:
         entry = {
             "job_id": job["job_id"],
+            "job_status": job["status"],
             "kind": "style_claims_current_newer_than_jsonl_export",
             "effective_claims_path": str(effective_claims_path),
             "export_path": str(export_path),
@@ -355,6 +372,7 @@ def _audit_claim_export_drift(snapshot: dict[str, Any], *, job: sqlite3.Row, pat
     if not jsonl_rows_equal(effective_claims_path, export_path):
         entry = {
             "job_id": job["job_id"],
+            "job_status": job["status"],
             "kind": "jsonl_export_differs_from_effective_claims",
             "effective_claims_count": len(_read_jsonl(effective_claims_path)),
             "export_claims_count": len(_read_jsonl(export_path)),
@@ -374,6 +392,7 @@ def _audit_obsidian_drift(snapshot: dict[str, Any], *, job: sqlite3.Row, paths: 
     if video_note.exists() and video_note.stat().st_mtime < claims_mtime:
         entry = {
             "job_id": job["job_id"],
+            "job_status": job["status"],
             "kind": "obsidian_video_note_older_than_effective_claims",
             "path": str(video_note),
         }
@@ -388,6 +407,7 @@ def _audit_obsidian_drift(snapshot: dict[str, Any], *, job: sqlite3.Row, paths: 
     if missing or extra:
         entry = {
             "job_id": job["job_id"],
+            "job_status": job["status"],
             "kind": "obsidian_chunk_note_set_mismatch",
             "missing": missing,
             "extra": extra,

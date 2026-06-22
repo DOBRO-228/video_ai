@@ -8,7 +8,7 @@ Run from the repository root:
 make dashboard
 ```
 
-The dashboard reads `src/style_kb/config/default.yaml`, opens `./mens-style-kb` by default, and serves a localhost URL. It does not modify SQLite pipeline state, the public `style-kb ingest/status/resume` CLI contract, or the original LLM-generated `claims/style_claims.jsonl` artifact. Manual dashboard state is stored as separate dashboard-managed artifacts. Ingest/resume may be run with an optional stage number, such as `style-kb ingest URL 9`, to stop after stage 09 and inspect intermediate artifacts. Ingest/resume may also use `--batch` to enable eligible OpenAI Batch API requests for that run.
+The dashboard reads `src/style_kb/config/default.yaml`, opens `./mens-style-kb` by default, and serves a localhost URL. It does not change the public `style-kb ingest/status/resume` CLI contract or the original LLM-generated `claims/style_claims.jsonl` artifact. Manual dashboard state is stored as separate dashboard-managed artifacts. Claim edits briefly acquire the same SQLite job lock used by the pipeline and update only the SQLite state for stage 16 after refreshing the quality report. Ingest/resume may be run with an optional stage number, such as `style-kb ingest URL 9`, to stop after stage 09 and inspect intermediate artifacts. Ingest/resume may also use `--batch` to enable eligible OpenAI Batch API requests for that run.
 
 Dashboard claim edits are terminal post-pipeline edits. They are allowed only after the job
 is completed and no live pipeline lock is present. Run all required `resume` commands before
@@ -46,11 +46,12 @@ surfaces:
 - `exports/jsonl/style_claims.jsonl` and claim-owned fields in `exports/jsonl/manifest.json`
   (`style_claims_source`, `style_claims_sha256`, `style_claims_count`);
 - the human-facing Obsidian export under `exports/obsidian/`, rendered through the same
-  stage 15 path.
+  stage 15 path;
+- `reports/quality_report.json`, recomputed through the same builder as stage 16, plus
+  the SQLite state for stage 16.
 
-The dashboard does not refresh `reports/quality_report.json`; the job payload reports it
-as stale when it predates the current claim overlay. If JSONL/Obsidian refresh fails, the
-overlay remains the source of truth and the failed derived surface is reported as stale.
+If any derived refresh fails, the overlay remains the source of truth and the failed
+derived surface is reported as stale.
 
 Views:
 

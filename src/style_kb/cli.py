@@ -81,6 +81,10 @@ def _run_command(func, *, action: str) -> None:
     try:
         job = func()
     except StyleKbError as error:
+        error_code = getattr(error, "error_code", None)
+        if error_code == "claims_overlay_blocks_stage13_rebuild":
+            typer.secho(f"{action} stopped: {error_code}: {error}", err=True, fg=typer.colors.YELLOW)
+            raise typer.Exit(code=1) from error
         typer.secho(f"{action} failed: {error}", err=True, fg=typer.colors.RED)
         raise typer.Exit(code=1) from error
     typer.echo(f"job_id: {job.job_id}")

@@ -70,8 +70,10 @@ The stage can be skipped when `style_claims.jsonl` parses as `StyleClaim`, `styl
 - Claims must remain normalized Russian knowledge objects with timestamp/source grounding.
 - Dashboard overlays are terminal post-pipeline edits. If `claims/style_claims_current.jsonl`
   or a non-empty `claims/style_claims_manual_edits.jsonl` exists, `resume` must not re-run
-  this stage. The runner fails before mutating stage 13 outputs because `_renumber_claims`
-  can orphan dashboard edits.
+  this stage. The runner performs an early preflight before executing upstream stages
+  when the current run would reach stage 13. The refusal preserves the previous job
+  status and avoids mutating stage 13 outputs because `_renumber_claims` can orphan
+  dashboard edits.
 - Curation intentionally does not auto-split or auto-rewrite canonical claims in the MVP. Those suggestions are collected for later analysis across multiple jobs.
 - `--batch` is the only CLI execution switch for claim extraction. Do not add CLI controls for provider, model, prompt, chunking, quality, output path, or partial extraction behavior.
 

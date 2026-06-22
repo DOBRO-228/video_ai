@@ -39,6 +39,8 @@ Use this before and after pipeline changes to compare:
 - JSONL style-claim export drift from effective claims;
 - stale quality-report claim counts;
 - Obsidian video/chunk-note drift.
+- overlay and export/Obsidian drift for jobs that are not completed but still carry
+  `claims/style_claims_current.jsonl` or non-empty manual edit records.
 
 Audit must stay read-only for job artifacts and SQLite state. It may write only diagnostics snapshots.
 
@@ -57,10 +59,12 @@ completed or have a live lock pid, and refreshes only existing surfaces:
 - `exports/jsonl/style_claims.jsonl`;
 - claim-owned fields in `exports/jsonl/manifest.json`;
 - human-facing Obsidian Markdown under `exports/obsidian/`.
+- `reports/quality_report.json` and the SQLite state for stage 16.
 
-It is export-only. It never runs stage 13, never renumbers `claim_id`, and never changes
+It never runs stage 13, never renumbers `claim_id`, and never changes
 `claims/style_claims.jsonl`, `claims/style_claims_raw.json`, or dashboard overlay files.
-It leaves `reports/quality_report.json` for an explicit pipeline rebuild/stage 16.
+The quality report is recomputed from the same stage 16 logic used by the pipeline and
+is written only for unlocked completed jobs.
 
 ## Delete One Job
 

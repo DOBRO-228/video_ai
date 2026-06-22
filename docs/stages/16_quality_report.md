@@ -61,8 +61,10 @@ artifacts, effective style claims, and visual artifacts when visuals are enabled
 - Speaker count is not fixed. Quality report warns only when diarization is enabled but no speaker labels are detected.
 - Empty style claims are a warning, not a hard failure, because some chunks may contain only service or promotional content.
 - Dashboard-deleted claims are excluded from claim-aware quality counts after `style_claims_current.jsonl` exists.
-- Dashboard edits do not refresh this report immediately. Dashboard/API payloads should
-  show the report as stale when it predates the current claim overlay.
+- Dashboard edits and the maintenance refresh path reuse the stage 16 report builder to
+  refresh this report from effective claims without rebuilding stage 13. Those paths must
+  also update the SQLite state for stage 16 so diagnostics do not report a DB/artifact
+  timestamp drift.
 
 ## Related Code
 

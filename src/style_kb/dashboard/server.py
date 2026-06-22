@@ -21,6 +21,7 @@ from style_kb.dashboard.assets import APP_JS, INDEX_HTML, STYLES_CSS
 from style_kb.export.claim_surfaces import ClaimSurfaceRefreshResult, refresh_existing_claim_surfaces
 from style_kb.models import ClaimType, ConfidenceLevel, StyleClaim
 from style_kb.pipeline.paths import JobPaths
+from style_kb.state.repository import StateRepository
 from style_kb.utils.files import write_json_atomic, write_jsonl_atomic
 
 
@@ -491,7 +492,7 @@ def ensure_dashboard_claim_edit_allowed(output_root: Path, paths: JobPaths) -> N
             status=409,
         )
     lock_pid = int(job.get("lock_pid") or 0)
-    if lock_pid and _is_pid_alive(lock_pid):
+    if lock_pid and lock_pid != os.getpid() and _is_pid_alive(lock_pid):
         raise DashboardError(
             "job_locked",
             f"job is locked by running pipeline process pid={lock_pid}",
@@ -607,50 +608,59 @@ def update_claim(output_root: Path, job_id: str, claim_id: str, updates: Any) ->
     paths = JobPaths(output_root, job_id)
     if not paths.job_dir.exists():
         raise DashboardError("job_not_found", f"job not found: {job_id}", status=404)
-    ensure_dashboard_claim_edit_allowed(output_root, paths)
-
-    original_claims = read_jsonl(paths.style_claims_jsonl)
-    original_by_id = {claim.get("claim_id"): claim for claim in original_claims if claim.get("claim_id")}
-    original_claim = original_by_id.get(claim_id)
-    if not original_claim:
-        raise DashboardError("claim_not_found", f"claim not found: {claim_id}", status=404)
 
     edits_path = claim_edits_path(paths)
+    repository = StateRepository(paths.database_path)
     with claim_edit_lock(edits_path):
-        claim_edits = read_jsonl(edits_path)
-        next_claim_edits = claim_edits
-        effective_by_id = {
-            claim.get("claim_id"): strip_claim_dashboard_fields(claim)
-            for claim in apply_claim_edits(original_claims, claim_edits)
-            if claim.get("claim_id")
-        }
-        previous_claim = effective_by_id.get(claim_id)
-        if previous_claim is None:
-            raise DashboardError("claim_deleted", f"claim was deleted: {claim_id}", status=409)
-        updated_claim = build_updated_claim(previous_claim, updates)
-        changes = claim_field_changes(previous_claim, updated_claim)
-        if changes:
-            edited_at = datetime.now(tz=UTC).isoformat(timespec="microseconds")
-            edit_record = {
-                "schema_version": 1,
-                "edit_id": claim_edit_id(job_id, claim_id, edited_at, updated_claim),
-                "action": "update",
-                "actor": "dashboard",
-                "job_id": job_id,
-                "claim_id": claim_id,
-                "edited_at": edited_at,
-                "original_artifact": "claims/style_claims.jsonl",
-                "original_claim": strip_claim_dashboard_fields(original_claim),
-                "previous_claim": strip_claim_dashboard_fields(previous_claim),
-                "updated_claim": strip_claim_dashboard_fields(updated_claim),
-                "changed_fields": list(changes.keys()),
-                "field_changes": changes,
+        _acquire_dashboard_job_lock(repository, job_id)
+        try:
+            ensure_dashboard_claim_edit_allowed(output_root, paths)
+            original_claims = read_jsonl(paths.style_claims_jsonl)
+            original_by_id = {claim.get("claim_id"): claim for claim in original_claims if claim.get("claim_id")}
+            original_claim = original_by_id.get(claim_id)
+            if not original_claim:
+                raise DashboardError("claim_not_found", f"claim not found: {claim_id}", status=404)
+            claim_edits = read_jsonl(edits_path)
+            next_claim_edits = claim_edits
+            effective_by_id = {
+                claim.get("claim_id"): strip_claim_dashboard_fields(claim)
+                for claim in apply_claim_edits(original_claims, claim_edits)
+                if claim.get("claim_id")
             }
-            next_claim_edits = [*claim_edits, edit_record]
-            write_jsonl_atomic(edits_path, next_claim_edits)
-        refresh_result = None
-        if next_claim_edits:
-            refresh_result = write_current_claims(paths, original_claims, next_claim_edits)
+            previous_claim = effective_by_id.get(claim_id)
+            if previous_claim is None:
+                raise DashboardError("claim_deleted", f"claim was deleted: {claim_id}", status=409)
+            updated_claim = build_updated_claim(previous_claim, updates)
+            changes = claim_field_changes(previous_claim, updated_claim)
+            if changes:
+                edited_at = datetime.now(tz=UTC).isoformat(timespec="microseconds")
+                edit_record = {
+                    "schema_version": 1,
+                    "edit_id": claim_edit_id(job_id, claim_id, edited_at, updated_claim),
+                    "action": "update",
+                    "actor": "dashboard",
+                    "job_id": job_id,
+                    "claim_id": claim_id,
+                    "edited_at": edited_at,
+                    "original_artifact": "claims/style_claims.jsonl",
+                    "original_claim": strip_claim_dashboard_fields(original_claim),
+                    "previous_claim": strip_claim_dashboard_fields(previous_claim),
+                    "updated_claim": strip_claim_dashboard_fields(updated_claim),
+                    "changed_fields": list(changes.keys()),
+                    "field_changes": changes,
+                }
+                next_claim_edits = [*claim_edits, edit_record]
+                write_jsonl_atomic(edits_path, next_claim_edits)
+            refresh_result = None
+            if next_claim_edits:
+                refresh_result = write_current_claims(
+                    paths,
+                    original_claims,
+                    next_claim_edits,
+                    repository=repository,
+                )
+        finally:
+            _release_dashboard_job_lock_safely(repository, job_id)
 
     return job_payload_with_refresh_result(output_root, job_id, refresh_result)
 
@@ -664,44 +674,53 @@ def delete_claim(output_root: Path, job_id: str, claim_id: str) -> dict[str, Any
     paths = JobPaths(output_root, job_id)
     if not paths.job_dir.exists():
         raise DashboardError("job_not_found", f"job not found: {job_id}", status=404)
-    ensure_dashboard_claim_edit_allowed(output_root, paths)
-
-    original_claims = read_jsonl(paths.style_claims_jsonl)
-    original_by_id = {claim.get("claim_id"): claim for claim in original_claims if claim.get("claim_id")}
-    original_claim = original_by_id.get(claim_id)
-    if not original_claim:
-        raise DashboardError("claim_not_found", f"claim not found: {claim_id}", status=404)
 
     edits_path = claim_edits_path(paths)
+    repository = StateRepository(paths.database_path)
     with claim_edit_lock(edits_path):
-        claim_edits = read_jsonl(edits_path)
-        effective_by_id = {
-            claim.get("claim_id"): strip_claim_dashboard_fields(claim)
-            for claim in apply_claim_edits(original_claims, claim_edits)
-            if claim.get("claim_id")
-        }
-        previous_claim = effective_by_id.get(claim_id)
-        if previous_claim is not None:
-            edited_at = datetime.now(tz=UTC).isoformat(timespec="microseconds")
-            deleted_claim = strip_claim_dashboard_fields(previous_claim)
-            edit_record = {
-                "schema_version": 1,
-                "edit_id": claim_delete_id(job_id, claim_id, edited_at, deleted_claim),
-                "action": "delete",
-                "actor": "dashboard",
-                "job_id": job_id,
-                "claim_id": claim_id,
-                "edited_at": edited_at,
-                "original_artifact": "claims/style_claims.jsonl",
-                "original_claim": strip_claim_dashboard_fields(original_claim),
-                "previous_claim": deleted_claim,
-                "deleted_claim": deleted_claim,
-                "changed_fields": ["deleted"],
-                "field_changes": {"deleted": {"before": False, "after": True}},
+        _acquire_dashboard_job_lock(repository, job_id)
+        try:
+            ensure_dashboard_claim_edit_allowed(output_root, paths)
+            original_claims = read_jsonl(paths.style_claims_jsonl)
+            original_by_id = {claim.get("claim_id"): claim for claim in original_claims if claim.get("claim_id")}
+            original_claim = original_by_id.get(claim_id)
+            if not original_claim:
+                raise DashboardError("claim_not_found", f"claim not found: {claim_id}", status=404)
+            claim_edits = read_jsonl(edits_path)
+            effective_by_id = {
+                claim.get("claim_id"): strip_claim_dashboard_fields(claim)
+                for claim in apply_claim_edits(original_claims, claim_edits)
+                if claim.get("claim_id")
             }
-            claim_edits = [*claim_edits, edit_record]
-            write_jsonl_atomic(edits_path, claim_edits)
-        refresh_result = write_current_claims(paths, original_claims, claim_edits)
+            previous_claim = effective_by_id.get(claim_id)
+            if previous_claim is not None:
+                edited_at = datetime.now(tz=UTC).isoformat(timespec="microseconds")
+                deleted_claim = strip_claim_dashboard_fields(previous_claim)
+                edit_record = {
+                    "schema_version": 1,
+                    "edit_id": claim_delete_id(job_id, claim_id, edited_at, deleted_claim),
+                    "action": "delete",
+                    "actor": "dashboard",
+                    "job_id": job_id,
+                    "claim_id": claim_id,
+                    "edited_at": edited_at,
+                    "original_artifact": "claims/style_claims.jsonl",
+                    "original_claim": strip_claim_dashboard_fields(original_claim),
+                    "previous_claim": deleted_claim,
+                    "deleted_claim": deleted_claim,
+                    "changed_fields": ["deleted"],
+                    "field_changes": {"deleted": {"before": False, "after": True}},
+                }
+                claim_edits = [*claim_edits, edit_record]
+                write_jsonl_atomic(edits_path, claim_edits)
+            refresh_result = write_current_claims(
+                paths,
+                original_claims,
+                claim_edits,
+                repository=repository,
+            )
+        finally:
+            _release_dashboard_job_lock_safely(repository, job_id)
 
     return job_payload_with_refresh_result(output_root, job_id, refresh_result)
 
@@ -714,6 +733,44 @@ def claim_edit_lock(path: Path) -> threading.Lock:
             lock = threading.Lock()
             _CLAIM_EDIT_LOCKS[normalized] = lock
         return lock
+
+
+def _acquire_dashboard_job_lock(repository: StateRepository, job_id: str) -> None:
+    current_job = repository.get_job(job_id)
+    if current_job is None:
+        raise DashboardError("job_not_found", f"job not found: {job_id}", status=404)
+    live_pid = current_job.lock_pid if current_job.lock_pid and _is_pid_alive(current_job.lock_pid) else None
+    if live_pid is not None and live_pid != os.getpid():
+        raise DashboardError(
+            "job_locked",
+            f"job is locked by running pipeline process pid={live_pid}",
+            status=409,
+        )
+    stale_pid = current_job.lock_pid if current_job.lock_pid and live_pid is None else None
+    locked_job = repository.try_acquire_job_lock(
+        job_id,
+        pid=os.getpid(),
+        acquired_at=datetime.now(tz=UTC),
+        stale_pid=stale_pid,
+    )
+    if locked_job is not None:
+        return
+    current_job = repository.get_job(job_id)
+    live_pid = current_job.lock_pid if current_job and current_job.lock_pid and _is_pid_alive(current_job.lock_pid) else None
+    if live_pid is not None and live_pid != os.getpid():
+        raise DashboardError(
+            "job_locked",
+            f"job is locked by running pipeline process pid={live_pid}",
+            status=409,
+        )
+    raise DashboardError("job_locked", f"job lock could not be acquired: {job_id}", status=409)
+
+
+def _release_dashboard_job_lock_safely(repository: StateRepository, job_id: str) -> None:
+    try:
+        repository.set_job_lock(job_id, pid=None, acquired_at=None)
+    except Exception:
+        return
 
 
 def build_updated_claim(previous_claim: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
@@ -814,10 +871,12 @@ def write_current_claims(
     paths: JobPaths,
     original_claims: list[dict[str, Any]],
     claim_edits: list[dict[str, Any]],
+    *,
+    repository: StateRepository,
 ) -> ClaimSurfaceRefreshResult:
     current_claims = current_claim_rows(original_claims, claim_edits)
     write_jsonl_atomic(current_claims_path(paths), current_claims)
-    return refresh_existing_claim_surfaces(paths=paths, config=load_default_config())
+    return refresh_existing_claim_surfaces(paths=paths, config=load_default_config(), repository=repository)
 
 
 def job_payload_with_refresh_result(
@@ -835,6 +894,8 @@ def job_payload_with_refresh_result(
         "obsidian_refreshed": refresh_result.obsidian_refreshed,
         "obsidian_skipped": refresh_result.obsidian_skipped,
         "stale_obsidian_notes_removed": refresh_result.stale_obsidian_notes_removed,
+        "quality_report_refreshed": refresh_result.quality_report_refreshed,
+        "quality_report_skipped": refresh_result.quality_report_skipped,
         "errors": refresh_result.stale_payload(),
     }
     payload["claim_surface_refresh"] = refresh_payload

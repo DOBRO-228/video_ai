@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -9,7 +10,9 @@ from typing import Any
 from style_kb.config.models import AppConfig
 from style_kb.export.jsonl import patch_style_claims_manifest_metadata, write_style_claims_export
 from style_kb.export.obsidian import render_obsidian_export
+from style_kb.models import QualityReport, StageState
 from style_kb.pipeline.paths import JobPaths
+from style_kb.state.repository import StateRepository
 from style_kb.stages.common import (
     effective_style_claims_path_for_paths,
     load_chunks,
@@ -18,7 +21,13 @@ from style_kb.stages.common import (
     load_timeline_events,
     load_video_info,
 )
+from style_kb.stages.stage_16_quality_report import (
+    Stage16QualityReport,
+    build_quality_report,
+    quality_report_stage_metrics,
+)
 from style_kb.utils.files import read_json, read_jsonl
+from style_kb.utils.pydantic_io import write_model
 
 
 @dataclass(slots=True)
@@ -32,10 +41,13 @@ class ClaimSurfaceRefreshResult:
     obsidian_skipped: bool = False
     obsidian_error: str | None = None
     stale_obsidian_notes_removed: int = 0
+    quality_report_refreshed: bool = False
+    quality_report_skipped: bool = False
+    quality_report_error: str | None = None
 
     @property
     def has_errors(self) -> bool:
-        return self.jsonl_error is not None or self.obsidian_error is not None
+        return self.jsonl_error is not None or self.obsidian_error is not None or self.quality_report_error is not None
 
     def stale_payload(self) -> dict[str, Any]:
         stale: dict[str, Any] = {}
@@ -43,6 +55,8 @@ class ClaimSurfaceRefreshResult:
             stale["exports/jsonl"] = self.jsonl_error
         if self.obsidian_error:
             stale["exports/obsidian"] = self.obsidian_error
+        if self.quality_report_error:
+            stale["reports/quality_report.json"] = self.quality_report_error
         return stale
 
 
@@ -50,8 +64,10 @@ def refresh_existing_claim_surfaces(
     *,
     paths: JobPaths,
     config: AppConfig,
+    repository: StateRepository,
     refresh_jsonl: bool = True,
     refresh_obsidian: bool = True,
+    refresh_quality_report: bool = True,
 ) -> ClaimSurfaceRefreshResult:
     result = ClaimSurfaceRefreshResult()
     effective_claims_path = effective_style_claims_path_for_paths(paths)
@@ -59,6 +75,8 @@ def refresh_existing_claim_surfaces(
         _refresh_existing_jsonl_surface(paths=paths, effective_claims_path=effective_claims_path, result=result)
     if refresh_obsidian:
         _refresh_existing_obsidian_surface(paths=paths, config=config, result=result)
+    if refresh_quality_report:
+        _refresh_existing_quality_report_surface(paths=paths, config=config, repository=repository, result=result)
     return result
 
 
@@ -125,6 +143,74 @@ def _refresh_existing_obsidian_surface(
         result.output_files.extend(outputs)
     except Exception as error:
         result.obsidian_error = f"{type(error).__name__}: {error}"
+
+
+def _refresh_existing_quality_report_surface(
+    *,
+    paths: JobPaths,
+    config: AppConfig,
+    repository: StateRepository,
+    result: ClaimSurfaceRefreshResult,
+) -> None:
+    try:
+        job = repository.get_job(paths.job_id)
+        if job is None:
+            raise ValueError(f"job not found: {paths.job_id}")
+        if job.lock_pid and job.lock_pid != os.getpid() and _is_pid_alive(job.lock_pid):
+            raise ValueError(f"job is locked by running pipeline process pid={job.lock_pid}")
+        report = build_quality_report(config=config, job=job, paths=paths)
+        if not _quality_report_needs_refresh(paths=paths, report=report, repository=repository):
+            result.quality_report_skipped = True
+            return
+        report_written = _quality_report_file_needs_refresh(paths=paths, report=report)
+        if report_written:
+            write_model(paths.quality_report, report)
+            result.output_files.append(paths.quality_report)
+        _mark_quality_report_stage_finished(paths=paths, report=report, repository=repository)
+        result.quality_report_refreshed = True
+    except Exception as error:
+        result.quality_report_error = f"{type(error).__name__}: {error}"
+
+
+def _quality_report_needs_refresh(*, paths: JobPaths, report: QualityReport, repository: StateRepository) -> bool:
+    if _quality_report_file_needs_refresh(paths=paths, report=report):
+        return True
+    stage = repository.get_stage(paths.job_id, Stage16QualityReport.name)
+    if stage is None or stage.finished_at is None:
+        return True
+    if stage.metrics != quality_report_stage_metrics(report):
+        return True
+    report_mtime = paths.quality_report.stat().st_mtime
+    return report_mtime > stage.finished_at.timestamp()
+
+
+def _quality_report_file_needs_refresh(*, paths: JobPaths, report: QualityReport) -> bool:
+    if not paths.quality_report.exists():
+        return True
+    try:
+        existing = QualityReport.model_validate(read_json(paths.quality_report))
+    except Exception:
+        return True
+    if existing.model_dump(mode="json") != report.model_dump(mode="json"):
+        return True
+    effective_claims_path = effective_style_claims_path_for_paths(paths)
+    return effective_claims_path.exists() and paths.quality_report.stat().st_mtime < effective_claims_path.stat().st_mtime
+
+
+def _mark_quality_report_stage_finished(
+    *,
+    paths: JobPaths,
+    report: QualityReport,
+    repository: StateRepository,
+) -> None:
+    repository.mark_stage_finished(
+        job_id=paths.job_id,
+        stage_name=Stage16QualityReport.name,
+        status=StageState.COMPLETED,
+        output_files=[str(paths.quality_report)],
+        remote_refs={},
+        metrics=quality_report_stage_metrics(report),
+    )
 
 
 def render_obsidian_claim_surface(
@@ -203,3 +289,15 @@ def _markdown_mtimes(root: Path) -> dict[str, int]:
 def _read_dict_rows(path: Path) -> list[dict[str, Any]]:
     rows = read_jsonl(path)
     return [row for row in rows if isinstance(row, dict)]
+
+
+def _is_pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True

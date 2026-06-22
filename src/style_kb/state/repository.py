@@ -140,6 +140,39 @@ class StateRepository:
     def set_job_lock(self, job_id: str, *, pid: int | None, acquired_at: datetime | None) -> Job:
         return self.update_job(job_id, lock_pid=pid, lock_acquired_at=acquired_at)
 
+    def try_acquire_job_lock(
+        self,
+        job_id: str,
+        *,
+        pid: int,
+        acquired_at: datetime,
+        stale_pid: int | None = None,
+    ) -> Job | None:
+        conditions = ["lock_pid IS NULL", "lock_pid = ?"]
+        condition_values: list[Any] = [pid]
+        if stale_pid is not None:
+            conditions.append("lock_pid = ?")
+            condition_values.append(stale_pid)
+        now = utc_now()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE jobs
+                SET lock_pid = ?, lock_acquired_at = ?, updated_at = ?
+                WHERE job_id = ? AND ({' OR '.join(conditions)})
+                """,
+                (
+                    pid,
+                    _to_iso(acquired_at),
+                    _to_iso(now),
+                    job_id,
+                    *condition_values,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+        return self.get_job(job_id)
+
     def clear_job_error(self, job_id: str) -> Job:
         return self.update_job(job_id, error_code=None, error_message=None)
 

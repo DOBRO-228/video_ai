@@ -28,6 +28,7 @@ def refresh_kb_exports(*, working_dir: Path | None = None) -> dict[str, Any]:
             "jsonl_refreshed": 0,
             "manifest_refreshed": 0,
             "obsidian_refreshed": 0,
+            "quality_report_refreshed": 0,
             "stale_obsidian_notes_removed": 0,
             "errors": 0,
         },
@@ -46,6 +47,7 @@ def refresh_kb_exports(*, working_dir: Path | None = None) -> dict[str, Any]:
             "jsonl_refreshed": False,
             "manifest_refreshed": False,
             "obsidian_refreshed": False,
+            "quality_report_refreshed": False,
             "stale_obsidian_notes_removed": 0,
             "skipped": None,
             "errors": {},
@@ -61,7 +63,7 @@ def refresh_kb_exports(*, working_dir: Path | None = None) -> dict[str, Any]:
             summary["jobs"].append(job_entry)
             continue
 
-        result = refresh_existing_claim_surfaces(paths=paths, config=config)
+        result = refresh_existing_claim_surfaces(paths=paths, config=config, repository=repository)
         job_entry.update(
             {
                 "jsonl_refreshed": result.jsonl_refreshed,
@@ -69,12 +71,19 @@ def refresh_kb_exports(*, working_dir: Path | None = None) -> dict[str, Any]:
                 "manifest_refreshed": result.manifest_refreshed,
                 "obsidian_refreshed": result.obsidian_refreshed,
                 "obsidian_skipped": result.obsidian_skipped,
+                "quality_report_refreshed": result.quality_report_refreshed,
+                "quality_report_skipped": result.quality_report_skipped,
                 "stale_obsidian_notes_removed": result.stale_obsidian_notes_removed,
                 "errors": result.stale_payload(),
-                "quality_report_left_stale": paths.quality_report.exists(),
             }
         )
-        if result.jsonl_refreshed or result.manifest_refreshed or result.obsidian_refreshed or result.stale_obsidian_notes_removed:
+        if (
+            result.jsonl_refreshed
+            or result.manifest_refreshed
+            or result.obsidian_refreshed
+            or result.quality_report_refreshed
+            or result.stale_obsidian_notes_removed
+        ):
             summary["counts"]["jobs_refreshed"] += 1
         if result.jsonl_refreshed:
             summary["counts"]["jsonl_refreshed"] += 1
@@ -82,6 +91,8 @@ def refresh_kb_exports(*, working_dir: Path | None = None) -> dict[str, Any]:
             summary["counts"]["manifest_refreshed"] += 1
         if result.obsidian_refreshed:
             summary["counts"]["obsidian_refreshed"] += 1
+        if result.quality_report_refreshed:
+            summary["counts"]["quality_report_refreshed"] += 1
         summary["counts"]["stale_obsidian_notes_removed"] += result.stale_obsidian_notes_removed
         if result.has_errors:
             summary["counts"]["errors"] += 1
