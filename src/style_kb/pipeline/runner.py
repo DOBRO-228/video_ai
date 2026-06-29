@@ -16,7 +16,7 @@ from style_kb.diagnostics import (
 )
 from style_kb.diagnostics_env import run_environment_snapshot
 from style_kb.error_advice import advice_for_error_code
-from style_kb.errors import JobLockError, StageExecutionError, StyleKbError
+from style_kb.errors import JobAlreadyExistsError, JobLockError, StageExecutionError, StyleKbError
 from style_kb.models import Job, JobState, StageState, StageStatus
 from style_kb.pipeline.base import Stage, StageContext
 from style_kb.pipeline.catalog import STAGES, stage_disabled_by_config
@@ -55,6 +55,8 @@ class PipelineRunner:
         self._start_run()
         _validate_stop_after_stage(stop_after_stage)
         video_id = extract_video_id(url)
+        paths = JobPaths(self.output_root, video_id)
+        self._raise_if_ingest_job_exists(job_id=video_id, paths=paths)
         return self._run_for_job(
             video_id=video_id,
             url=url,
@@ -108,6 +110,7 @@ class PipelineRunner:
         openai_batch: bool,
     ) -> Job:
         paths = JobPaths(self.output_root, requested_job_id)
+        self._raise_if_ingest_job_exists(job_id=requested_job_id, paths=paths)
         paths.ensure_directories()
         existing_job = self.repository.get_job(requested_job_id)
         job = self.repository.create_or_get_job(
@@ -161,6 +164,18 @@ class PipelineRunner:
             job_created=existing_job is None,
             stop_after_stage=stop_after_stage,
             openai_batch=openai_batch,
+        )
+
+    def _raise_if_ingest_job_exists(self, *, job_id: str, paths: JobPaths) -> None:
+        existing_job = self.repository.get_job(job_id)
+        existing_entries = _existing_job_dir_entries(paths.job_dir)
+        if existing_job is None and not existing_entries:
+            return
+        raise JobAlreadyExistsError(
+            job_id=job_id,
+            job_dir=str(paths.job_dir),
+            status=existing_job.status.value if existing_job is not None else None,
+            existing_entries=[str(path) for path in existing_entries],
         )
 
     def _run_existing_job(
@@ -1293,6 +1308,22 @@ def _disabled_stage_reuse_decision_data(stage: Stage) -> dict[str, object]:
         "missing_output_files": [],
         "stale_output_files": [],
     }
+
+
+def _existing_job_dir_entries(job_dir: Path, *, limit: int = 5) -> list[Path]:
+    if not job_dir.exists():
+        return []
+    if not job_dir.is_dir():
+        return [job_dir]
+    try:
+        entries: list[Path] = []
+        for entry in job_dir.iterdir():
+            entries.append(entry)
+            if len(entries) >= limit:
+                break
+        return entries
+    except OSError:
+        return [job_dir]
 
 
 def _is_pid_alive(pid: int) -> bool:

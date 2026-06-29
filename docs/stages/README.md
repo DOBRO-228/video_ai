@@ -38,6 +38,7 @@ Read the stage document before editing the corresponding `src/style_kb/stages/st
 - `pipeline.visual_enabled=false` is the default audio-only mode. In this mode stages 03, 08, 09, and 10 are skipped by config, and downstream stages must not require scene, frame, visual, presenter, or video-proxy artifacts.
 - `style-kb ingest URL` and `style-kb resume JOB_ID` accept an optional stage number to stop immediately after that stage completes, for example `style-kb ingest URL 9`.
 - `style-kb ingest URL --batch` and `style-kb resume JOB_ID --batch` enable eligible OpenAI Batch API requests for that run.
+- `style-kb ingest URL` is for new jobs only. If SQLite already has that job id, or the corresponding job artifact directory already contains entries, ingest must refuse to start and the user should run `style-kb resume JOB_ID`.
 - API keys come from `.env`/environment variables, not YAML.
 - Avoid fallback behavior unless it is already explicit in a stage document.
 - Stage 08/09 changes must be measured by scene count, frame count, frame cap behavior, extraction elapsed time, duplicate frames skipped, stage 10 provider requests, and materialized visual event count.

@@ -5,6 +5,26 @@ class StyleKbError(Exception):
     """Base application error."""
 
 
+class JobAlreadyExistsError(StyleKbError):
+    """Raised when ingest targets an existing job or job artifact directory."""
+
+    error_code = "job_already_exists"
+
+    def __init__(
+        self,
+        *,
+        job_id: str,
+        job_dir: str,
+        status: str | None = None,
+        existing_entries: list[str] | None = None,
+    ) -> None:
+        super().__init__(f"job already exists: {job_id}")
+        self.job_id = job_id
+        self.job_dir = job_dir
+        self.status = status
+        self.existing_entries = existing_entries or []
+
+
 class ConfigError(StyleKbError):
     """Raised when config is missing or invalid."""
 

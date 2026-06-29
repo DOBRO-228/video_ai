@@ -17,6 +17,7 @@ dependencies = [
   "scenedetect[opencv]>=0.6.7.1",
   "soniox>=0.4.0",
   "typer>=0.16.0",
+  "yt-dlp (>=2026.6.9,<2027.0.0)",
 ]
 
 [project.scripts]

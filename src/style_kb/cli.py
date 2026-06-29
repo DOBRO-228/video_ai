@@ -7,7 +7,7 @@ from typing import Annotated
 import typer
 
 from style_kb.error_advice import advice_for_error_code
-from style_kb.errors import StyleKbError
+from style_kb.errors import JobAlreadyExistsError, StyleKbError
 from style_kb.models import Job, JobState, StageState, StageStatus
 from style_kb.pipeline.paths import JobPaths
 from style_kb.pipeline.runner import PipelineRunner
@@ -80,6 +80,18 @@ def resume(job_id: str, stop_after_stage: StopAfterStageArg = None, batch: Batch
 def _run_command(func, *, action: str) -> None:
     try:
         job = func()
+    except JobAlreadyExistsError as error:
+        typer.secho(f"{action} refused: job already exists", err=True, fg=typer.colors.YELLOW)
+        typer.echo(f"job_id: {error.job_id}", err=True)
+        if error.status is not None:
+            typer.echo(f"status: {error.status}", err=True)
+        typer.echo(f"job_dir: {error.job_dir}", err=True)
+        if error.existing_entries:
+            typer.echo("existing_artifacts:", err=True)
+            for entry in error.existing_entries:
+                typer.echo(f"  {entry}", err=True)
+        typer.echo(f"resume: style-kb resume {error.job_id}", err=True)
+        raise typer.Exit(code=1) from error
     except StyleKbError as error:
         error_code = getattr(error, "error_code", None)
         if error_code == "claims_overlay_blocks_stage13_rebuild":

@@ -8,6 +8,13 @@ Extract canonical structured style knowledge from deterministic chunks. This sta
 
 The stage sends chunks to OpenAI structured output using `style_claims_ru.txt`. Each response may contain `0..style_claims.max_claims_per_chunk` claims. Raw responses are cached per chunk under `claims/raw/` with a request fingerprint that includes the chunk payload, prompt hash, model, retry count, prompt-cache settings, and claim settings.
 
+The extraction prompt requires the canonical `claim` text to preserve the source's modal force.
+Hard bans, obligations, exclusive conditions, and absolute statements must not be softened in
+the main claim text, even when `avoid`, `prefer`, or `evidence` also carry that information.
+For example, source wording such as `нельзя`, `запрещено`, `обязательно`, `должен`,
+`только`, or `никогда` should not become weaker `не рекомендуется`, `лучше`, `стоит`, or
+`можно` phrasing unless the source itself is that soft.
+
 By default, cache-miss chunks are requested synchronously. When the current CLI run uses `--batch`, first-attempt cache-miss extraction requests are submitted through the OpenAI Batch API with endpoint `/v1/responses`. The batch input, manifest, output, and error files are durable artifacts under `claims/raw/`. If a batch response is missing, has an API error, or fails deterministic claim validation, that raw response is preserved as an attempt artifact and the chunk falls back to the existing synchronous retry-advisor/retry flow. Batch is a transport/cost mode only; it is not part of semantic skip validation.
 
 Provider output is validated before it can become a cache hit or a final artifact. If a chunk response contains service metadata as style knowledge, technical identifiers in user-facing fields, invalid enums, missing required text, malformed JSON, or too many claims, the stage keeps the attempt raw output at `claims/raw/{chunk_id}_attempt_{attempt}.json`, logs the validation error, records it in `claims/style_claims_errors.json`, emits progress, and retries up to `style_claims.max_retries`. A first successful attempt is written to the canonical per-chunk raw cache only; an identical successful attempt file is removed to avoid duplicate raw artifacts.
@@ -67,7 +74,7 @@ The stage can be skipped when `style_claims.jsonl` parses as `StyleClaim`, `styl
 - `claims/style_claims_curate_raw.json` is an audit artifact only. It records decisions, confidence reasons, split/rewrite suggestions, and ignored invalid decisions; it must not be imported as style knowledge.
 - Python attaches `chunk_id`, `timeline_event_ids`, `timestamp_url`, and `source_refs` to accepted claims. The model must not output those as claim content.
 - Retry-advisor outputs are diagnostic prompt guidance only. They are not claims and must not be imported into the KB.
-- Claims must remain normalized Russian knowledge objects with timestamp/source grounding.
+- Claims must remain normalized Russian knowledge objects with timestamp/source grounding. Normalization may simplify wording, but it must not weaken the source's modal force in the main `claim` field.
 - Dashboard overlays are terminal post-pipeline edits. If `claims/style_claims_current.jsonl`
   or a non-empty `claims/style_claims_manual_edits.jsonl` exists, `resume` must not re-run
   this stage. The runner performs an early preflight before executing upstream stages

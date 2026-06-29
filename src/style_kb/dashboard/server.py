@@ -616,12 +616,9 @@ def update_claim(output_root: Path, job_id: str, claim_id: str, updates: Any) ->
         try:
             ensure_dashboard_claim_edit_allowed(output_root, paths)
             original_claims = read_jsonl(paths.style_claims_jsonl)
-            original_by_id = {claim.get("claim_id"): claim for claim in original_claims if claim.get("claim_id")}
-            original_claim = original_by_id.get(claim_id)
-            if not original_claim:
-                raise DashboardError("claim_not_found", f"claim not found: {claim_id}", status=404)
             claim_edits = read_jsonl(edits_path)
             next_claim_edits = claim_edits
+            original_by_id = {claim.get("claim_id"): claim for claim in original_claims if claim.get("claim_id")}
             effective_by_id = {
                 claim.get("claim_id"): strip_claim_dashboard_fields(claim)
                 for claim in apply_claim_edits(original_claims, claim_edits)
@@ -629,7 +626,8 @@ def update_claim(output_root: Path, job_id: str, claim_id: str, updates: Any) ->
             }
             previous_claim = effective_by_id.get(claim_id)
             if previous_claim is None:
-                raise DashboardError("claim_deleted", f"claim was deleted: {claim_id}", status=409)
+                raise DashboardError("claim_not_found", f"claim not found or was deleted: {claim_id}", status=404)
+            original_claim = original_by_id.get(claim_id) or previous_claim
             updated_claim = build_updated_claim(previous_claim, updates)
             changes = claim_field_changes(previous_claim, updated_claim)
             if changes:
@@ -682,11 +680,8 @@ def delete_claim(output_root: Path, job_id: str, claim_id: str) -> dict[str, Any
         try:
             ensure_dashboard_claim_edit_allowed(output_root, paths)
             original_claims = read_jsonl(paths.style_claims_jsonl)
-            original_by_id = {claim.get("claim_id"): claim for claim in original_claims if claim.get("claim_id")}
-            original_claim = original_by_id.get(claim_id)
-            if not original_claim:
-                raise DashboardError("claim_not_found", f"claim not found: {claim_id}", status=404)
             claim_edits = read_jsonl(edits_path)
+            original_by_id = {claim.get("claim_id"): claim for claim in original_claims if claim.get("claim_id")}
             effective_by_id = {
                 claim.get("claim_id"): strip_claim_dashboard_fields(claim)
                 for claim in apply_claim_edits(original_claims, claim_edits)
@@ -694,6 +689,7 @@ def delete_claim(output_root: Path, job_id: str, claim_id: str) -> dict[str, Any
             }
             previous_claim = effective_by_id.get(claim_id)
             if previous_claim is not None:
+                original_claim = original_by_id.get(claim_id) or previous_claim
                 edited_at = datetime.now(tz=UTC).isoformat(timespec="microseconds")
                 deleted_claim = strip_claim_dashboard_fields(previous_claim)
                 edit_record = {
@@ -914,7 +910,13 @@ def current_claim_rows(original_claims: list[dict[str, Any]], claim_edits: list[
 
 
 def apply_claim_edits(original_claims: list[dict[str, Any]], claim_edits: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    claims_by_id = {claim.get("claim_id"): strip_claim_dashboard_fields(claim) for claim in original_claims if claim.get("claim_id")}
+    original_by_id = {
+        claim.get("claim_id"): strip_claim_dashboard_fields(claim)
+        for claim in original_claims
+        if claim.get("claim_id")
+    }
+    claims_by_id = dict(original_by_id)
+    claim_order = [claim_id for claim_id in original_by_id if isinstance(claim_id, str)]
     history_by_id = build_claim_edit_history(claim_edits)
     deleted_claim_ids: set[str] = set()
     for edit in claim_edits:
@@ -925,6 +927,27 @@ def apply_claim_edits(original_claims: list[dict[str, Any]], claim_edits: list[d
         if action == "delete":
             deleted_claim_ids.add(claim_id)
             claims_by_id.pop(claim_id, None)
+            if claim_id in claim_order:
+                claim_order.remove(claim_id)
+            continue
+        if action == "add":
+            added_claim = edit.get("added_claim")
+            if not isinstance(added_claim, dict) or claim_id in deleted_claim_ids:
+                continue
+            candidate = strip_claim_dashboard_fields(added_claim)
+            try:
+                StyleClaim.model_validate(candidate)
+            except Exception:
+                continue
+            if candidate.get("claim_id") != claim_id:
+                continue
+            claims_by_id[claim_id] = candidate
+            if claim_id not in claim_order:
+                insert_after = edit.get("insert_after_claim_id")
+                if isinstance(insert_after, str) and insert_after in claim_order:
+                    claim_order.insert(claim_order.index(insert_after) + 1, claim_id)
+                else:
+                    claim_order.append(claim_id)
             continue
         if action != "update" or claim_id in deleted_claim_ids:
             continue
@@ -939,9 +962,8 @@ def apply_claim_edits(original_claims: list[dict[str, Any]], claim_edits: list[d
         claims_by_id[claim_id] = candidate
 
     effective_claims: list[dict[str, Any]] = []
-    for original_claim in original_claims:
-        claim_id = original_claim.get("claim_id")
-        if claim_id not in claims_by_id:
+    for claim_id in claim_order:
+        if not isinstance(claim_id, str) or claim_id not in claims_by_id:
             continue
         claim = deepcopy(claims_by_id[claim_id])
         history = history_by_id.get(claim_id) or []
@@ -954,7 +976,9 @@ def apply_claim_edits(original_claims: list[dict[str, Any]], claim_edits: list[d
                 "edits_count": len(history),
                 "changed_fields": latest.get("changed_fields") or [],
             }
-            claim["llm_claim"] = strip_claim_dashboard_fields(original_claim)
+            original_claim = original_by_id.get(claim_id)
+            if original_claim is not None:
+                claim["llm_claim"] = strip_claim_dashboard_fields(original_claim)
         effective_claims.append(claim)
     return effective_claims
 

@@ -8,6 +8,10 @@ Primary ingest:
 style-kb ingest "https://www.youtube.com/watch?v=VIDEO_ID"
 ```
 
+`ingest` only starts a new local job. If the job already exists in SQLite or the
+job artifact directory already contains entries, the command refuses to start and
+prints the existing job id. Continue an existing job with `resume`.
+
 For inspection workflows, pass an optional stage number to stop immediately after that stage completes:
 
 ```bash
